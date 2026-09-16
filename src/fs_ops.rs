@@ -20,6 +20,18 @@ pub fn copy_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn move_path(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // fs::rename fails across filesystems/mount points, so fall back to copy+delete.
+    if fs::rename(src, dest).is_err() {
+        copy_recursive(src, dest)?;
+        delete_recursive(src)?;
+    }
+    Ok(())
+}
+
 pub fn delete_recursive(path: &Path) -> Result<()> {
     if path.is_dir() {
         fs::remove_dir_all(path)?;
@@ -82,6 +94,41 @@ mod tests {
         delete_recursive(&dir.join("sub")).unwrap();
         assert!(!dir.join("sub").exists());
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn moves_file() {
+        let dir = std::env::temp_dir().join("pc_test_move_file");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.txt");
+        fs::write(&src, "hello").unwrap();
+        let dest = dir.join("b.txt");
+
+        move_path(&src, &dest).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "hello");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn moves_directory() {
+        let dir = std::env::temp_dir().join("pc_test_move_dir");
+        let _ = fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("nested/n.txt"), "deep").unwrap();
+        let dest = dir.join("dest");
+
+        move_path(&src, &dest).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(
+            fs::read_to_string(dest.join("nested/n.txt")).unwrap(),
+            "deep"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

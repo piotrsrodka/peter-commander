@@ -119,6 +119,7 @@ impl App {
         match action {
             Action::Open => self.active_pane().enter_selected()?,
             Action::Copy => self.copy_selected()?,
+            Action::Move => self.move_selected()?,
             Action::Delete => self.request_delete(),
             Action::Quit => self.quit(),
             other => {
@@ -143,6 +144,29 @@ impl App {
             }
             Err(err) => {
                 self.status_message = format!("Copy failed: {err}");
+            }
+        }
+
+        self.left.reload()?;
+        self.right.reload()?;
+        Ok(())
+    }
+
+    fn move_selected(&mut self) -> Result<()> {
+        let Some(src) = self.active_pane().selected_path() else {
+            return Ok(());
+        };
+        let Some(file_name) = src.file_name() else {
+            return Ok(());
+        };
+        let dest = self.inactive_pane().cwd.join(file_name);
+
+        match fs_ops::move_path(&src, &dest) {
+            Ok(()) => {
+                self.status_message = format!("Moved {} to {}", src.display(), dest.display());
+            }
+            Err(err) => {
+                self.status_message = format!("Move failed: {err}");
             }
         }
 
