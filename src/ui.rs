@@ -251,6 +251,11 @@ fn draw_status_message(frame: &mut Frame, area: Rect, message: &str) {
 }
 
 fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
+    // Spread the tiles evenly across the full width instead of packing them
+    // to the left; on a narrow terminal the tail simply gets clipped, same
+    // as before.
+    let tile_width = area.width / FN_KEYS.len() as u16;
+
     let mut spans = Vec::new();
     for fn_key in FN_KEYS {
         spans.push(Span::styled(
@@ -260,8 +265,9 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
                 .bg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         ));
+        let label_width = tile_width.saturating_sub(fn_key.key.len() as u16) as usize;
         spans.push(Span::styled(
-            format!("{:<7}", fn_key.label),
+            format!("{:<label_width$}", fn_key.label),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         ));
     }
