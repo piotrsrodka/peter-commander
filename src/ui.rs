@@ -178,6 +178,20 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
+const NAME_COLUMN_WIDTH: usize = 30;
+
+/// Truncates a name to fit the name column, appending an ellipsis, instead
+/// of letting a long name spill into the size/date columns.
+fn fit_name(name: &str, width: usize) -> String {
+    let char_count = name.chars().count();
+    if char_count <= width {
+        format!("{name:<width$}")
+    } else {
+        let truncated: String = name.chars().take(width.saturating_sub(1)).collect();
+        format!("{truncated}\u{2026}")
+    }
+}
+
 fn format_modified(modified: Option<std::time::SystemTime>) -> String {
     match modified {
         Some(time) => DateTime::<Local>::from(time)
@@ -211,11 +225,12 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
             };
             let date = format_modified(entry.modified);
             let size_label = if entry.is_dir {
-                "<DIR>".to_string()
+                String::new()
             } else {
                 entry.size.to_string()
             };
-            let label = format!("{:<30} {:>10} {}", entry.name, size_label, date);
+            let name = fit_name(&entry.name, NAME_COLUMN_WIDTH);
+            let label = format!("{name} {size_label:>10} {date}");
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
@@ -269,4 +284,30 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
     }
     let bar = Paragraph::new(Line::from(spans));
     frame.render_widget(bar, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_name_is_padded_not_truncated() {
+        let result = fit_name("short.txt", 10);
+        assert_eq!(result, "short.txt ");
+        assert_eq!(result.chars().count(), 10);
+    }
+
+    #[test]
+    fn long_name_is_truncated_with_ellipsis() {
+        let result = fit_name("this_is_a_very_long_filename.txt", 10);
+        assert_eq!(result.chars().count(), 10);
+        assert!(result.ends_with('\u{2026}'));
+        assert!(result.starts_with("this_is_a"));
+    }
+
+    #[test]
+    fn exact_width_name_is_unchanged() {
+        let result = fit_name("1234567890", 10);
+        assert_eq!(result, "1234567890");
+    }
 }
