@@ -63,6 +63,25 @@ pub enum Dialog {
         kind: TextInputKind,
         input: String,
     },
+    ConfirmQuit,
+    Settings {
+        selected: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingItem {
+    WaitAfterShellCommand,
+}
+
+impl SettingItem {
+    pub const ALL: &'static [SettingItem] = &[SettingItem::WaitAfterShellCommand];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SettingItem::WaitAfterShellCommand => "Wait for Enter after running commands",
+        }
+    }
 }
 
 /// A request to suspend the TUI and hand the terminal to an external
@@ -71,6 +90,8 @@ pub enum Dialog {
 pub enum ExternalRequest {
     View(PathBuf),
     Edit(PathBuf),
+    Shell { command: String, cwd: PathBuf },
+    RevealTerminal,
 }
 
 pub struct App {
@@ -84,6 +105,12 @@ pub struct App {
     pub status_message: String,
     pub dialog: Dialog,
     pub external_request: Option<ExternalRequest>,
+    pub help_open: bool,
+    pub command_line: String,
+    /// Whether running a command from the command line pauses with
+    /// "Press Enter to continue" afterward, or returns straight to the
+    /// panels (output can still be seen later via Ctrl+O).
+    pub wait_after_shell_command: bool,
 }
 
 impl App {
@@ -104,6 +131,9 @@ impl App {
             status_message: String::new(),
             dialog: Dialog::None,
             external_request: None,
+            help_open: false,
+            command_line: String::new(),
+            wait_after_shell_command: true,
         })
     }
 
@@ -116,6 +146,32 @@ impl App {
     pub fn set_error(&mut self, message: String) {
         logging::log_error(&message);
         self.status_message = message;
+    }
+
+    /// Ctrl+O: reveal the real terminal underneath the panels (classic NC
+    /// behavior) so previous command output/scrollback is visible again.
+    pub fn request_reveal_terminal(&mut self) {
+        self.external_request = Some(ExternalRequest::RevealTerminal);
+    }
+
+    /// Alt+F1: point the left pane at the right pane's current directory.
+    pub fn sync_left_to_right_dir(&mut self) -> Result<()> {
+        self.left.cwd = self.right.cwd.clone();
+        self.left.selected = 0;
+        if let Err(err) = self.left.reload() {
+            self.set_error(format!("Cannot switch left pane: {err}"));
+        }
+        Ok(())
+    }
+
+    /// Alt+F2: point the right pane at the left pane's current directory.
+    pub fn sync_right_to_left_dir(&mut self) -> Result<()> {
+        self.right.cwd = self.left.cwd.clone();
+        self.right.selected = 0;
+        if let Err(err) = self.right.reload() {
+            self.set_error(format!("Cannot switch right pane: {err}"));
+        }
+        Ok(())
     }
 
     pub fn active_pane(&mut self) -> &mut Pane {
@@ -197,12 +253,55 @@ impl App {
             Action::NewFile => self.request_new_file(),
             Action::View => self.request_external(ExternalRequest::View, "view"),
             Action::Edit => self.request_external(ExternalRequest::Edit, "edit"),
-            Action::Quit => self.quit(),
+            Action::Help => self.help_open = true,
+            Action::Quit => self.dialog = Dialog::ConfirmQuit,
+            Action::Settings => self.dialog = Dialog::Settings { selected: 0 },
             other => {
                 self.status_message = format!("{} is not implemented yet", other.label());
             }
         }
         Ok(())
+    }
+
+    pub fn dialog_is_settings(&self) -> bool {
+        matches!(self.dialog, Dialog::Settings { .. })
+    }
+
+    pub fn setting_value(&self, item: SettingItem) -> bool {
+        match item {
+            SettingItem::WaitAfterShellCommand => self.wait_after_shell_command,
+        }
+    }
+
+    fn toggle_setting(&mut self, item: SettingItem) {
+        match item {
+            SettingItem::WaitAfterShellCommand => {
+                self.wait_after_shell_command = !self.wait_after_shell_command;
+            }
+        }
+    }
+
+    pub fn settings_move_up(&mut self) {
+        if let Dialog::Settings { selected } = &mut self.dialog {
+            *selected = if *selected == 0 {
+                SettingItem::ALL.len() - 1
+            } else {
+                *selected - 1
+            };
+        }
+    }
+
+    pub fn settings_move_down(&mut self) {
+        if let Dialog::Settings { selected } = &mut self.dialog {
+            *selected = (*selected + 1) % SettingItem::ALL.len();
+        }
+    }
+
+    pub fn settings_toggle_selected(&mut self) {
+        if let Dialog::Settings { selected } = &self.dialog {
+            let item = SettingItem::ALL[*selected];
+            self.toggle_setting(item);
+        }
     }
 
     pub fn open_selected(&mut self) -> Result<()> {
@@ -325,7 +424,11 @@ impl App {
                 self.left.reload()?;
                 self.right.reload()?;
             }
-            Dialog::None => {}
+            Dialog::ConfirmQuit => {
+                self.dialog = Dialog::None;
+                self.quit();
+            }
+            Dialog::Settings { .. } | Dialog::None => {}
         }
         Ok(())
     }
@@ -355,7 +458,8 @@ impl App {
     pub fn dialog_default_yes(&self) -> bool {
         match &self.dialog {
             Dialog::Confirm { kind, .. } => kind.default_yes(),
-            Dialog::TextInput { .. } | Dialog::None => false,
+            Dialog::ConfirmQuit => true,
+            Dialog::TextInput { .. } | Dialog::Settings { .. } | Dialog::None => false,
         }
     }
 
@@ -369,5 +473,34 @@ impl App {
         if let Dialog::TextInput { input, .. } = &mut self.dialog {
             input.pop();
         }
+    }
+
+    pub fn command_line_push(&mut self, c: char) {
+        self.command_line.push(c);
+    }
+
+    pub fn command_line_backspace(&mut self) {
+        self.command_line.pop();
+    }
+
+    pub fn command_line_clear(&mut self) {
+        self.command_line.clear();
+    }
+
+    /// Submits the command line: if it holds a non-empty command, queues it
+    /// as a shell request in the active pane's directory and clears the
+    /// buffer, returning true. If it's empty, does nothing and returns
+    /// false, so the caller can fall back to opening the selected entry
+    /// instead (matching classic Norton Commander: Enter runs the typed
+    /// command, or opens the selection when nothing was typed).
+    pub fn submit_command_line(&mut self) -> bool {
+        let command = self.command_line.trim().to_string();
+        if command.is_empty() {
+            return false;
+        }
+        self.command_line.clear();
+        let cwd = self.active_pane().cwd.clone();
+        self.external_request = Some(ExternalRequest::Shell { command, cwd });
+        true
     }
 }

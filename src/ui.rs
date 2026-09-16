@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{App, Dialog, Side};
+use crate::app::{App, Dialog, SettingItem, Side};
 use crate::menu::{FN_KEYS, MENU_BAR};
 use crate::pane::Pane;
 
@@ -15,6 +15,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(1), // menu bar
             Constraint::Min(3),    // panes
+            Constraint::Length(1), // command line
             Constraint::Length(1), // status message
             Constraint::Length(1), // F-key bar
         ])
@@ -30,8 +31,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_pane(frame, panes[0], &app.left, app.active == Side::Left);
     draw_pane(frame, panes[1], &app.right, app.active == Side::Right);
 
-    draw_status_message(frame, root[2], &app.status_message);
-    draw_fn_key_bar(frame, root[3]);
+    draw_command_line(frame, root[2], app);
+    draw_status_message(frame, root[3], &app.status_message);
+    draw_fn_key_bar(frame, root[4]);
 
     if app.menu_open {
         draw_menu_dropdown(frame, root[0], app);
@@ -45,8 +47,83 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Dialog::TextInput { kind, input } => {
             draw_text_input_dialog(frame, kind.prompt(), input);
         }
+        Dialog::ConfirmQuit => {
+            draw_confirm_dialog(frame, "Quit PeterCommander? [Y/n]");
+        }
+        Dialog::Settings { selected } => {
+            draw_settings_dialog(frame, app, *selected);
+        }
         Dialog::None => {}
     }
+
+    if app.help_open {
+        draw_help(frame);
+    }
+}
+
+const HELP_LINES: &[&str] = &[
+    "F1        Help          Show this screen",
+    "F2        Rename        Not yet implemented",
+    "F3        View          Page selected file with $PAGER",
+    "F4        Edit          Edit selected file with $EDITOR",
+    "Shift+F4  New File      Create a new empty file",
+    "F5        Copy          Copy selection to the other pane",
+    "F6        Move          Move selection to the other pane",
+    "F7        MkDir         Create a new directory",
+    "F8        Delete        Delete selection (asks to confirm)",
+    "F9        Menu          Open the pulldown menu",
+    "F10       Quit          Quit PeterCommander (asks to confirm)",
+    "",
+    "Alt+F1    Left = Right   Point left pane at right pane's dir",
+    "Alt+F2    Right = Left   Point right pane at left pane's dir",
+    "Ctrl+O    Terminal       Reveal the terminal/scrollback under panels",
+    "",
+    "Tab       Switch the active pane",
+    "Up/Down   Move the selection",
+    "",
+    "Type anywhere to fill the command line below the panes;",
+    "Enter runs it in the active pane's directory, or opens",
+    "the selected entry if the command line is empty.",
+    "Esc clears the command line. Quit with F10 (or F9 > Command > Quit).",
+    "",
+    "F9 > Options > Settings opens the settings screen: Up/Down",
+    "to move, Space to toggle a checkbox, Enter to save/close.",
+    "",
+    "Press any key to close this help",
+];
+
+fn draw_help(frame: &mut Frame) {
+    let width = HELP_LINES
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(20) as u16
+        + 4;
+    let width = width.min(frame.area().width);
+    let height = (HELP_LINES.len() as u16 + 2).min(frame.area().height);
+
+    let area = Rect {
+        x: (frame.area().width.saturating_sub(width)) / 2,
+        y: (frame.area().height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let lines: Vec<Line> = HELP_LINES
+        .iter()
+        .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::White))))
+        .collect();
+
+    let block = Block::default()
+        .title("Help — Keybindings")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let paragraph = Paragraph::new(lines).block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_text_input_dialog(frame: &mut Frame, prompt: &str, input: &str) {
@@ -105,6 +182,64 @@ fn draw_confirm_dialog(frame: &mut Frame, message: &str) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
+}
+
+const SETTINGS_HINT: &str = " Space: toggle   Enter: save/close";
+
+fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
+    let items: Vec<ListItem> = SettingItem::ALL
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let checkbox = if app.setting_value(*item) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let style = if idx == selected {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!(" {checkbox} {}", item.label()),
+                style,
+            )))
+        })
+        .chain(std::iter::once(ListItem::new(Line::from(Span::styled(
+            SETTINGS_HINT,
+            Style::default().fg(Color::DarkGray),
+        )))))
+        .collect();
+
+    let hint_len = SETTINGS_HINT.chars().count();
+    let width = SettingItem::ALL
+        .iter()
+        .map(|item| item.label().chars().count() + 6)
+        .chain(std::iter::once(hint_len + 2))
+        .max()
+        .unwrap_or(20) as u16;
+    let width = width.min(frame.area().width);
+    let height = (SettingItem::ALL.len() as u16 + 3).min(frame.area().height);
+
+    let area = Rect {
+        x: (frame.area().width.saturating_sub(width)) / 2,
+        y: (frame.area().height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let block = Block::default()
+        .title("Settings")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &App) {
@@ -190,6 +325,23 @@ fn fit_name(name: &str, width: usize) -> String {
         let truncated: String = name.chars().take(width.saturating_sub(1)).collect();
         format!("{truncated}\u{2026}")
     }
+}
+
+fn draw_command_line(frame: &mut Frame, area: Rect, app: &App) {
+    let cwd = match app.active {
+        Side::Left => &app.left.cwd,
+        Side::Right => &app.right.cwd,
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{}> ", cwd.display()),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(&app.command_line, Style::default().fg(Color::White)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn format_modified(modified: Option<std::time::SystemTime>) -> String {

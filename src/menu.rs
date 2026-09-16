@@ -115,12 +115,12 @@ pub const FN_KEYS: &[FnKey] = &[
     },
     FnKey {
         key: "F9",
-        label: "Settings",
-        action: Some(Action::Settings),
+        label: "Menu",
+        action: None,
     },
     FnKey {
         key: "F10",
-        label: "Menu",
-        action: None,
+        label: "Quit",
+        action: Some(Action::Quit),
     },
 ];

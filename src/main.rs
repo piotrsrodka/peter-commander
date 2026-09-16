@@ -90,17 +90,28 @@ fn run(
     Ok(())
 }
 
-/// Suspends the TUI, runs an external program (pager/editor) on a file,
+/// Suspends the TUI, runs an external program (pager/editor/shell command),
 /// and restores the TUI once it exits.
 fn run_external(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     request: ExternalRequest,
     app: &mut App,
 ) -> Result<()> {
-    let (env_var, default_program, path): (&str, &str, &Path) = match &request {
-        ExternalRequest::View(path) => ("PAGER", "less", path),
-        ExternalRequest::Edit(path) => ("EDITOR", "vi", path),
-    };
+    match request {
+        ExternalRequest::View(path) => run_pager_or_editor(terminal, "PAGER", "less", &path, app),
+        ExternalRequest::Edit(path) => run_pager_or_editor(terminal, "EDITOR", "vi", &path, app),
+        ExternalRequest::Shell { command, cwd } => run_shell_command(terminal, &command, &cwd, app),
+        ExternalRequest::RevealTerminal => reveal_terminal(terminal),
+    }
+}
+
+fn run_pager_or_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    env_var: &str,
+    default_program: &str,
+    path: &Path,
+    app: &mut App,
+) -> Result<()> {
     // $EDITOR/$PAGER may be a full command line (e.g. "omarchy-launch-editor
     // --inline"), not just a bare program name, so parse it like a shell would.
     let command_line = env::var(env_var).unwrap_or_else(|_| default_program.to_string());
@@ -135,13 +146,118 @@ fn run_external(
     Ok(())
 }
 
+/// Runs a shell command line (Norton Commander's built-in command prompt),
+/// pausing for a keypress afterward so the user can read its output before
+/// the TUI redraws over it.
+fn run_shell_command(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    command: &str,
+    cwd: &Path,
+    app: &mut App,
+) -> Result<()> {
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let wait = app.wait_after_shell_command;
+
+    restore_terminal();
+    println!("$ {command}");
+    let status = Command::new(&shell)
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .status();
+
+    if wait {
+        match &status {
+            Ok(status) if !status.success() => println!("\n[exited with {status}]"),
+            Err(err) => println!("\n[failed to launch {shell}: {err}]"),
+            Ok(_) => {}
+        }
+        println!("\nPress Enter to continue...");
+        let mut discard = String::new();
+        let _ = io::stdin().read_line(&mut discard);
+    }
+
+    enable_raw_mode().context("enable_raw_mode")?;
+    io::stdout()
+        .execute(EnterAlternateScreen)
+        .context("EnterAlternateScreen")?;
+    terminal.clear()?;
+
+    match status {
+        Ok(status) if !status.success() => {
+            app.set_error(format!("Command exited with {status}"));
+        }
+        Err(err) => {
+            app.set_error(format!("Failed to launch {shell}: {err}"));
+        }
+        Ok(_) => {}
+    }
+
+    app.left.reload()?;
+    app.right.reload()?;
+    Ok(())
+}
+
+/// Ctrl+O: reveals the real terminal underneath the panels — the same
+/// screen that one-off shell commands print to — so its scrollback is
+/// visible again, without spawning anything. Pressing Ctrl+O (or Esc)
+/// again toggles back. Raw mode stays on throughout, so this is just an
+/// alternate-screen flip, not a full terminal suspend/resume.
+///
+/// Deliberately draws nothing here: anything printed to this (primary)
+/// screen becomes permanent scrollback once later output scrolls past it,
+/// so even a "toast" hint ends up baked in as a stray line per use. Classic
+/// Norton Commander doesn't overlay anything on the revealed screen either.
+fn reveal_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    io::stdout()
+        .execute(LeaveAlternateScreen)
+        .context("LeaveAlternateScreen")?;
+
+    loop {
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            let is_ctrl_o =
+                key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if is_ctrl_o || key.code == KeyCode::Esc {
+                break;
+            }
+        }
+    }
+
+    io::stdout()
+        .execute(EnterAlternateScreen)
+        .context("EnterAlternateScreen")?;
+    terminal.clear()?;
+    Ok(())
+}
+
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    if app.help_open {
+        app.help_open = false;
+        return Ok(());
+    }
+
     if app.dialog_is_text_input() {
         match code {
             KeyCode::Enter => app.confirm_dialog()?,
             KeyCode::Esc => app.cancel_dialog(),
             KeyCode::Backspace => app.text_input_backspace(),
             KeyCode::Char(c) => app.text_input_push(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if app.dialog_is_settings() {
+        match code {
+            KeyCode::Up => app.settings_move_up(),
+            KeyCode::Down => app.settings_move_down(),
+            KeyCode::Char(' ') => app.settings_toggle_selected(),
+            // Settings apply immediately, so Enter isn't really "saving"
+            // anything new — it just closes with a positive, deliberate
+            // key rather than Esc's "never mind" feel. Esc/F9 still work too.
+            KeyCode::Enter | KeyCode::Esc | KeyCode::F(9) => app.cancel_dialog(),
             _ => {}
         }
         return Ok(());
@@ -171,20 +287,36 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             KeyCode::Up => app.menu_up(),
             KeyCode::Down => app.menu_down(),
             KeyCode::Enter => app.confirm_menu_selection()?,
-            KeyCode::F(10) => app.close_menu(),
+            KeyCode::F(9) => app.close_menu(),
             _ => {}
         }
         return Ok(());
     }
 
     match code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => app.quit(),
         KeyCode::Tab => app.toggle_active(),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
-        KeyCode::Enter => app.open_selected()?,
+        KeyCode::Backspace => app.command_line_backspace(),
+        KeyCode::Esc => app.command_line_clear(),
+        // Classic Norton Commander: Enter runs whatever is typed on the
+        // command line, or opens the selected entry if nothing was typed.
+        KeyCode::Enter => {
+            if !app.submit_command_line() {
+                app.open_selected()?;
+            }
+        }
         KeyCode::F(4) if modifiers.contains(KeyModifiers::SHIFT) => {
             app.run_action(Action::NewFile)?;
+        }
+        KeyCode::F(1) if modifiers.contains(KeyModifiers::ALT) => {
+            app.sync_left_to_right_dir()?;
+        }
+        KeyCode::F(2) if modifiers.contains(KeyModifiers::ALT) => {
+            app.sync_right_to_left_dir()?;
+        }
+        KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.request_reveal_terminal();
         }
         KeyCode::F(n) => {
             if let Some(fn_key) = FN_KEYS.iter().find(|k| k.key == format!("F{n}")) {
@@ -194,6 +326,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
                 }
             }
         }
+        // Any other printable character is typed straight into the
+        // always-visible command line, same as classic Norton Commander.
+        KeyCode::Char(c) => app.command_line_push(c),
         _ => {}
     }
     Ok(())
