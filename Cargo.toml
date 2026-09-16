@@ -2,6 +2,9 @@
 name = "peter-commander"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal file manager"
+license = "MIT"
+repository = "https://github.com/piotrsrodka/peter-commander"
 
 [dependencies]
 anyhow = "1.0.104"
