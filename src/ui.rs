@@ -210,7 +210,10 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let title = pane.cwd.to_string_lossy().to_string();
+    let title = match pane.selected_entry() {
+        Some(entry) => pane.cwd.join(&entry.name).to_string_lossy().to_string(),
+        None => pane.cwd.to_string_lossy().to_string(),
+    };
 
     let items: Vec<ListItem> = pane
         .entries
