@@ -106,9 +106,24 @@ impl Pane {
         }
     }
 
-    /// Enters the selected directory. Returns `Ok(Some(message))` if the
-    /// directory couldn't be entered (e.g. permission denied) without
-    /// changing the current directory, instead of propagating a fatal error.
+    /// Switches to `new_path`. Returns `Ok(Some(message))` and leaves the
+    /// current directory unchanged if it couldn't be entered (e.g.
+    /// permission denied), instead of propagating a fatal error.
+    fn set_cwd(&mut self, new_path: PathBuf) -> Result<Option<String>> {
+        let previous_cwd = self.cwd.clone();
+        let previous_selected = self.selected;
+        self.cwd = new_path;
+        self.selected = 0;
+
+        if let Err(err) = self.reload() {
+            self.cwd = previous_cwd;
+            self.selected = previous_selected;
+            return Ok(Some(format!("Cannot open directory: {err}")));
+        }
+        Ok(None)
+    }
+
+    /// Enters the selected directory (see `set_cwd` for failure handling).
     pub fn enter_selected(&mut self) -> Result<Option<String>> {
         let Some(entry) = self.selected_entry() else {
             return Ok(None);
@@ -126,17 +141,21 @@ impl Pane {
             self.cwd.join(&entry.name)
         };
 
-        let previous_cwd = self.cwd.clone();
-        let previous_selected = self.selected;
-        self.cwd = new_path;
-        self.selected = 0;
+        self.set_cwd(new_path)
+    }
 
-        if let Err(err) = self.reload() {
-            self.cwd = previous_cwd;
-            self.selected = previous_selected;
-            return Ok(Some(format!("Cannot open directory: {err}")));
-        }
-        Ok(None)
+    /// Changes directory to `target` (absolute, or relative to the current
+    /// directory), resolving `.`/`..`/symlinks where possible. Used by the
+    /// command line's built-in `cd` handling (see `set_cwd` for failure
+    /// handling).
+    pub fn change_dir(&mut self, target: &Path) -> Result<Option<String>> {
+        let candidate = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            self.cwd.join(target)
+        };
+        let new_path = fs::canonicalize(&candidate).unwrap_or(candidate);
+        self.set_cwd(new_path)
     }
 }
 
@@ -204,6 +223,42 @@ mod tests {
             pane.entries.iter().any(|e| e.name == "dangling"),
             "a broken symlink should still show up in the listing"
         );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn change_dir_moves_to_relative_and_absolute_targets() {
+        let base = std::env::temp_dir().join("pc_test_pane_change_dir");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+
+        let mut pane = Pane::new(base.clone()).unwrap();
+
+        let result = pane.change_dir(Path::new("sub")).unwrap();
+        assert!(result.is_none());
+        assert_eq!(pane.cwd, base.join("sub").canonicalize().unwrap());
+
+        let result = pane.change_dir(&base).unwrap();
+        assert!(result.is_none());
+        assert_eq!(pane.cwd, base.canonicalize().unwrap());
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn change_dir_to_missing_path_reports_error_without_moving() {
+        let base = std::env::temp_dir().join("pc_test_pane_change_dir_missing");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let mut pane = Pane::new(base.clone()).unwrap();
+        let previous_cwd = pane.cwd.clone();
+
+        let result = pane.change_dir(Path::new("does_not_exist")).unwrap();
+
+        assert!(result.is_some());
+        assert_eq!(pane.cwd, previous_cwd);
 
         fs::remove_dir_all(&base).unwrap();
     }

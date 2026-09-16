@@ -254,10 +254,8 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             KeyCode::Up => app.settings_move_up(),
             KeyCode::Down => app.settings_move_down(),
             KeyCode::Char(' ') => app.settings_toggle_selected(),
-            // Settings apply immediately, so Enter isn't really "saving"
-            // anything new — it just closes with a positive, deliberate
-            // key rather than Esc's "never mind" feel. Esc/F9 still work too.
-            KeyCode::Enter | KeyCode::Esc | KeyCode::F(9) => app.cancel_dialog(),
+            KeyCode::Enter => app.settings_save(),
+            KeyCode::Esc | KeyCode::F(9) => app.settings_cancel(),
             _ => {}
         }
         return Ok(());

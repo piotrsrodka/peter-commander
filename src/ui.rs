@@ -50,7 +50,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Dialog::ConfirmQuit => {
             draw_confirm_dialog(frame, "Quit PeterCommander? [Y/n]");
         }
-        Dialog::Settings { selected } => {
+        Dialog::Settings { selected, .. } => {
             draw_settings_dialog(frame, app, *selected);
         }
         Dialog::None => {}
@@ -87,7 +87,7 @@ const HELP_LINES: &[&str] = &[
     "Esc clears the command line. Quit with F10 (or F9 > Command > Quit).",
     "",
     "F9 > Options > Settings opens the settings screen: Up/Down",
-    "to move, Space to toggle a checkbox, Enter to save/close.",
+    "to move, Space to toggle a checkbox, Enter to save, Esc to cancel.",
     "",
     "Press any key to close this help",
 ];
@@ -184,7 +184,7 @@ fn draw_confirm_dialog(frame: &mut Frame, message: &str) {
     frame.render_widget(paragraph, area);
 }
 
-const SETTINGS_HINT: &str = " Space: toggle   Enter: save/close";
+const SETTINGS_HINT: &str = " Space: toggle   Enter: save   Esc: cancel";
 
 fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
     let items: Vec<ListItem> = SettingItem::ALL

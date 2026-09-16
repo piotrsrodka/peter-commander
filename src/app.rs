@@ -66,6 +66,9 @@ pub enum Dialog {
     ConfirmQuit,
     Settings {
         selected: usize,
+        /// Values as they were when the dialog opened, so Esc can revert
+        /// toggles made during this session instead of just closing.
+        original: Vec<bool>,
     },
 }
 
@@ -80,6 +83,14 @@ impl SettingItem {
     pub fn label(&self) -> &'static str {
         match self {
             SettingItem::WaitAfterShellCommand => "Wait for Enter after running commands",
+        }
+    }
+
+    /// Stable identifier used in the persisted settings file, independent
+    /// of the display label so relabeling doesn't break saved settings.
+    pub fn key(&self) -> &'static str {
+        match self {
+            SettingItem::WaitAfterShellCommand => "wait_after_shell_command",
         }
     }
 }
@@ -120,6 +131,11 @@ impl App {
             Some(last) => (last.left, last.right),
             None => (cwd.clone(), cwd),
         };
+        let saved_settings = state::load_settings();
+        let wait_after_shell_command = saved_settings
+            .get(SettingItem::WaitAfterShellCommand.key())
+            .copied()
+            .unwrap_or(true);
         Ok(App {
             left: Pane::new(left_dir)?,
             right: Pane::new(right_dir)?,
@@ -133,7 +149,7 @@ impl App {
             external_request: None,
             help_open: false,
             command_line: String::new(),
-            wait_after_shell_command: true,
+            wait_after_shell_command,
         })
     }
 
@@ -255,7 +271,16 @@ impl App {
             Action::Edit => self.request_external(ExternalRequest::Edit, "edit"),
             Action::Help => self.help_open = true,
             Action::Quit => self.dialog = Dialog::ConfirmQuit,
-            Action::Settings => self.dialog = Dialog::Settings { selected: 0 },
+            Action::Settings => {
+                let original = SettingItem::ALL
+                    .iter()
+                    .map(|item| self.setting_value(*item))
+                    .collect();
+                self.dialog = Dialog::Settings {
+                    selected: 0,
+                    original,
+                };
+            }
             other => {
                 self.status_message = format!("{} is not implemented yet", other.label());
             }
@@ -273,16 +298,22 @@ impl App {
         }
     }
 
-    fn toggle_setting(&mut self, item: SettingItem) {
+    fn set_setting_value(&mut self, item: SettingItem, value: bool) {
         match item {
-            SettingItem::WaitAfterShellCommand => {
-                self.wait_after_shell_command = !self.wait_after_shell_command;
-            }
+            SettingItem::WaitAfterShellCommand => self.wait_after_shell_command = value,
         }
     }
 
+    fn persist_settings(&self) {
+        let pairs: Vec<(&str, bool)> = SettingItem::ALL
+            .iter()
+            .map(|item| (item.key(), self.setting_value(*item)))
+            .collect();
+        state::save_settings(&pairs);
+    }
+
     pub fn settings_move_up(&mut self) {
-        if let Dialog::Settings { selected } = &mut self.dialog {
+        if let Dialog::Settings { selected, .. } = &mut self.dialog {
             *selected = if *selected == 0 {
                 SettingItem::ALL.len() - 1
             } else {
@@ -292,15 +323,38 @@ impl App {
     }
 
     pub fn settings_move_down(&mut self) {
-        if let Dialog::Settings { selected } = &mut self.dialog {
+        if let Dialog::Settings { selected, .. } = &mut self.dialog {
             *selected = (*selected + 1) % SettingItem::ALL.len();
         }
     }
 
+    /// Toggles the selected checkbox in memory only — not persisted until
+    /// `settings_save`, so `settings_cancel` can still revert it.
     pub fn settings_toggle_selected(&mut self) {
-        if let Dialog::Settings { selected } = &self.dialog {
+        if let Dialog::Settings { selected, .. } = &self.dialog {
             let item = SettingItem::ALL[*selected];
-            self.toggle_setting(item);
+            let value = self.setting_value(item);
+            self.set_setting_value(item, !value);
+        }
+    }
+
+    /// Enter: persists whatever the checkboxes currently show and closes.
+    pub fn settings_save(&mut self) {
+        self.persist_settings();
+        self.dialog = Dialog::None;
+    }
+
+    /// Esc/F9: reverts every setting to what it was when the dialog opened,
+    /// discarding any toggles made in this session, then closes.
+    pub fn settings_cancel(&mut self) {
+        let Dialog::Settings { original, .. } = &self.dialog else {
+            self.dialog = Dialog::None;
+            return;
+        };
+        let original = original.clone();
+        self.dialog = Dialog::None;
+        for (item, value) in SettingItem::ALL.iter().zip(original.iter()) {
+            self.set_setting_value(*item, *value);
         }
     }
 
@@ -499,8 +553,75 @@ impl App {
             return false;
         }
         self.command_line.clear();
+
+        // `cd` is a shell builtin: run as `$SHELL -c "cd ..."` it would just
+        // change a throwaway child process's directory and have no visible
+        // effect at all. Handle it ourselves so it actually moves the pane.
+        if let Some(target) = parse_cd_argument(&command) {
+            match self.active_pane().change_dir(&target) {
+                Ok(Some(message)) => self.set_error(message),
+                Ok(None) => {}
+                Err(err) => self.set_error(format!("cd failed: {err}")),
+            }
+            return true;
+        }
+
         let cwd = self.active_pane().cwd.clone();
         self.external_request = Some(ExternalRequest::Shell { command, cwd });
         true
+    }
+}
+
+/// Recognizes `cd`, `cd <path>`, `cd ~`, and `cd ~/path` on the command
+/// line, returning the target directory (with `~` expanded, but otherwise
+/// unresolved — resolution against the current directory happens in
+/// `Pane::change_dir`). Returns `None` for anything else, including a word
+/// that merely starts with "cd" (e.g. "cdiff").
+fn parse_cd_argument(command: &str) -> Option<PathBuf> {
+    let rest = command.strip_prefix("cd")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let arg = rest.trim();
+    if arg.is_empty() || arg == "~" {
+        return dirs::home_dir();
+    }
+    if let Some(suffix) = arg.strip_prefix("~/") {
+        return Some(dirs::home_dir()?.join(suffix));
+    }
+    Some(PathBuf::from(arg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bare_cd_as_home() {
+        assert_eq!(parse_cd_argument("cd"), dirs::home_dir());
+        assert_eq!(parse_cd_argument("cd "), dirs::home_dir());
+        assert_eq!(parse_cd_argument("cd ~"), dirs::home_dir());
+    }
+
+    #[test]
+    fn parses_cd_with_path() {
+        assert_eq!(parse_cd_argument("cd /tmp"), Some(PathBuf::from("/tmp")));
+        assert_eq!(
+            parse_cd_argument("cd some/relative/dir"),
+            Some(PathBuf::from("some/relative/dir"))
+        );
+    }
+
+    #[test]
+    fn parses_cd_with_home_relative_path() {
+        let expected = dirs::home_dir().map(|home| home.join("projects"));
+        assert_eq!(parse_cd_argument("cd ~/projects"), expected);
+    }
+
+    #[test]
+    fn does_not_match_non_cd_commands() {
+        assert_eq!(parse_cd_argument("cdiff a b"), None);
+        assert_eq!(parse_cd_argument("ls -la"), None);
+        assert_eq!(parse_cd_argument("echo cd"), None);
     }
 }
