@@ -5,7 +5,10 @@ mod pane;
 mod state;
 mod ui;
 
+use std::env;
 use std::io;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,7 +24,7 @@ use ratatui::backend::CrosstermBackend;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::flag;
 
-use app::{App, Dialog};
+use app::{App, Dialog, ExternalRequest};
 use menu::{Action, FN_KEYS};
 
 fn restore_terminal() {
@@ -71,9 +74,49 @@ fn run(
         {
             handle_key(&mut app, key.code, key.modifiers)?;
         }
+
+        if let Some(request) = app.external_request.take() {
+            run_external(terminal, request, &mut app)?;
+        }
     }
 
     app.save_state();
+    Ok(())
+}
+
+/// Suspends the TUI, runs an external program (pager/editor) on a file,
+/// and restores the TUI once it exits.
+fn run_external(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    request: ExternalRequest,
+    app: &mut App,
+) -> Result<()> {
+    let (env_var, default_program, path): (&str, &str, &Path) = match &request {
+        ExternalRequest::View(path) => ("PAGER", "less", path),
+        ExternalRequest::Edit(path) => ("EDITOR", "vi", path),
+    };
+    let program = env::var(env_var).unwrap_or_else(|_| default_program.to_string());
+
+    restore_terminal();
+    let status = Command::new(&program).arg(path).status();
+    enable_raw_mode().context("enable_raw_mode")?;
+    io::stdout()
+        .execute(EnterAlternateScreen)
+        .context("EnterAlternateScreen")?;
+    terminal.clear()?;
+
+    match status {
+        Ok(status) if !status.success() => {
+            app.status_message = format!("{program} exited with {status}");
+        }
+        Err(err) => {
+            app.status_message = format!("Failed to launch {program}: {err}");
+        }
+        Ok(_) => {}
+    }
+
+    app.left.reload()?;
+    app.right.reload()?;
     Ok(())
 }
 

@@ -64,6 +64,14 @@ pub enum Dialog {
     },
 }
 
+/// A request to suspend the TUI and hand the terminal to an external
+/// process. `main` owns the `Terminal` so it performs the actual
+/// suspend/spawn/resume; `App` just records what it wants run.
+pub enum ExternalRequest {
+    View(PathBuf),
+    Edit(PathBuf),
+}
+
 pub struct App {
     pub left: Pane,
     pub right: Pane,
@@ -74,6 +82,7 @@ pub struct App {
     pub menu_item: usize,
     pub status_message: String,
     pub dialog: Dialog,
+    pub external_request: Option<ExternalRequest>,
 }
 
 impl App {
@@ -93,6 +102,7 @@ impl App {
             menu_item: 0,
             status_message: String::new(),
             dialog: Dialog::None,
+            external_request: None,
         })
     }
 
@@ -177,6 +187,8 @@ impl App {
             Action::Delete => self.request_delete(),
             Action::MkDir => self.request_mkdir(),
             Action::NewFile => self.request_new_file(),
+            Action::View => self.request_external(ExternalRequest::View, "view"),
+            Action::Edit => self.request_external(ExternalRequest::Edit, "edit"),
             Action::Quit => self.quit(),
             other => {
                 self.status_message = format!("{} is not implemented yet", other.label());
@@ -213,6 +225,20 @@ impl App {
             name: entry.name.clone(),
             src,
         };
+    }
+
+    fn request_external(&mut self, make: fn(PathBuf) -> ExternalRequest, verb: &str) {
+        let pane = self.active_pane();
+        let Some(entry) = pane.selected_entry() else {
+            return;
+        };
+        if entry.is_dir {
+            self.status_message = format!("Cannot {verb} a directory");
+            return;
+        }
+        if let Some(path) = pane.selected_path() {
+            self.external_request = Some(make(path));
+        }
     }
 
     fn request_delete(&mut self) {
