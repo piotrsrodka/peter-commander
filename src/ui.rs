@@ -210,16 +210,12 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
                 Style::default().fg(Color::White)
             };
             let date = format_modified(entry.modified);
-            let label = if entry.is_dir {
-                format!(
-                    "{:<30} {:>10} {}",
-                    format!("{}/", entry.name),
-                    "<DIR>",
-                    date
-                )
+            let size_label = if entry.is_dir {
+                "<DIR>".to_string()
             } else {
-                format!("{:<30} {:>10} {}", entry.name, entry.size, date)
+                entry.size.to_string()
             };
+            let label = format!("{:<30} {:>10} {}", entry.name, size_label, date);
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
