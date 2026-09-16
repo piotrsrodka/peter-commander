@@ -83,7 +83,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
     }
 
     match code {
-        KeyCode::Char('q') => app.quit(),
+        KeyCode::Char('q') | KeyCode::Char('Q') => app.quit(),
         KeyCode::Tab => app.toggle_active(),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
