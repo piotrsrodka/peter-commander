@@ -56,8 +56,8 @@ impl Pane {
                 files.push(item);
             }
         }
-        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        dirs.sort_by_key(|a| a.name.to_lowercase());
+        files.sort_by_key(|a| a.name.to_lowercase());
 
         entries.extend(dirs);
         entries.extend(files);
@@ -86,20 +86,20 @@ impl Pane {
     }
 
     pub fn enter_selected(&mut self) -> Result<()> {
-        if let Some(entry) = self.selected_entry() {
-            if entry.is_dir {
-                let new_path = if entry.name == ".." {
-                    self.cwd
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| self.cwd.clone())
-                } else {
-                    self.cwd.join(&entry.name)
-                };
-                self.cwd = new_path;
-                self.selected = 0;
-                self.reload()?;
-            }
+        if let Some(entry) = self.selected_entry()
+            && entry.is_dir
+        {
+            let new_path = if entry.name == ".." {
+                self.cwd
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.cwd.clone())
+            } else {
+                self.cwd.join(&entry.name)
+            };
+            self.cwd = new_path;
+            self.selected = 0;
+            self.reload()?;
         }
         Ok(())
     }

@@ -1,4 +1,5 @@
 mod app;
+mod menu;
 mod pane;
 mod ui;
 
@@ -6,15 +7,16 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use app::App;
+use menu::FN_KEYS;
 
 fn main() -> Result<()> {
     enable_raw_mode()?;
@@ -37,12 +39,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key(&mut app, key.code)?;
-                }
-            }
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            handle_key(&mut app, key.code)?;
         }
     }
 
@@ -50,12 +51,35 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
+    if app.menu_open {
+        match code {
+            KeyCode::Esc => app.close_menu(),
+            KeyCode::Left => app.menu_left(),
+            KeyCode::Right => app.menu_right(),
+            KeyCode::Up => app.menu_up(),
+            KeyCode::Down => app.menu_down(),
+            KeyCode::Enter => app.confirm_menu_selection()?,
+            KeyCode::F(10) => app.close_menu(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.quit(),
+        KeyCode::Char('q') => app.quit(),
+        KeyCode::Esc => app.quit(),
         KeyCode::Tab => app.toggle_active(),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
         KeyCode::Enter => app.active_pane().enter_selected()?,
+        KeyCode::F(n) => {
+            if let Some(fn_key) = FN_KEYS.iter().find(|k| k.key == format!("F{n}")) {
+                match fn_key.action {
+                    Some(action) => app.run_action(action)?,
+                    None => app.open_menu(),
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
