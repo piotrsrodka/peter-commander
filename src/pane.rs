@@ -17,14 +17,18 @@ pub struct Pane {
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
     pub selected: usize,
+    /// Whether dotfiles (names starting with `.`) are filtered out of the
+    /// listing. The ".." pseudo-entry is always shown regardless.
+    pub hide_hidden: bool,
 }
 
 impl Pane {
-    pub fn new(cwd: PathBuf) -> Result<Self> {
+    pub fn new(cwd: PathBuf, hide_hidden: bool) -> Result<Self> {
         let mut pane = Pane {
             cwd,
             entries: Vec::new(),
             selected: 0,
+            hide_hidden,
         };
         pane.reload()?;
         Ok(pane)
@@ -48,13 +52,16 @@ impl Pane {
             // Skip entries we can't stat (e.g. broken symlinks, permission
             // issues on a single item) instead of failing the whole listing.
             let Ok(entry) = entry else { continue };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if self.hide_hidden && name.starts_with('.') {
+                continue;
+            }
             // Follow symlinks for classification (so a symlink to a
             // directory is treated as a directory, matching `ls -L`);
             // fall back to the link's own metadata for broken symlinks.
             let Ok(metadata) = fs::metadata(entry.path()).or_else(|_| entry.metadata()) else {
                 continue;
             };
-            let name = entry.file_name().to_string_lossy().to_string();
             let item = Entry {
                 name,
                 is_dir: metadata.is_dir(),
@@ -173,7 +180,7 @@ mod tests {
         fs::create_dir(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let mut pane = Pane::new(base.clone()).unwrap();
+        let mut pane = Pane::new(base.clone(), false).unwrap();
         pane.selected = pane
             .entries
             .iter()
@@ -196,7 +203,7 @@ mod tests {
         fs::create_dir_all(base.join("real_dir")).unwrap();
         std::os::unix::fs::symlink(base.join("real_dir"), base.join("link_to_dir")).unwrap();
 
-        let pane = Pane::new(base.clone()).unwrap();
+        let pane = Pane::new(base.clone(), false).unwrap();
         let entry = pane
             .entries
             .iter()
@@ -218,7 +225,7 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         std::os::unix::fs::symlink(base.join("does_not_exist"), base.join("dangling")).unwrap();
 
-        let pane = Pane::new(base.clone()).unwrap();
+        let pane = Pane::new(base.clone(), false).unwrap();
         assert!(
             pane.entries.iter().any(|e| e.name == "dangling"),
             "a broken symlink should still show up in the listing"
@@ -233,7 +240,7 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("sub")).unwrap();
 
-        let mut pane = Pane::new(base.clone()).unwrap();
+        let mut pane = Pane::new(base.clone(), false).unwrap();
 
         let result = pane.change_dir(Path::new("sub")).unwrap();
         assert!(result.is_none());
@@ -252,13 +259,32 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
 
-        let mut pane = Pane::new(base.clone()).unwrap();
+        let mut pane = Pane::new(base.clone(), false).unwrap();
         let previous_cwd = pane.cwd.clone();
 
         let result = pane.change_dir(Path::new("does_not_exist")).unwrap();
 
         assert!(result.is_some());
         assert_eq!(pane.cwd, previous_cwd);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn hide_hidden_filters_dotfiles_but_keeps_dotdot() {
+        let base = std::env::temp_dir().join("pc_test_pane_hidden");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join(".hidden_file"), "").unwrap();
+        fs::write(base.join("visible_file"), "").unwrap();
+
+        let pane = Pane::new(base.clone(), true).unwrap();
+        assert!(!pane.entries.iter().any(|e| e.name == ".hidden_file"));
+        assert!(pane.entries.iter().any(|e| e.name == "visible_file"));
+        assert!(pane.entries.iter().any(|e| e.name == ".."));
+
+        let pane = Pane::new(base.clone(), false).unwrap();
+        assert!(pane.entries.iter().any(|e| e.name == ".hidden_file"));
 
         fs::remove_dir_all(&base).unwrap();
     }

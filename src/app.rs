@@ -80,14 +80,19 @@ pub enum Dialog {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingItem {
     WaitAfterShellCommand,
+    HideHiddenFiles,
 }
 
 impl SettingItem {
-    pub const ALL: &'static [SettingItem] = &[SettingItem::WaitAfterShellCommand];
+    pub const ALL: &'static [SettingItem] = &[
+        SettingItem::WaitAfterShellCommand,
+        SettingItem::HideHiddenFiles,
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
             SettingItem::WaitAfterShellCommand => "Wait for Enter after running commands",
+            SettingItem::HideHiddenFiles => "Hide hidden files/folders",
         }
     }
 
@@ -96,6 +101,7 @@ impl SettingItem {
     pub fn key(&self) -> &'static str {
         match self {
             SettingItem::WaitAfterShellCommand => "wait_after_shell_command",
+            SettingItem::HideHiddenFiles => "hide_hidden_files",
         }
     }
 }
@@ -141,9 +147,13 @@ impl App {
             .get(SettingItem::WaitAfterShellCommand.key())
             .copied()
             .unwrap_or(true);
+        let hide_hidden_files = saved_settings
+            .get(SettingItem::HideHiddenFiles.key())
+            .copied()
+            .unwrap_or(false);
         Ok(App {
-            left: Pane::new(left_dir)?,
-            right: Pane::new(right_dir)?,
+            left: Pane::new(left_dir, hide_hidden_files)?,
+            right: Pane::new(right_dir, hide_hidden_files)?,
             active: Side::Left,
             should_quit: false,
             menu_open: false,
@@ -356,12 +366,25 @@ impl App {
     pub fn setting_value(&self, item: SettingItem) -> bool {
         match item {
             SettingItem::WaitAfterShellCommand => self.wait_after_shell_command,
+            // Both panes are always kept in sync, so either one reflects
+            // the current value.
+            SettingItem::HideHiddenFiles => self.left.hide_hidden,
         }
     }
 
     fn set_setting_value(&mut self, item: SettingItem, value: bool) {
         match item {
             SettingItem::WaitAfterShellCommand => self.wait_after_shell_command = value,
+            SettingItem::HideHiddenFiles => {
+                self.left.hide_hidden = value;
+                self.right.hide_hidden = value;
+                if let Err(err) = self.left.reload() {
+                    self.set_error(format!("Cannot reload left pane: {err}"));
+                }
+                if let Err(err) = self.right.reload() {
+                    self.set_error(format!("Cannot reload right pane: {err}"));
+                }
+            }
         }
     }
 
