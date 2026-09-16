@@ -1,5 +1,6 @@
 mod app;
 mod fs_ops;
+mod logging;
 mod menu;
 mod pane;
 mod state;
@@ -36,6 +37,7 @@ fn main() -> Result<()> {
     let default_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
+        logging::log_error(&format!("panic: {info}"));
         default_panic_hook(info);
     }));
 
@@ -55,6 +57,10 @@ fn main() -> Result<()> {
     let result = run(&mut terminal, &should_exit);
 
     restore_terminal();
+
+    if let Err(err) = &result {
+        logging::log_error(&format!("fatal: {err:?}"));
+    }
 
     result
 }
@@ -116,10 +122,10 @@ fn run_external(
 
     match status {
         Ok(status) if !status.success() => {
-            app.status_message = format!("{program} exited with {status}");
+            app.set_error(format!("{program} exited with {status}"));
         }
         Err(err) => {
-            app.status_message = format!("Failed to launch {program}: {err}");
+            app.set_error(format!("Failed to launch {program}: {err}"));
         }
         Ok(_) => {}
     }

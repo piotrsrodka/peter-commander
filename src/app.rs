@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::fs_ops;
+use crate::logging;
 use crate::menu::{Action, MENU_BAR};
 use crate::pane::Pane;
 use crate::state;
@@ -110,6 +111,13 @@ impl App {
         state::save(&self.left.cwd, &self.right.cwd);
     }
 
+    /// Sets the status message and appends it to the error log. Use this for
+    /// unexpected failures (I/O errors), not routine user-facing guidance.
+    pub fn set_error(&mut self, message: String) {
+        logging::log_error(&message);
+        self.status_message = message;
+    }
+
     pub fn active_pane(&mut self) -> &mut Pane {
         match self.active {
             Side::Left => &mut self.left,
@@ -199,7 +207,7 @@ impl App {
 
     pub fn open_selected(&mut self) -> Result<()> {
         if let Some(message) = self.active_pane().enter_selected()? {
-            self.status_message = message;
+            self.set_error(message);
         }
         Ok(())
     }
@@ -264,7 +272,7 @@ impl App {
                 match kind {
                     DialogKind::Delete => match fs_ops::delete_recursive(&src) {
                         Ok(()) => self.status_message = format!("Deleted {name}"),
-                        Err(err) => self.status_message = format!("Delete failed: {err}"),
+                        Err(err) => self.set_error(format!("Delete failed: {err}")),
                     },
                     DialogKind::Copy => {
                         let dest = self.inactive_pane().cwd.join(&name);
@@ -273,7 +281,7 @@ impl App {
                                 self.status_message =
                                     format!("Copied {} to {}", src.display(), dest.display());
                             }
-                            Err(err) => self.status_message = format!("Copy failed: {err}"),
+                            Err(err) => self.set_error(format!("Copy failed: {err}")),
                         }
                     }
                     DialogKind::Move => {
@@ -283,7 +291,7 @@ impl App {
                                 self.status_message =
                                     format!("Moved {} to {}", src.display(), dest.display());
                             }
-                            Err(err) => self.status_message = format!("Move failed: {err}"),
+                            Err(err) => self.set_error(format!("Move failed: {err}")),
                         }
                     }
                 }
@@ -305,11 +313,11 @@ impl App {
                 match kind {
                     TextInputKind::MkDir => match std::fs::create_dir(&target) {
                         Ok(()) => self.status_message = format!("Created directory {name}"),
-                        Err(err) => self.status_message = format!("MkDir failed: {err}"),
+                        Err(err) => self.set_error(format!("MkDir failed: {err}")),
                     },
                     TextInputKind::NewFile => match std::fs::File::create(&target) {
                         Ok(_) => self.status_message = format!("Created file {name}"),
-                        Err(err) => self.status_message = format!("New file failed: {err}"),
+                        Err(err) => self.set_error(format!("New file failed: {err}")),
                     },
                 }
 
