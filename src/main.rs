@@ -2,6 +2,7 @@ mod app;
 mod fs_ops;
 mod menu;
 mod pane;
+mod state;
 mod ui;
 
 use std::io;
@@ -48,6 +49,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         }
     }
 
+    app.save_state();
     Ok(())
 }
 

@@ -6,6 +6,7 @@ use anyhow::Result;
 use crate::fs_ops;
 use crate::menu::{Action, MENU_BAR};
 use crate::pane::Pane;
+use crate::state;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -59,9 +60,13 @@ pub struct App {
 impl App {
     pub fn new() -> Result<Self> {
         let cwd = env::current_dir()?;
+        let (left_dir, right_dir) = match state::load() {
+            Some(last) => (last.left, last.right),
+            None => (cwd.clone(), cwd),
+        };
         Ok(App {
-            left: Pane::new(cwd.clone())?,
-            right: Pane::new(cwd)?,
+            left: Pane::new(left_dir)?,
+            right: Pane::new(right_dir)?,
             active: Side::Left,
             should_quit: false,
             menu_open: false,
@@ -70,6 +75,10 @@ impl App {
             status_message: String::new(),
             dialog: Dialog::None,
         })
+    }
+
+    pub fn save_state(&self) {
+        state::save(&self.left.cwd, &self.right.cwd);
     }
 
     pub fn active_pane(&mut self) -> &mut Pane {
