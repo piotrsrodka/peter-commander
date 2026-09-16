@@ -73,6 +73,16 @@ impl Pane {
         self.entries.get(self.selected)
     }
 
+    /// The filesystem path of the selected entry, or `None` for the ".." pseudo-entry.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        let entry = self.selected_entry()?;
+        if entry.name == ".." {
+            None
+        } else {
+            Some(self.cwd.join(&entry.name))
+        }
+    }
+
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;

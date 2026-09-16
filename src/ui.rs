@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{App, Side};
+use crate::app::{App, Dialog, Side};
 use crate::menu::{FN_KEYS, MENU_BAR};
 use crate::pane::Pane;
 
@@ -35,6 +35,37 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.menu_open {
         draw_menu_dropdown(frame, root[0], app);
     }
+
+    if let Dialog::ConfirmDelete { name, .. } = &app.dialog {
+        draw_confirm_dialog(frame, &format!("Delete '{name}'? (y/n)"));
+    }
+}
+
+fn draw_confirm_dialog(frame: &mut Frame, message: &str) {
+    let width = (message.len() as u16 + 4).min(frame.area().width);
+    let height = 3;
+    let area = Rect {
+        x: (frame.area().width.saturating_sub(width)) / 2,
+        y: (frame.area().height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let paragraph = Paragraph::new(Line::from(Span::styled(
+        message,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &App) {

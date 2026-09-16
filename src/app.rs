@@ -1,7 +1,9 @@
 use std::env;
+use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::fs_ops;
 use crate::menu::{Action, MENU_BAR};
 use crate::pane::Pane;
 
@@ -9,6 +11,11 @@ use crate::pane::Pane;
 pub enum Side {
     Left,
     Right,
+}
+
+pub enum Dialog {
+    None,
+    ConfirmDelete { name: String, path: PathBuf },
 }
 
 pub struct App {
@@ -20,6 +27,7 @@ pub struct App {
     pub menu_category: usize,
     pub menu_item: usize,
     pub status_message: String,
+    pub dialog: Dialog,
 }
 
 impl App {
@@ -34,6 +42,7 @@ impl App {
             menu_category: 0,
             menu_item: 0,
             status_message: String::new(),
+            dialog: Dialog::None,
         })
     }
 
@@ -41,6 +50,13 @@ impl App {
         match self.active {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
+        }
+    }
+
+    pub fn inactive_pane(&mut self) -> &mut Pane {
+        match self.active {
+            Side::Left => &mut self.right,
+            Side::Right => &mut self.left,
         }
     }
 
@@ -102,11 +118,71 @@ impl App {
     pub fn run_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Open => self.active_pane().enter_selected()?,
+            Action::Copy => self.copy_selected()?,
+            Action::Delete => self.request_delete(),
             Action::Quit => self.quit(),
             other => {
                 self.status_message = format!("{} is not implemented yet", other.label());
             }
         }
         Ok(())
+    }
+
+    fn copy_selected(&mut self) -> Result<()> {
+        let Some(src) = self.active_pane().selected_path() else {
+            return Ok(());
+        };
+        let Some(file_name) = src.file_name() else {
+            return Ok(());
+        };
+        let dest = self.inactive_pane().cwd.join(file_name);
+
+        match fs_ops::copy_recursive(&src, &dest) {
+            Ok(()) => {
+                self.status_message = format!("Copied {} to {}", src.display(), dest.display());
+            }
+            Err(err) => {
+                self.status_message = format!("Copy failed: {err}");
+            }
+        }
+
+        self.left.reload()?;
+        self.right.reload()?;
+        Ok(())
+    }
+
+    fn request_delete(&mut self) {
+        let pane = self.active_pane();
+        if let Some(path) = pane.selected_path()
+            && let Some(entry) = pane.selected_entry()
+        {
+            self.dialog = Dialog::ConfirmDelete {
+                name: entry.name.clone(),
+                path,
+            };
+        }
+    }
+
+    pub fn confirm_dialog(&mut self) -> Result<()> {
+        if let Dialog::ConfirmDelete { path, name } = &self.dialog {
+            let path = path.clone();
+            let name = name.clone();
+            match fs_ops::delete_recursive(&path) {
+                Ok(()) => {
+                    self.status_message = format!("Deleted {name}");
+                }
+                Err(err) => {
+                    self.status_message = format!("Delete failed: {err}");
+                }
+            }
+            self.dialog = Dialog::None;
+            self.left.reload()?;
+            self.right.reload()?;
+        }
+        Ok(())
+    }
+
+    pub fn cancel_dialog(&mut self) {
+        self.dialog = Dialog::None;
     }
 }
