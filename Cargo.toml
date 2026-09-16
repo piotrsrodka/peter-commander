@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = "0.4.45"
 crossterm = "0.29.0"
 dirs = "7.0.0"
 ratatui = "0.30.2"

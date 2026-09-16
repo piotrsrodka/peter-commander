@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -140,6 +141,15 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
+fn format_modified(modified: Option<std::time::SystemTime>) -> String {
+    match modified {
+        Some(time) => DateTime::<Local>::from(time)
+            .format("%d-%m-%y %H:%M")
+            .to_string(),
+        None => String::new(),
+    }
+}
+
 fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
     let border_style = if is_active {
         Style::default()
@@ -162,10 +172,16 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
             } else {
                 Style::default().fg(Color::White)
             };
+            let date = format_modified(entry.modified);
             let label = if entry.is_dir {
-                format!("{}/", entry.name)
+                format!(
+                    "{:<30} {:>10} {}",
+                    format!("{}/", entry.name),
+                    "<DIR>",
+                    date
+                )
             } else {
-                format!("{:<30} {:>10}", entry.name, entry.size)
+                format!("{:<30} {:>10} {}", entry.name, entry.size, date)
             };
             ListItem::new(Line::from(Span::styled(label, style)))
         })

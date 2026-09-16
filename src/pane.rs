@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::Result;
 
@@ -8,6 +9,7 @@ pub struct Entry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    pub modified: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -36,6 +38,7 @@ impl Pane {
                 name: "..".to_string(),
                 is_dir: true,
                 size: 0,
+                modified: None,
             });
         }
 
@@ -49,6 +52,7 @@ impl Pane {
                 name,
                 is_dir: metadata.is_dir(),
                 size: metadata.len(),
+                modified: metadata.modified().ok(),
             };
             if item.is_dir {
                 dirs.push(item);
