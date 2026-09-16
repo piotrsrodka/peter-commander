@@ -95,10 +95,19 @@ fn run_external(
         ExternalRequest::View(path) => ("PAGER", "less", path),
         ExternalRequest::Edit(path) => ("EDITOR", "vi", path),
     };
-    let program = env::var(env_var).unwrap_or_else(|_| default_program.to_string());
+    // $EDITOR/$PAGER may be a full command line (e.g. "omarchy-launch-editor
+    // --inline"), not just a bare program name, so parse it like a shell would.
+    let command_line = env::var(env_var).unwrap_or_else(|_| default_program.to_string());
+    let mut parts =
+        shell_words::split(&command_line).unwrap_or_else(|_| vec![command_line.clone()]);
+    if parts.is_empty() {
+        parts.push(default_program.to_string());
+    }
+    let program = parts.remove(0);
+    let args = parts;
 
     restore_terminal();
-    let status = Command::new(&program).arg(path).status();
+    let status = Command::new(&program).args(&args).arg(path).status();
     enable_raw_mode().context("enable_raw_mode")?;
     io::stdout()
         .execute(EnterAlternateScreen)
