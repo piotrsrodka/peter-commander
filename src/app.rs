@@ -152,7 +152,7 @@ impl App {
 
     pub fn run_action(&mut self, action: Action) -> Result<()> {
         match action {
-            Action::Open => self.active_pane().enter_selected()?,
+            Action::Open => self.open_selected()?,
             Action::Copy => self.request_copy(),
             Action::Move => self.request_move(),
             Action::Delete => self.request_delete(),
@@ -160,6 +160,13 @@ impl App {
             other => {
                 self.status_message = format!("{} is not implemented yet", other.label());
             }
+        }
+        Ok(())
+    }
+
+    pub fn open_selected(&mut self) -> Result<()> {
+        if let Some(message) = self.active_pane().enter_selected()? {
+            self.status_message = message;
         }
         Ok(())
     }

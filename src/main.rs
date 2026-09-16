@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -41,11 +41,13 @@ fn main() -> Result<()> {
         flag::register(signal, Arc::clone(&should_exit))?;
     }
 
-    enable_raw_mode()?;
+    enable_raw_mode().context("enable_raw_mode")?;
     let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
+    stdout
+        .execute(EnterAlternateScreen)
+        .context("EnterAlternateScreen")?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend).context("Terminal::new")?;
 
     let result = run(&mut terminal, &should_exit);
 
@@ -111,7 +113,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
         KeyCode::Tab => app.toggle_active(),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
-        KeyCode::Enter => app.active_pane().enter_selected()?,
+        KeyCode::Enter => app.open_selected()?,
         KeyCode::F(n) => {
             if let Some(fn_key) = FN_KEYS.iter().find(|k| k.key == format!("F{n}")) {
                 match fn_key.action {
