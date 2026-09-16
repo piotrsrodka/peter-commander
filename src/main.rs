@@ -54,8 +54,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
 fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
     if !matches!(app.dialog, Dialog::None) {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => app.confirm_dialog()?,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_dialog()?,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                app.cancel_dialog()
+            }
             _ => {}
         }
         return Ok(());

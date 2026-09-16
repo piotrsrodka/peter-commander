@@ -37,7 +37,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     if let Dialog::ConfirmDelete { name, .. } = &app.dialog {
-        draw_confirm_dialog(frame, &format!("Delete '{name}'? (y/n)"));
+        draw_confirm_dialog(frame, &format!("Delete '{name}'? [y/N]"));
     }
 }
 
