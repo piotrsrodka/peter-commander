@@ -1,0 +1,36 @@
+# Maintainer: Piotr Srodka <piotr.srodka@hey.com>
+pkgname=peter-commander
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A dual-pane terminal file manager"
+arch=('x86_64' 'aarch64')
+url="https://github.com/piotrsrodka/peter-commander"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/piotrsrodka/peter-commander/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('3d7712ebed82f428cdb81bc338f3be2973afb774826e1602a53d4f5804a5bbf1')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    cargo test --frozen --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
