@@ -48,7 +48,10 @@ impl Pane {
             // Skip entries we can't stat (e.g. broken symlinks, permission
             // issues on a single item) instead of failing the whole listing.
             let Ok(entry) = entry else { continue };
-            let Ok(metadata) = entry.metadata() else {
+            // Follow symlinks for classification (so a symlink to a
+            // directory is treated as a directory, matching `ls -L`);
+            // fall back to the link's own metadata for broken symlinks.
+            let Ok(metadata) = fs::metadata(entry.path()).or_else(|_| entry.metadata()) else {
                 continue;
             };
             let name = entry.file_name().to_string_lossy().to_string();
@@ -164,6 +167,44 @@ mod tests {
         assert_eq!(pane.cwd, base, "cwd must not change on failed entry");
 
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn symlink_to_directory_is_classified_as_a_directory() {
+        let base = std::env::temp_dir().join("pc_test_pane_symlink");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("real_dir")).unwrap();
+        std::os::unix::fs::symlink(base.join("real_dir"), base.join("link_to_dir")).unwrap();
+
+        let pane = Pane::new(base.clone()).unwrap();
+        let entry = pane
+            .entries
+            .iter()
+            .find(|e| e.name == "link_to_dir")
+            .unwrap();
+
+        assert!(
+            entry.is_dir,
+            "a symlink to a directory must be classified as a directory"
+        );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn broken_symlink_is_still_listed() {
+        let base = std::env::temp_dir().join("pc_test_pane_broken_symlink");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(base.join("does_not_exist"), base.join("dangling")).unwrap();
+
+        let pane = Pane::new(base.clone()).unwrap();
+        assert!(
+            pane.entries.iter().any(|e| e.name == "dangling"),
+            "a broken symlink should still show up in the listing"
+        );
+
         fs::remove_dir_all(&base).unwrap();
     }
 }
