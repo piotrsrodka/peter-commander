@@ -36,12 +36,31 @@ impl DialogKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextInputKind {
+    MkDir,
+    NewFile,
+}
+
+impl TextInputKind {
+    pub fn prompt(&self) -> &'static str {
+        match self {
+            TextInputKind::MkDir => "New directory name:",
+            TextInputKind::NewFile => "New file name:",
+        }
+    }
+}
+
 pub enum Dialog {
     None,
     Confirm {
         kind: DialogKind,
         name: String,
         src: PathBuf,
+    },
+    TextInput {
+        kind: TextInputKind,
+        input: String,
     },
 }
 
@@ -156,6 +175,8 @@ impl App {
             Action::Copy => self.request_copy(),
             Action::Move => self.request_move(),
             Action::Delete => self.request_delete(),
+            Action::MkDir => self.request_mkdir(),
+            Action::NewFile => self.request_new_file(),
             Action::Quit => self.quit(),
             other => {
                 self.status_message = format!("{} is not implemented yet", other.label());
@@ -208,43 +229,70 @@ impl App {
     }
 
     pub fn confirm_dialog(&mut self) -> Result<()> {
-        let Dialog::Confirm { kind, name, src } = &self.dialog else {
-            return Ok(());
-        };
-        let kind = *kind;
-        let name = name.clone();
-        let src = src.clone();
+        match &self.dialog {
+            Dialog::Confirm { kind, name, src } => {
+                let kind = *kind;
+                let name = name.clone();
+                let src = src.clone();
 
-        match kind {
-            DialogKind::Delete => match fs_ops::delete_recursive(&src) {
-                Ok(()) => self.status_message = format!("Deleted {name}"),
-                Err(err) => self.status_message = format!("Delete failed: {err}"),
-            },
-            DialogKind::Copy => {
-                let dest = self.inactive_pane().cwd.join(&name);
-                match fs_ops::copy_recursive(&src, &dest) {
-                    Ok(()) => {
-                        self.status_message =
-                            format!("Copied {} to {}", src.display(), dest.display());
+                match kind {
+                    DialogKind::Delete => match fs_ops::delete_recursive(&src) {
+                        Ok(()) => self.status_message = format!("Deleted {name}"),
+                        Err(err) => self.status_message = format!("Delete failed: {err}"),
+                    },
+                    DialogKind::Copy => {
+                        let dest = self.inactive_pane().cwd.join(&name);
+                        match fs_ops::copy_recursive(&src, &dest) {
+                            Ok(()) => {
+                                self.status_message =
+                                    format!("Copied {} to {}", src.display(), dest.display());
+                            }
+                            Err(err) => self.status_message = format!("Copy failed: {err}"),
+                        }
                     }
-                    Err(err) => self.status_message = format!("Copy failed: {err}"),
-                }
-            }
-            DialogKind::Move => {
-                let dest = self.inactive_pane().cwd.join(&name);
-                match fs_ops::move_path(&src, &dest) {
-                    Ok(()) => {
-                        self.status_message =
-                            format!("Moved {} to {}", src.display(), dest.display());
+                    DialogKind::Move => {
+                        let dest = self.inactive_pane().cwd.join(&name);
+                        match fs_ops::move_path(&src, &dest) {
+                            Ok(()) => {
+                                self.status_message =
+                                    format!("Moved {} to {}", src.display(), dest.display());
+                            }
+                            Err(err) => self.status_message = format!("Move failed: {err}"),
+                        }
                     }
-                    Err(err) => self.status_message = format!("Move failed: {err}"),
                 }
+
+                self.dialog = Dialog::None;
+                self.left.reload()?;
+                self.right.reload()?;
             }
+            Dialog::TextInput { kind, input } => {
+                let kind = *kind;
+                let name = input.clone();
+                if name.trim().is_empty() {
+                    self.status_message = "Name cannot be empty".to_string();
+                    self.dialog = Dialog::None;
+                    return Ok(());
+                }
+                let target = self.active_pane().cwd.join(&name);
+
+                match kind {
+                    TextInputKind::MkDir => match std::fs::create_dir(&target) {
+                        Ok(()) => self.status_message = format!("Created directory {name}"),
+                        Err(err) => self.status_message = format!("MkDir failed: {err}"),
+                    },
+                    TextInputKind::NewFile => match std::fs::File::create(&target) {
+                        Ok(_) => self.status_message = format!("Created file {name}"),
+                        Err(err) => self.status_message = format!("New file failed: {err}"),
+                    },
+                }
+
+                self.dialog = Dialog::None;
+                self.left.reload()?;
+                self.right.reload()?;
+            }
+            Dialog::None => {}
         }
-
-        self.dialog = Dialog::None;
-        self.left.reload()?;
-        self.right.reload()?;
         Ok(())
     }
 
@@ -252,10 +300,40 @@ impl App {
         self.dialog = Dialog::None;
     }
 
+    pub fn dialog_is_text_input(&self) -> bool {
+        matches!(self.dialog, Dialog::TextInput { .. })
+    }
+
+    pub fn request_mkdir(&mut self) {
+        self.dialog = Dialog::TextInput {
+            kind: TextInputKind::MkDir,
+            input: String::new(),
+        };
+    }
+
+    pub fn request_new_file(&mut self) {
+        self.dialog = Dialog::TextInput {
+            kind: TextInputKind::NewFile,
+            input: String::new(),
+        };
+    }
+
     pub fn dialog_default_yes(&self) -> bool {
         match &self.dialog {
             Dialog::Confirm { kind, .. } => kind.default_yes(),
-            Dialog::None => false,
+            Dialog::TextInput { .. } | Dialog::None => false,
+        }
+    }
+
+    pub fn text_input_push(&mut self, c: char) {
+        if let Dialog::TextInput { input, .. } = &mut self.dialog {
+            input.push(c);
+        }
+    }
+
+    pub fn text_input_backspace(&mut self) {
+        if let Dialog::TextInput { input, .. } = &mut self.dialog {
+            input.pop();
         }
     }
 }

@@ -37,10 +37,47 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_menu_dropdown(frame, root[0], app);
     }
 
-    if let Dialog::Confirm { kind, name, .. } = &app.dialog {
-        let hint = if kind.default_yes() { "[Y/n]" } else { "[y/N]" };
-        draw_confirm_dialog(frame, &format!("{} '{}'? {}", kind.verb(), name, hint));
+    match &app.dialog {
+        Dialog::Confirm { kind, name, .. } => {
+            let hint = if kind.default_yes() { "[Y/n]" } else { "[y/N]" };
+            draw_confirm_dialog(frame, &format!("{} '{}'? {}", kind.verb(), name, hint));
+        }
+        Dialog::TextInput { kind, input } => {
+            draw_text_input_dialog(frame, kind.prompt(), input);
+        }
+        Dialog::None => {}
     }
+}
+
+fn draw_text_input_dialog(frame: &mut Frame, prompt: &str, input: &str) {
+    let width = (prompt.len().max(input.len() + 2) as u16 + 4).min(frame.area().width);
+    let height = 4;
+    let area = Rect {
+        x: (frame.area().width.saturating_sub(width)) / 2,
+        y: (frame.area().height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let block = Block::default()
+        .title(prompt)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let paragraph = Paragraph::new(Line::from(vec![
+        Span::styled(input, Style::default().fg(Color::White)),
+        Span::styled(
+            "_",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ]))
+    .block(block);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_confirm_dialog(frame: &mut Frame, message: &str) {

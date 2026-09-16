@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -22,7 +22,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::flag;
 
 use app::{App, Dialog};
-use menu::FN_KEYS;
+use menu::{Action, FN_KEYS};
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -69,7 +69,7 @@ fn run(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(&mut app, key.code)?;
+            handle_key(&mut app, key.code, key.modifiers)?;
         }
     }
 
@@ -77,7 +77,18 @@ fn run(
     Ok(())
 }
 
-fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
+fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    if app.dialog_is_text_input() {
+        match code {
+            KeyCode::Enter => app.confirm_dialog()?,
+            KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Backspace => app.text_input_backspace(),
+            KeyCode::Char(c) => app.text_input_push(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if !matches!(app.dialog, Dialog::None) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_dialog()?,
@@ -114,6 +125,9 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
         KeyCode::Enter => app.open_selected()?,
+        KeyCode::F(4) if modifiers.contains(KeyModifiers::SHIFT) => {
+            app.run_action(Action::NewFile)?;
+        }
         KeyCode::F(n) => {
             if let Some(fn_key) = FN_KEYS.iter().find(|k| k.key == format!("F{n}")) {
                 match fn_key.action {
