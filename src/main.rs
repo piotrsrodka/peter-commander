@@ -55,8 +55,13 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
     if !matches!(app.dialog, Dialog::None) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_dialog()?,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                app.cancel_dialog()
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Enter => {
+                if app.dialog_default_yes() {
+                    app.confirm_dialog()?;
+                } else {
+                    app.cancel_dialog();
+                }
             }
             _ => {}
         }

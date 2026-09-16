@@ -13,9 +13,35 @@ pub enum Side {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKind {
+    Delete,
+    Copy,
+    Move,
+}
+
+impl DialogKind {
+    pub fn verb(&self) -> &'static str {
+        match self {
+            DialogKind::Delete => "Delete",
+            DialogKind::Copy => "Copy",
+            DialogKind::Move => "Move",
+        }
+    }
+
+    /// Delete is destructive and defaults to "no"; Copy/Move default to "yes".
+    pub fn default_yes(&self) -> bool {
+        !matches!(self, DialogKind::Delete)
+    }
+}
+
 pub enum Dialog {
     None,
-    ConfirmDelete { name: String, path: PathBuf },
+    Confirm {
+        kind: DialogKind,
+        name: String,
+        src: PathBuf,
+    },
 }
 
 pub struct App {
@@ -118,8 +144,8 @@ impl App {
     pub fn run_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Open => self.active_pane().enter_selected()?,
-            Action::Copy => self.copy_selected()?,
-            Action::Move => self.move_selected()?,
+            Action::Copy => self.request_copy(),
+            Action::Move => self.request_move(),
             Action::Delete => self.request_delete(),
             Action::Quit => self.quit(),
             other => {
@@ -129,50 +155,27 @@ impl App {
         Ok(())
     }
 
-    fn copy_selected(&mut self) -> Result<()> {
-        let Some(src) = self.active_pane().selected_path() else {
-            return Ok(());
-        };
-        let Some(file_name) = src.file_name() else {
-            return Ok(());
-        };
-        let dest = self.inactive_pane().cwd.join(file_name);
-
-        match fs_ops::copy_recursive(&src, &dest) {
-            Ok(()) => {
-                self.status_message = format!("Copied {} to {}", src.display(), dest.display());
-            }
-            Err(err) => {
-                self.status_message = format!("Copy failed: {err}");
-            }
-        }
-
-        self.left.reload()?;
-        self.right.reload()?;
-        Ok(())
+    fn request_copy(&mut self) {
+        self.request_transfer(DialogKind::Copy);
     }
 
-    fn move_selected(&mut self) -> Result<()> {
-        let Some(src) = self.active_pane().selected_path() else {
-            return Ok(());
-        };
-        let Some(file_name) = src.file_name() else {
-            return Ok(());
-        };
-        let dest = self.inactive_pane().cwd.join(file_name);
+    fn request_move(&mut self) {
+        self.request_transfer(DialogKind::Move);
+    }
 
-        match fs_ops::move_path(&src, &dest) {
-            Ok(()) => {
-                self.status_message = format!("Moved {} to {}", src.display(), dest.display());
-            }
-            Err(err) => {
-                self.status_message = format!("Move failed: {err}");
-            }
-        }
-
-        self.left.reload()?;
-        self.right.reload()?;
-        Ok(())
+    fn request_transfer(&mut self, kind: DialogKind) {
+        let pane = self.active_pane();
+        let Some(src) = pane.selected_path() else {
+            return;
+        };
+        let Some(entry) = pane.selected_entry() else {
+            return;
+        };
+        self.dialog = Dialog::Confirm {
+            kind,
+            name: entry.name.clone(),
+            src,
+        };
     }
 
     fn request_delete(&mut self) {
@@ -180,33 +183,63 @@ impl App {
         if let Some(path) = pane.selected_path()
             && let Some(entry) = pane.selected_entry()
         {
-            self.dialog = Dialog::ConfirmDelete {
+            self.dialog = Dialog::Confirm {
+                kind: DialogKind::Delete,
                 name: entry.name.clone(),
-                path,
+                src: path,
             };
         }
     }
 
     pub fn confirm_dialog(&mut self) -> Result<()> {
-        if let Dialog::ConfirmDelete { path, name } = &self.dialog {
-            let path = path.clone();
-            let name = name.clone();
-            match fs_ops::delete_recursive(&path) {
-                Ok(()) => {
-                    self.status_message = format!("Deleted {name}");
-                }
-                Err(err) => {
-                    self.status_message = format!("Delete failed: {err}");
+        let Dialog::Confirm { kind, name, src } = &self.dialog else {
+            return Ok(());
+        };
+        let kind = *kind;
+        let name = name.clone();
+        let src = src.clone();
+
+        match kind {
+            DialogKind::Delete => match fs_ops::delete_recursive(&src) {
+                Ok(()) => self.status_message = format!("Deleted {name}"),
+                Err(err) => self.status_message = format!("Delete failed: {err}"),
+            },
+            DialogKind::Copy => {
+                let dest = self.inactive_pane().cwd.join(&name);
+                match fs_ops::copy_recursive(&src, &dest) {
+                    Ok(()) => {
+                        self.status_message =
+                            format!("Copied {} to {}", src.display(), dest.display());
+                    }
+                    Err(err) => self.status_message = format!("Copy failed: {err}"),
                 }
             }
-            self.dialog = Dialog::None;
-            self.left.reload()?;
-            self.right.reload()?;
+            DialogKind::Move => {
+                let dest = self.inactive_pane().cwd.join(&name);
+                match fs_ops::move_path(&src, &dest) {
+                    Ok(()) => {
+                        self.status_message =
+                            format!("Moved {} to {}", src.display(), dest.display());
+                    }
+                    Err(err) => self.status_message = format!("Move failed: {err}"),
+                }
+            }
         }
+
+        self.dialog = Dialog::None;
+        self.left.reload()?;
+        self.right.reload()?;
         Ok(())
     }
 
     pub fn cancel_dialog(&mut self) {
         self.dialog = Dialog::None;
+    }
+
+    pub fn dialog_default_yes(&self) -> bool {
+        match &self.dialog {
+            Dialog::Confirm { kind, .. } => kind.default_yes(),
+            Dialog::None => false,
+        }
     }
 }

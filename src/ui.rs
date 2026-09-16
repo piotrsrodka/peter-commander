@@ -36,8 +36,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_menu_dropdown(frame, root[0], app);
     }
 
-    if let Dialog::ConfirmDelete { name, .. } = &app.dialog {
-        draw_confirm_dialog(frame, &format!("Delete '{name}'? [y/N]"));
+    if let Dialog::Confirm { kind, name, .. } = &app.dialog {
+        let hint = if kind.default_yes() { "[Y/n]" } else { "[y/N]" };
+        draw_confirm_dialog(frame, &format!("{} '{}'? {}", kind.verb(), name, hint));
     }
 }
 
