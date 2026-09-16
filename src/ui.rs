@@ -47,6 +47,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Dialog::TextInput { kind, input } => {
             draw_text_input_dialog(frame, kind.prompt(), input);
         }
+        Dialog::Rename { input, .. } => {
+            draw_text_input_dialog(frame, "Rename to:", input);
+        }
         Dialog::ConfirmQuit => {
             draw_confirm_dialog(frame, "Quit PeterCommander? [Y/n]");
         }
@@ -63,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 const HELP_LINES: &[&str] = &[
     "F1        Help          Show this screen",
-    "F2        Rename        Not yet implemented",
+    "F2        Rename        Rename selection (move within same dir)",
     "F3        View          Page selected file with $PAGER",
     "F4        Edit          Edit selected file with $EDITOR",
     "Shift+F4  New File      Create a new empty file",
@@ -269,13 +272,16 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
     }
 
     let category = &MENU_BAR[app.menu_category];
-    let width = category
+    let row_text_width = category
         .items
         .iter()
-        .map(|a| a.label().len())
+        .map(|action| {
+            let shortcut_width = action.shortcut().map_or(0, |s| s.len() + 3);
+            action.label().len() + shortcut_width
+        })
         .max()
-        .unwrap_or(4) as u16
-        + 4;
+        .unwrap_or(4);
+    let width = (row_text_width as u16) + 4;
     let height = category.items.len() as u16 + 2;
 
     let area = Rect {
@@ -290,18 +296,29 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, action)| {
-            let style = if idx == app.menu_item {
-                Style::default()
+            let is_selected = idx == app.menu_item;
+            let enabled = app.action_enabled(*action);
+            let style = match (is_selected, enabled) {
+                (true, true) => Style::default()
                     .fg(Color::White)
                     .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Black).bg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+                (true, false) => Style::default().fg(Color::DarkGray).bg(Color::Blue),
+                (false, true) => Style::default().fg(Color::Black).bg(Color::Gray),
+                (false, false) => Style::default().fg(Color::DarkGray).bg(Color::Gray),
             };
-            ListItem::new(Line::from(Span::styled(
-                format!(" {} ", action.label()),
-                style,
-            )))
+            let text = match action.shortcut() {
+                Some(shortcut) => {
+                    format!(
+                        "{:<label_width$}{shortcut:>shortcut_width$}",
+                        action.label(),
+                        label_width = row_text_width - shortcut.len(),
+                        shortcut_width = shortcut.len(),
+                    )
+                }
+                None => format!("{:<row_text_width$}", action.label()),
+            };
+            ListItem::new(Line::from(Span::styled(format!(" {text} "), style)))
         })
         .collect();
 

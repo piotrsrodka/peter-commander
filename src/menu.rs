@@ -31,6 +31,20 @@ impl Action {
             Action::Quit => "Quit",
         }
     }
+
+    /// The keybinding shown next to this action in the pulldown menu.
+    /// Derived from `FN_KEYS` so the two never drift apart, with the couple
+    /// of bindings that aren't plain F-keys (Open, New File) hardcoded.
+    pub fn shortcut(&self) -> Option<&'static str> {
+        match self {
+            Action::Open => Some("Enter"),
+            Action::NewFile => Some("Shift+F4"),
+            other => FN_KEYS
+                .iter()
+                .find(|fn_key| fn_key.action == Some(*other))
+                .map(|fn_key| fn_key.key),
+        }
+    }
 }
 
 pub struct MenuCategory {
@@ -41,19 +55,18 @@ pub struct MenuCategory {
 pub const MENU_BAR: &[MenuCategory] = &[
     MenuCategory {
         title: "File",
+        // Ordered by keybinding (Enter, then F2..F8) to match the F1 help screen.
         items: &[
             Action::Open,
             Action::Rename,
+            Action::View,
+            Action::Edit,
+            Action::NewFile,
             Action::Copy,
             Action::Move,
             Action::MkDir,
-            Action::NewFile,
             Action::Delete,
         ],
-    },
-    MenuCategory {
-        title: "Edit",
-        items: &[Action::View, Action::Edit],
     },
     MenuCategory {
         title: "Options",

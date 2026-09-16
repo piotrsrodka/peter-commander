@@ -31,9 +31,10 @@ impl DialogKind {
         }
     }
 
-    /// Delete is destructive and defaults to "no"; Copy/Move default to "yes".
+    /// Delete and Move are destructive/hard to undo and default to "no";
+    /// Copy is non-destructive and defaults to "yes".
     pub fn default_yes(&self) -> bool {
-        !matches!(self, DialogKind::Delete)
+        matches!(self, DialogKind::Copy)
     }
 }
 
@@ -62,6 +63,10 @@ pub enum Dialog {
     TextInput {
         kind: TextInputKind,
         input: String,
+    },
+    Rename {
+        input: String,
+        src: PathBuf,
     },
     ConfirmQuit,
     Settings {
@@ -197,6 +202,30 @@ impl App {
         }
     }
 
+    pub fn active_pane_ref(&self) -> &Pane {
+        match self.active {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        }
+    }
+
+    /// Whether `action` would actually do something given the current
+    /// selection, used to gray out inapplicable items in the pulldown menu.
+    pub fn action_enabled(&self, action: Action) -> bool {
+        let entry = self.active_pane_ref().selected_entry();
+        let has_real_selection = entry.is_some_and(|e| e.name != "..");
+        let selection_is_file = entry.is_some_and(|e| e.name != ".." && !e.is_dir);
+
+        match action {
+            Action::Open => entry.is_some_and(|e| e.is_dir),
+            Action::Rename | Action::Copy | Action::Move | Action::Delete => has_real_selection,
+            Action::View | Action::Edit => selection_is_file,
+            Action::MkDir | Action::NewFile | Action::Help | Action::Settings | Action::Quit => {
+                true
+            }
+        }
+    }
+
     pub fn inactive_pane(&mut self) -> &mut Pane {
         match self.active {
             Side::Left => &mut self.right,
@@ -219,6 +248,7 @@ impl App {
         self.menu_open = true;
         self.menu_category = 0;
         self.menu_item = 0;
+        self.snap_menu_item_to_enabled();
     }
 
     pub fn close_menu(&mut self) {
@@ -232,25 +262,58 @@ impl App {
             self.menu_category -= 1;
         }
         self.menu_item = 0;
+        self.snap_menu_item_to_enabled();
     }
 
     pub fn menu_right(&mut self) {
         self.menu_category = (self.menu_category + 1) % MENU_BAR.len();
         self.menu_item = 0;
+        self.snap_menu_item_to_enabled();
     }
 
-    pub fn menu_up(&mut self) {
-        let len = MENU_BAR[self.menu_category].items.len();
-        if self.menu_item == 0 {
-            self.menu_item = len - 1;
-        } else {
-            self.menu_item -= 1;
+    /// Moves `self.menu_item` to the first enabled item at or after index 0,
+    /// used whenever the menu/category first opens so the selection never
+    /// starts on a grayed-out entry.
+    fn snap_menu_item_to_enabled(&mut self) {
+        let items = MENU_BAR[self.menu_category].items;
+        if let Some(idx) = items.iter().position(|action| self.action_enabled(*action)) {
+            self.menu_item = idx;
         }
     }
 
+    pub fn menu_up(&mut self) {
+        self.step_menu_item(false);
+    }
+
     pub fn menu_down(&mut self) {
-        let len = MENU_BAR[self.menu_category].items.len();
-        self.menu_item = (self.menu_item + 1) % len;
+        self.step_menu_item(true);
+    }
+
+    /// Moves the selection one step up/down, skipping grayed-out (disabled)
+    /// items so the cursor can never land on one. If every item in the
+    /// category were disabled this would just leave the selection as-is,
+    /// but MkDir/New File are always enabled so that can't happen in
+    /// practice.
+    fn step_menu_item(&mut self, forward: bool) {
+        let items = MENU_BAR[self.menu_category].items;
+        let len = items.len();
+        if len == 0 {
+            return;
+        }
+        let mut idx = self.menu_item;
+        for _ in 0..len {
+            idx = if forward {
+                (idx + 1) % len
+            } else if idx == 0 {
+                len - 1
+            } else {
+                idx - 1
+            };
+            if self.action_enabled(items[idx]) {
+                self.menu_item = idx;
+                return;
+            }
+        }
     }
 
     pub fn confirm_menu_selection(&mut self) -> Result<()> {
@@ -262,6 +325,7 @@ impl App {
     pub fn run_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Open => self.open_selected()?,
+            Action::Rename => self.request_rename(),
             Action::Copy => self.request_copy(),
             Action::Move => self.request_move(),
             Action::Delete => self.request_delete(),
@@ -280,9 +344,6 @@ impl App {
                     selected: 0,
                     original,
                 };
-            }
-            other => {
-                self.status_message = format!("{} is not implemented yet", other.label());
             }
         }
         Ok(())
@@ -363,6 +424,22 @@ impl App {
             self.set_error(message);
         }
         Ok(())
+    }
+
+    /// F2: on Linux, renaming *is* moving (both go through the same
+    /// `rename(2)` syscall), so this just opens a text prompt pre-filled
+    /// with the current name and reuses `fs_ops::move_path` within the same
+    /// directory.
+    fn request_rename(&mut self) {
+        let pane = self.active_pane();
+        let Some(entry) = pane.selected_entry() else {
+            return;
+        };
+        let name = entry.name.clone();
+        let Some(src) = pane.selected_path() else {
+            return;
+        };
+        self.dialog = Dialog::Rename { input: name, src };
     }
 
     fn request_copy(&mut self) {
@@ -453,6 +530,29 @@ impl App {
                 self.left.reload()?;
                 self.right.reload()?;
             }
+            Dialog::Rename { input, src } => {
+                let new_name = input.clone();
+                let src = src.clone();
+                if new_name.trim().is_empty() {
+                    self.status_message = "Name cannot be empty".to_string();
+                    self.dialog = Dialog::None;
+                    return Ok(());
+                }
+                match src.parent() {
+                    Some(parent) => {
+                        let dest = parent.join(&new_name);
+                        match fs_ops::move_path(&src, &dest) {
+                            Ok(()) => self.status_message = format!("Renamed to {new_name}"),
+                            Err(err) => self.set_error(format!("Rename failed: {err}")),
+                        }
+                    }
+                    None => self.set_error("Cannot rename: no parent directory".to_string()),
+                }
+
+                self.dialog = Dialog::None;
+                self.left.reload()?;
+                self.right.reload()?;
+            }
             Dialog::TextInput { kind, input } => {
                 let kind = *kind;
                 let name = input.clone();
@@ -492,7 +592,10 @@ impl App {
     }
 
     pub fn dialog_is_text_input(&self) -> bool {
-        matches!(self.dialog, Dialog::TextInput { .. })
+        matches!(
+            self.dialog,
+            Dialog::TextInput { .. } | Dialog::Rename { .. }
+        )
     }
 
     pub fn request_mkdir(&mut self) {
@@ -513,19 +616,26 @@ impl App {
         match &self.dialog {
             Dialog::Confirm { kind, .. } => kind.default_yes(),
             Dialog::ConfirmQuit => true,
-            Dialog::TextInput { .. } | Dialog::Settings { .. } | Dialog::None => false,
+            Dialog::TextInput { .. }
+            | Dialog::Rename { .. }
+            | Dialog::Settings { .. }
+            | Dialog::None => false,
         }
     }
 
     pub fn text_input_push(&mut self, c: char) {
-        if let Dialog::TextInput { input, .. } = &mut self.dialog {
-            input.push(c);
+        match &mut self.dialog {
+            Dialog::TextInput { input, .. } | Dialog::Rename { input, .. } => input.push(c),
+            _ => {}
         }
     }
 
     pub fn text_input_backspace(&mut self) {
-        if let Dialog::TextInput { input, .. } = &mut self.dialog {
-            input.pop();
+        match &mut self.dialog {
+            Dialog::TextInput { input, .. } | Dialog::Rename { input, .. } => {
+                input.pop();
+            }
+            _ => {}
         }
     }
 
