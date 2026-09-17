@@ -5,6 +5,8 @@
 A dual-pane, keyboard-driven terminal file manager, in the tradition of
 Norton Commander — built in Rust with ratatui (https://ratatui.rs).
 
+![Peter Commander](docs/screenshot-2026-09-17_12-55-42.png)
+
 ## Features
 
 - Dual-pane file browsing
