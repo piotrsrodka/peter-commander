@@ -33,18 +33,42 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         match app.active {
             Side::Left => {
                 app.preview_visible_lines = panes[1].height.saturating_sub(2) as usize;
-                draw_pane(frame, panes[0], &app.left, !app.preview_focus);
+                draw_pane(
+                    frame,
+                    panes[0],
+                    &app.left,
+                    !app.preview_focus,
+                    &mut app.left_list_state,
+                );
                 draw_preview_pane(frame, panes[1], &app.left, app.preview_focus, app.preview_scroll);
             }
             Side::Right => {
                 app.preview_visible_lines = panes[0].height.saturating_sub(2) as usize;
                 draw_preview_pane(frame, panes[0], &app.right, app.preview_focus, app.preview_scroll);
-                draw_pane(frame, panes[1], &app.right, !app.preview_focus);
+                draw_pane(
+                    frame,
+                    panes[1],
+                    &app.right,
+                    !app.preview_focus,
+                    &mut app.right_list_state,
+                );
             }
         }
     } else {
-        draw_pane(frame, panes[0], &app.left, app.active == Side::Left);
-        draw_pane(frame, panes[1], &app.right, app.active == Side::Right);
+        draw_pane(
+            frame,
+            panes[0],
+            &app.left,
+            app.active == Side::Left,
+            &mut app.left_list_state,
+        );
+        draw_pane(
+            frame,
+            panes[1],
+            &app.right,
+            app.active == Side::Right,
+            &mut app.right_list_state,
+        );
     }
 
     draw_command_line(frame, root[2], app);
@@ -386,7 +410,13 @@ fn format_modified(modified: Option<std::time::SystemTime>) -> String {
     }
 }
 
-fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
+fn draw_pane(
+    frame: &mut Frame,
+    area: Rect,
+    pane: &Pane,
+    is_active: bool,
+    list_state: &mut ListState,
+) {
     let border_style = if is_active {
         Style::default()
             .fg(Color::Yellow)
@@ -442,12 +472,13 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
     };
     let list = List::new(items).block(block).highlight_style(highlight_style);
 
-    let mut state = ListState::default();
-    if is_active {
-        state.select(Some(pane.selected));
-    }
+    // Always keep the selection tracked (not just while active) so the
+    // persisted `list_state`'s scroll offset stays correct for this pane
+    // even while the other pane has focus; `highlight_style` above is what
+    // actually hides the highlight when inactive.
+    list_state.select(Some(pane.selected));
 
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, area, list_state);
 }
 
 /// Quick-view: renders a live preview of `source`'s selected entry, in

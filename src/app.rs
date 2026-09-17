@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use anyhow::Result;
+use ratatui::widgets::ListState;
 
 use crate::fs_ops;
 use crate::logging;
@@ -164,6 +165,13 @@ pub struct App {
     /// `xdg-open`) that were spawned without waiting for them to exit, kept
     /// around only so their exit status can be reaped and avoid zombies.
     background_children: Vec<Child>,
+    /// Persisted across frames (unlike a fresh `ListState::default()` each
+    /// draw) so ratatui's own scroll-to-keep-selected-visible logic works
+    /// incrementally instead of recomputing from offset zero every time —
+    /// otherwise the highlighted row gets pinned to the bottom of a long
+    /// listing while moving up, only settling into place near the top.
+    pub left_list_state: ListState,
+    pub right_list_state: ListState,
 }
 
 impl App {
@@ -207,6 +215,8 @@ impl App {
             internal_preview,
             preview_visible_lines: 0,
             background_children: Vec::new(),
+            left_list_state: ListState::default(),
+            right_list_state: ListState::default(),
         })
     }
 
