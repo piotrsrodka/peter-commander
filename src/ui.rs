@@ -412,15 +412,20 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let list = List::new(items).block(block).highlight_style(
+    let highlight_style = if is_active {
         Style::default()
             .bg(Color::Blue)
             .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    );
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let list = List::new(items).block(block).highlight_style(highlight_style);
 
     let mut state = ListState::default();
-    state.select(Some(pane.selected));
+    if is_active {
+        state.select(Some(pane.selected));
+    }
 
     frame.render_stateful_widget(list, area, &mut state);
 }

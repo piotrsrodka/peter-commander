@@ -117,6 +117,14 @@ impl Pane {
     /// current directory unchanged if it couldn't be entered (e.g.
     /// permission denied), instead of propagating a fatal error.
     fn set_cwd(&mut self, new_path: PathBuf) -> Result<Option<String>> {
+        self.set_cwd_selecting(new_path, None)
+    }
+
+    /// Like `set_cwd`, but if `select_name` is given and found among the
+    /// reloaded entries, selects it instead of defaulting to the top. Used
+    /// when navigating up so the cursor lands back on the folder just left,
+    /// instead of resetting to the top of the parent listing.
+    fn set_cwd_selecting(&mut self, new_path: PathBuf, select_name: Option<&str>) -> Result<Option<String>> {
         let previous_cwd = self.cwd.clone();
         let previous_selected = self.selected;
         self.cwd = new_path;
@@ -126,6 +134,12 @@ impl Pane {
             self.cwd = previous_cwd;
             self.selected = previous_selected;
             return Ok(Some(format!("Cannot open directory: {err}")));
+        }
+
+        if let Some(name) = select_name {
+            if let Some(index) = self.entries.iter().position(|e| e.name == name) {
+                self.selected = index;
+            }
         }
         Ok(None)
     }
@@ -139,15 +153,20 @@ impl Pane {
             return Ok(None);
         }
 
-        let new_path = if entry.name == ".." {
-            self.cwd
+        if entry.name == ".." {
+            let left_name = self
+                .cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string());
+            let new_path = self
+                .cwd
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.cwd.clone())
-        } else {
-            self.cwd.join(&entry.name)
-        };
+                .unwrap_or_else(|| self.cwd.clone());
+            return self.set_cwd_selecting(new_path, left_name.as_deref());
+        }
 
+        let new_path = self.cwd.join(&entry.name);
         self.set_cwd(new_path)
     }
 
