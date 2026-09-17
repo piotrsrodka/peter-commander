@@ -8,10 +8,14 @@ Norton Commander — built in Rust with ratatui (https://ratatui.rs).
 ## Features
 
 - Dual-pane file browsing
-- File operations: open, rename, copy, move, mkdir, new file, delete, view, edit
+- File operations: rename, copy, move, mkdir, new file, delete
+- Quick preview (F3) for text, directories, and binaries
+- Edit (F4) with your `$EDITOR`
+- Runs executable scripts and binaries directly
+- Opens images, PDFs, audio, video, and HTML in your system's default app
 - Built-in command-line prompt, with `cd` support
-- Quick terminal access (Ctrl+O)
-- Settings that persist across sessions (e.g. show/hide hidden files)
+- Ctrl+O shows previous command output
+- Configurable settings: hidden files, F3 preview mode
 
 ## Installing
 
