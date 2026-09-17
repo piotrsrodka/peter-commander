@@ -1,18 +1,16 @@
 # Peter Commander
 
 A dual-pane, keyboard-driven terminal file manager, in the tradition of
-Norton Commander / Total Commander — built in Rust with
-[ratatui](https://ratatui.rs).
+Norton Commander / Total Commander — built in Rust with ratatui
+(https://ratatui.rs).
 
 ## Features
 
-- Dual-pane file browsing with full-path + selected-name titles
+- Dual-pane file browsing
 - File operations: open, rename, copy, move, mkdir, new file, delete, view, edit
-- Pulldown menu bar with F-key shortcuts and a help screen (F1)
-- Built-in command-line prompt with `cd` handling
-- Ctrl+O to reveal/toggle the terminal
-- Persistent settings (including a hide-hidden-files toggle), with save/cancel
-- Quit confirmation and clean signal handling (SIGINT/SIGTERM/SIGHUP)
+- Built-in command-line prompt, with `cd` support
+- Quick terminal access (Ctrl+O)
+- Settings that persist across sessions (e.g. show/hide hidden files)
 
 ## Installing
 
@@ -35,18 +33,37 @@ Install Rust if you don't already have it, then build from source:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
 git clone https://github.com/piotrsrodka/peter-commander.git
 cd peter-commander
 cargo build --release
-cp target/release/peter-commander ~/.local/bin/   # or anywhere on your PATH
+cp target/release/peter-commander ~/.local/bin/
 ```
+
+(`~/.local/bin` just needs to be on your `PATH` — pick any directory that is.)
 
 ### macOS
 
-Same as "Other Linux" above — install Rust via `rustup` (or `brew install
-rust`), then `cargo build --release`. All dependencies support macOS
-terminals natively, no changes needed.
+```sh
+brew install rust
+git clone https://github.com/piotrsrodka/peter-commander.git
+cd peter-commander
+cargo build --release
+cp target/release/peter-commander ~/.local/bin/
+```
+
+### Optional: a shorter `pc` command
+
+After installing (any platform above), you can run:
+
+```sh
+./scripts/setup-alias.sh
+```
+
+This adds `alias pc=peter-commander` to your shell rc file (`.bashrc` or
+`.zshrc`) — but only if `pc` isn't already used by something else on your
+system. It checks your actual machine at run time rather than relying on
+a package database, since that's what actually matters and no single
+database covers every distro anyway.
 
 ### From source (general)
 
