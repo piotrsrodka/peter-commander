@@ -16,30 +16,24 @@ Norton Commander / Total Commander — built in Rust with ratatui
 
 ### Arch Linux / Omarchy
 
-A `PKGBUILD` is provided in `packaging/arch/` — Rust is pulled in
-automatically as a build dependency, no separate install step needed:
-
 ```sh
 git clone https://github.com/piotrsrodka/peter-commander.git
 cd peter-commander/packaging/arch
 makepkg -si
 ```
 
-This builds `peter-commander` from the tagged release source and installs
-it system-wide as `/usr/bin/peter-commander`.
+Installs `peter-commander` system-wide as `/usr/bin/peter-commander`.
+Requires sudo.
 
-### Other Linux (build from source)
+### Other Linux
 
-No sudo needed — everything installs under your home directory.
-
-**Step 1 — install Rust.** Skip this if `cargo --version` already works
-(a recent stable toolchain — edition 2024 — is required).
+**Step 1 — install Rust** (skip if `cargo --version` already works):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-**Step 2 — build and install Peter Commander:**
+**Step 2 — build and install:**
 
 ```sh
 git clone https://github.com/piotrsrodka/peter-commander.git
@@ -47,25 +41,17 @@ cd peter-commander
 ./scripts/install.sh
 ```
 
-This builds the release binary, copies it to `~/.local/bin`, and sets up
-a short `pc` alias — automatically, in one step. It warns you if
-`~/.local/bin` isn't on your `PATH` yet, and only adds the `pc` alias if
-that name isn't already used by something else on your system (checked
-on your actual machine at run time, since no package database covers
-every distro anyway — it's always safe to run and never overwrites an
-existing `pc`).
+No sudo needed. Installs to `~/.local/bin` and sets up a `pc` alias.
 
-### macOS (build from source)
+### macOS
 
-No sudo needed — everything installs under your home directory.
-
-**Step 1 — install Rust.** Skip this if `cargo --version` already works.
+**Step 1 — install Rust** (skip if `cargo --version` already works):
 
 ```sh
 brew install rust
 ```
 
-**Step 2 — build and install Peter Commander:**
+**Step 2 — build and install:**
 
 ```sh
 git clone https://github.com/piotrsrodka/peter-commander.git
@@ -73,14 +59,12 @@ cd peter-commander
 ./scripts/install.sh
 ```
 
-Same as above: builds, installs to `~/.local/bin`, and sets up the `pc`
-alias automatically.
+No sudo needed. Installs to `~/.local/bin` and sets up a `pc` alias.
 
 ---
 
-Note this is a TUI app that needs a real interactive terminal (raw-mode
-support) — it won't run under a non-interactive script or with piped
-output.
+Peter Commander is a TUI app and needs a real interactive terminal — it
+won't run under a non-interactive script or with piped output.
 
 ## License
 
