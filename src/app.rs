@@ -1,5 +1,6 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::Result;
 
@@ -159,6 +160,10 @@ pub struct App {
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
     pub preview_visible_lines: usize,
+    /// Detached external viewers (e.g. an image viewer opened via
+    /// `xdg-open`) that were spawned without waiting for them to exit, kept
+    /// around only so their exit status can be reaped and avoid zombies.
+    background_children: Vec<Child>,
 }
 
 impl App {
@@ -201,6 +206,7 @@ impl App {
             last_preview_target: None,
             internal_preview,
             preview_visible_lines: 0,
+            background_children: Vec::new(),
         })
     }
 
@@ -515,10 +521,12 @@ impl App {
         }
     }
 
-    /// Enter: opens the selected directory, or — for a file with the
-    /// executable permission bit set — runs it exactly as if its name had
-    /// been typed on the command line (`./name`). Non-executable files do
-    /// nothing, same as before.
+    /// Enter: opens the selected directory; for a file with the executable
+    /// permission bit set, runs it exactly as if its name had been typed on
+    /// the command line (`./name`); for a known media file (image, PDF,
+    /// audio, video, HTML), hands it to the desktop's default viewer
+    /// (`xdg-open`, or `open` on macOS). Anything else does nothing, same
+    /// as before.
     pub fn open_selected(&mut self) -> Result<()> {
         let pane = self.active_pane_ref();
         if let Some(entry) = pane.selected_entry()
@@ -531,10 +539,46 @@ impl App {
             return Ok(());
         }
 
+        if let Some(entry) = pane.selected_entry()
+            && !entry.is_dir
+            && is_media_file(&entry.name)
+            && let Some(path) = pane.selected_path()
+        {
+            self.open_externally(&path);
+            return Ok(());
+        }
+
         if let Some(message) = self.active_pane().enter_selected()? {
             self.set_error(message);
         }
         Ok(())
+    }
+
+    /// Spawns `media_opener()` on `path` without waiting for it — a GUI
+    /// viewer can stay open indefinitely, and PC shouldn't block (or need
+    /// its terminal suspended) while the user looks at it. Its stdio is
+    /// discarded so any stray output from it can't corrupt our screen,
+    /// since we're not suspending the alternate screen for this.
+    fn open_externally(&mut self, path: &Path) {
+        let opener = media_opener();
+        match Command::new(opener)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => self.background_children.push(child),
+            Err(err) => self.set_error(format!("Failed to launch {opener}: {err}")),
+        }
+    }
+
+    /// Reaps any detached external viewers that have exited, so they don't
+    /// pile up as zombie processes. Cheap to call every loop iteration —
+    /// `try_wait` never blocks.
+    pub fn reap_finished_children(&mut self) {
+        self.background_children
+            .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
     }
 
     /// F2: on Linux, renaming *is* moving (both go through the same
@@ -812,6 +856,33 @@ impl App {
         let cwd = self.active_pane().cwd.clone();
         self.external_request = Some(ExternalRequest::Shell { command, cwd });
         true
+    }
+}
+
+/// Extensions handed off to the desktop's default viewer on Enter, rather
+/// than doing nothing. Deliberately just images/PDF/audio/video/HTML —
+/// anything else (including plain text) stays as-is rather than risking
+/// guessing wrong about what the user wants to happen.
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "tiff", "tif", "ico", "pdf", "mp4", "mov",
+    "mkv", "avi", "webm", "mp3", "wav", "flac", "ogg", "m4a", "html", "htm",
+];
+
+fn is_media_file(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| MEDIA_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+}
+
+/// The desktop command that opens a file with its associated default
+/// application, so we don't have to maintain our own program-per-extension
+/// mapping.
+fn media_opener() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
     }
 }
 

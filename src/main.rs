@@ -82,6 +82,7 @@ fn run(
             handle_key(&mut app, key.code, key.modifiers)?;
         }
         app.sync_preview_scroll();
+        app.reap_finished_children();
 
         if let Some(request) = app.external_request.take() {
             run_external(terminal, request, &mut app)?;
