@@ -269,9 +269,12 @@ impl App {
             // a name-only listing for those.
             Action::View => entry.is_some(),
             Action::Edit => selection_is_file,
-            Action::MkDir | Action::NewFile | Action::Help | Action::Settings | Action::Quit => {
-                true
-            }
+            Action::MkDir
+            | Action::NewFile
+            | Action::Help
+            | Action::Settings
+            | Action::ShowTerminal
+            | Action::Quit => true,
         }
     }
 
@@ -411,6 +414,7 @@ impl App {
             Action::View => self.view_selected(),
             Action::Edit => self.request_external(ExternalRequest::Edit, "edit"),
             Action::Help => self.help_open = true,
+            Action::ShowTerminal => self.request_reveal_terminal(),
             Action::Quit => self.dialog = Dialog::ConfirmQuit,
             Action::Settings => {
                 let original = SettingItem::ALL

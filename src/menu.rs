@@ -11,6 +11,7 @@ pub enum Action {
     Edit,
     Help,
     Settings,
+    ShowTerminal,
     Quit,
 }
 
@@ -28,6 +29,7 @@ impl Action {
             Action::Edit => "Edit",
             Action::Help => "Help",
             Action::Settings => "Settings",
+            Action::ShowTerminal => "Show Terminal",
             Action::Quit => "Quit",
         }
     }
@@ -39,6 +41,7 @@ impl Action {
         match self {
             Action::Open => Some("Enter"),
             Action::NewFile => Some("Shift+F4"),
+            Action::ShowTerminal => Some("Ctrl+O"),
             other => FN_KEYS
                 .iter()
                 .find(|fn_key| fn_key.action == Some(*other))
@@ -74,7 +77,7 @@ pub const MENU_BAR: &[MenuCategory] = &[
     },
     MenuCategory {
         title: "Command",
-        items: &[Action::Quit],
+        items: &[Action::ShowTerminal, Action::Quit],
     },
 ];
 
