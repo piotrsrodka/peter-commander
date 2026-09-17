@@ -28,7 +28,9 @@ makepkg -si
 This builds `peter-commander` from the tagged release source and installs
 it system-wide as `/usr/bin/peter-commander`.
 
-### Other Linux / macOS (build from source)
+### Other Linux (build from source)
+
+No sudo needed — everything installs under your home directory.
 
 **Step 1 — install Rust.** Skip this if `cargo --version` already works
 (a recent stable toolchain — edition 2024 — is required).
@@ -37,25 +39,44 @@ it system-wide as `/usr/bin/peter-commander`.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-(On macOS you can instead run `brew install rust` if you prefer Homebrew.)
+**Step 2 — build and install Peter Commander:**
+
+```sh
+git clone https://github.com/piotrsrodka/peter-commander.git
+cd peter-commander
+./scripts/install.sh
+```
+
+This builds the release binary, copies it to `~/.local/bin`, and sets up
+a short `pc` alias — automatically, in one step. It warns you if
+`~/.local/bin` isn't on your `PATH` yet, and only adds the `pc` alias if
+that name isn't already used by something else on your system (checked
+on your actual machine at run time, since no package database covers
+every distro anyway — it's always safe to run and never overwrites an
+existing `pc`).
+
+### macOS (build from source)
+
+No sudo needed — everything installs under your home directory.
+
+**Step 1 — install Rust.** Skip this if `cargo --version` already works.
+
+```sh
+brew install rust
+```
 
 **Step 2 — build and install Peter Commander:**
 
 ```sh
 git clone https://github.com/piotrsrodka/peter-commander.git
 cd peter-commander
-cargo build --release
-cp target/release/peter-commander ~/.local/bin/
-./scripts/setup-alias.sh
+./scripts/install.sh
 ```
 
-(`~/.local/bin` just needs to be on your `PATH` — pick any directory that
-is.) The last line adds a short `pc` alias for `peter-commander` — but
-only if `pc` isn't already used by something else on your system. It
-checks your actual machine at run time rather than relying on a package
-database, since that's what actually matters and no single database
-covers every distro anyway; it's always safe to run and never overwrites
-an existing `pc`.
+Same as above: builds, installs to `~/.local/bin`, and sets up the `pc`
+alias automatically.
+
+---
 
 Note this is a TUI app that needs a real interactive terminal (raw-mode
 support) — it won't run under a non-interactive script or with piped
