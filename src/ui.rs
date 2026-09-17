@@ -408,6 +408,10 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if entry.is_executable {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };

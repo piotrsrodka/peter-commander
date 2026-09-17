@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -10,6 +11,9 @@ pub struct Entry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// Whether this is a file with an executable permission bit set — the
+    /// same thing Enter checks to decide whether to run it.
+    pub is_executable: bool,
 }
 
 #[derive(Debug)]
@@ -43,6 +47,7 @@ impl Pane {
                 is_dir: true,
                 size: 0,
                 modified: None,
+                is_executable: false,
             });
         }
 
@@ -62,11 +67,13 @@ impl Pane {
             let Ok(metadata) = fs::metadata(entry.path()).or_else(|_| entry.metadata()) else {
                 continue;
             };
+            let is_dir = metadata.is_dir();
             let item = Entry {
                 name,
-                is_dir: metadata.is_dir(),
+                is_dir,
                 size: metadata.len(),
                 modified: metadata.modified().ok(),
+                is_executable: !is_dir && metadata.permissions().mode() & 0o111 != 0,
             };
             if item.is_dir {
                 dirs.push(item);

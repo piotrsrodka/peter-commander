@@ -515,7 +515,22 @@ impl App {
         }
     }
 
+    /// Enter: opens the selected directory, or — for a file with the
+    /// executable permission bit set — runs it exactly as if its name had
+    /// been typed on the command line (`./name`). Non-executable files do
+    /// nothing, same as before.
     pub fn open_selected(&mut self) -> Result<()> {
+        let pane = self.active_pane_ref();
+        if let Some(entry) = pane.selected_entry()
+            && entry.is_executable
+        {
+            self.external_request = Some(ExternalRequest::Shell {
+                command: format!("./{}", shell_words::quote(&entry.name)),
+                cwd: pane.cwd.clone(),
+            });
+            return Ok(());
+        }
+
         if let Some(message) = self.active_pane().enter_selected()? {
             self.set_error(message);
         }
