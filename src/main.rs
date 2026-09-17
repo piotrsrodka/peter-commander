@@ -306,6 +306,20 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         KeyCode::Down if app.quick_view && app.preview_focus => app.scroll_preview_down(),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
+        KeyCode::Home if app.quick_view && app.preview_focus => app.scroll_preview_to_top(),
+        KeyCode::End if app.quick_view && app.preview_focus => app.scroll_preview_to_bottom(),
+        KeyCode::PageUp if app.quick_view && app.preview_focus => app.scroll_preview_page_up(),
+        KeyCode::PageDown if app.quick_view && app.preview_focus => app.scroll_preview_page_down(),
+        KeyCode::Home => app.active_pane().move_to_top(),
+        KeyCode::End => app.active_pane().move_to_bottom(),
+        KeyCode::PageUp => {
+            let page = app.pane_visible_lines;
+            app.active_pane().move_page_up(page);
+        }
+        KeyCode::PageDown => {
+            let page = app.pane_visible_lines;
+            app.active_pane().move_page_down(page);
+        }
         KeyCode::Backspace => app.command_line_backspace(),
         KeyCode::Esc => app.command_line_clear(),
         // Classic Norton Commander: Enter runs whatever is typed on the
@@ -329,6 +343,13 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         }
         KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.request_reveal_terminal();
+        }
+        // Some terminals (e.g. GNOME/ptyxis) intercept F10 for their own
+        // menu and never forward it to us, leaving F10-only Quit
+        // unreachable there. Ctrl+Q is a widely recognized "quit" shortcut
+        // and gives those users a way out.
+        KeyCode::Char('q') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.run_action(Action::Quit)?;
         }
         KeyCode::F(n) => {
             if let Some(fn_key) = FN_KEYS.iter().find(|k| k.key == format!("F{n}")) {

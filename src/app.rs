@@ -161,6 +161,9 @@ pub struct App {
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
     pub preview_visible_lines: usize,
+    /// Height (in rows) of a file-listing pane in the last drawn frame,
+    /// used to size a PgUp/PgDown page jump.
+    pub pane_visible_lines: usize,
     /// Detached external viewers (e.g. an image viewer opened via
     /// `xdg-open`) that were spawned without waiting for them to exit, kept
     /// around only so their exit status can be reaped and avoid zombies.
@@ -214,6 +217,7 @@ impl App {
             last_preview_target: None,
             internal_preview,
             preview_visible_lines: 0,
+            pane_visible_lines: 0,
             background_children: Vec::new(),
             left_list_state: ListState::default(),
             right_list_state: ListState::default(),
@@ -322,6 +326,29 @@ impl App {
         let total_lines = preview::build_preview(self.active_pane_ref()).line_count();
         let max = total_lines.saturating_sub(self.preview_visible_lines);
         self.preview_scroll = (self.preview_scroll + 1).min(max);
+    }
+
+    pub fn scroll_preview_to_top(&mut self) {
+        self.preview_scroll = 0;
+    }
+
+    /// End: same bottom-clamping as `scroll_preview_down` — lands with the
+    /// last line at the bottom of the preview, not scrolled past it.
+    pub fn scroll_preview_to_bottom(&mut self) {
+        let total_lines = preview::build_preview(self.active_pane_ref()).line_count();
+        self.preview_scroll = total_lines.saturating_sub(self.preview_visible_lines);
+    }
+
+    pub fn scroll_preview_page_up(&mut self) {
+        let page = self.preview_visible_lines.max(1);
+        self.preview_scroll = self.preview_scroll.saturating_sub(page);
+    }
+
+    pub fn scroll_preview_page_down(&mut self) {
+        let page = self.preview_visible_lines.max(1);
+        let total_lines = preview::build_preview(self.active_pane_ref()).line_count();
+        let max = total_lines.saturating_sub(self.preview_visible_lines);
+        self.preview_scroll = (self.preview_scroll + page).min(max);
     }
 
     /// Resets the preview scroll position whenever the previewed entry has

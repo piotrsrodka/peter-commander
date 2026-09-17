@@ -134,6 +134,25 @@ impl Pane {
         }
     }
 
+    pub fn move_to_top(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn move_to_bottom(&mut self) {
+        self.selected = self.entries.len().saturating_sub(1);
+    }
+
+    /// PgUp: moves up roughly one screenful (`page` rows).
+    pub fn move_page_up(&mut self, page: usize) {
+        self.selected = self.selected.saturating_sub(page);
+    }
+
+    /// PgDown: moves down roughly one screenful (`page` rows).
+    pub fn move_page_down(&mut self, page: usize) {
+        let last = self.entries.len().saturating_sub(1);
+        self.selected = (self.selected + page).min(last);
+    }
+
     /// Switches to `new_path`. Returns `Ok(Some(message))` and leaves the
     /// current directory unchanged if it couldn't be entered (e.g.
     /// permission denied), instead of propagating a fatal error.

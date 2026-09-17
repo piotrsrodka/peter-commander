@@ -29,6 +29,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(root[1]);
 
+    app.pane_visible_lines = panes[0].height.saturating_sub(2) as usize;
+
     if app.quick_view {
         match app.active {
             Side::Left => {
@@ -120,9 +122,12 @@ const HELP_LINES: &[&str] = &[
     "Alt+F1    Left = Right   Point left pane at right pane's dir",
     "Alt+F2    Right = Left   Point right pane at left pane's dir",
     "Ctrl+O    Terminal       Reveal the terminal/scrollback under panels",
+    "Ctrl+Q    Quit           Same as F10, in case your terminal eats F10",
     "",
     "Tab       Switch the active pane",
     "Up/Down   Move the selection",
+    "Home/End  Jump to the top/bottom of the listing",
+    "PgUp/PgDn Move the selection by one screenful",
     "",
     "Type anywhere to fill the command line below the panes;",
     "Enter runs it in the active pane's directory, or opens",
@@ -396,7 +401,7 @@ fn draw_command_line(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(&app.command_line, Style::default().fg(Color::White)),
+        Span::styled(&app.command_line, Style::default().fg(Color::Reset)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -443,7 +448,12 @@ fn draw_pane(
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                // Not White: this renders straight onto the terminal's own
+                // background with no contrasting box behind it, so it must
+                // follow the terminal's default foreground instead of
+                // assuming a dark theme (a hardcoded white was invisible on
+                // light-background terminals).
+                Style::default().fg(Color::Reset)
             };
             let date = format_modified(entry.modified);
             let size_label = if entry.is_dir {
@@ -517,7 +527,7 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::Reset)
                 };
                 Line::from(Span::styled(entry.name, style))
             })
