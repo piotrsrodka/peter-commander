@@ -3,8 +3,7 @@
 [![Rust](https://github.com/piotrsrodka/peter-commander/actions/workflows/rust.yml/badge.svg)](https://github.com/piotrsrodka/peter-commander/actions/workflows/rust.yml)
 
 A dual-pane, keyboard-driven terminal file manager, in the tradition of
-Norton Commander / Total Commander — built in Rust with ratatui
-(https://ratatui.rs).
+Norton Commander — built in Rust with ratatui (https://ratatui.rs).
 
 ## Features
 
