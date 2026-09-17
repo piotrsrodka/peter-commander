@@ -8,8 +8,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::app::{App, Dialog, SettingItem, Side};
 use crate::menu::{FN_KEYS, MENU_BAR};
 use crate::pane::Pane;
+use crate::preview::{self, PreviewContent};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -28,8 +29,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(root[1]);
 
-    draw_pane(frame, panes[0], &app.left, app.active == Side::Left);
-    draw_pane(frame, panes[1], &app.right, app.active == Side::Right);
+    if app.quick_view {
+        match app.active {
+            Side::Left => {
+                app.preview_visible_lines = panes[1].height.saturating_sub(2) as usize;
+                draw_pane(frame, panes[0], &app.left, !app.preview_focus);
+                draw_preview_pane(frame, panes[1], &app.left, app.preview_focus, app.preview_scroll);
+            }
+            Side::Right => {
+                app.preview_visible_lines = panes[0].height.saturating_sub(2) as usize;
+                draw_preview_pane(frame, panes[0], &app.right, app.preview_focus, app.preview_scroll);
+                draw_pane(frame, panes[1], &app.right, !app.preview_focus);
+            }
+        }
+    } else {
+        draw_pane(frame, panes[0], &app.left, app.active == Side::Left);
+        draw_pane(frame, panes[1], &app.right, app.active == Side::Right);
+    }
 
     draw_command_line(frame, root[2], app);
     draw_status_message(frame, root[3], &app.status_message);
@@ -428,6 +444,65 @@ fn draw_pane(frame: &mut Frame, area: Rect, pane: &Pane, is_active: bool) {
     }
 
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Quick-view: renders a live preview of `source`'s selected entry, in
+/// place of the opposite pane's own listing (Ctrl+Q). `focused` is whether
+/// Tab has moved scroll focus onto this pane; `scroll` is how many lines of
+/// a text preview are skipped from the top.
+fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool, scroll: usize) {
+    let title = match source.selected_entry() {
+        Some(entry) if entry.name != ".." => {
+            source.cwd.join(&entry.name).to_string_lossy().to_string()
+        }
+        _ => source.cwd.to_string_lossy().to_string(),
+    };
+
+    let border_style = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let block = Block::default()
+        .title(format!("Preview: {title}"))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    let lines: Vec<Line> = match preview::build_preview(source) {
+        PreviewContent::Empty => Vec::new(),
+        PreviewContent::Directory(entries) => entries
+            .into_iter()
+            .skip(scroll)
+            .map(|entry| {
+                let style = if entry.is_dir {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(Span::styled(entry.name, style))
+            })
+            .collect(),
+        PreviewContent::Binary(size) => vec![Line::from(Span::styled(
+            format!("<Binary file> ({size} bytes)"),
+            Style::default().fg(Color::DarkGray),
+        ))],
+        PreviewContent::Error(err) => vec![Line::from(Span::styled(
+            format!("Cannot preview: {err}"),
+            Style::default().fg(Color::Red),
+        ))],
+        PreviewContent::Text(text_lines) => text_lines
+            .into_iter()
+            .skip(scroll)
+            .map(Line::from)
+            .collect(),
+    };
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_status_message(frame: &mut Frame, area: Rect, message: &str) {

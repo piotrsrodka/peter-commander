@@ -3,6 +3,7 @@ mod fs_ops;
 mod logging;
 mod menu;
 mod pane;
+mod preview;
 mod state;
 mod ui;
 
@@ -72,7 +73,7 @@ fn run(
     let mut app = App::new()?;
 
     while !app.should_quit && !should_exit.load(Ordering::Relaxed) {
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         if event::poll(Duration::from_millis(200))?
             && let Event::Key(key) = event::read()?
@@ -80,6 +81,7 @@ fn run(
         {
             handle_key(&mut app, key.code, key.modifiers)?;
         }
+        app.sync_preview_scroll();
 
         if let Some(request) = app.external_request.take() {
             run_external(terminal, request, &mut app)?;
@@ -292,15 +294,26 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
     }
 
     match code {
-        KeyCode::Tab => app.toggle_active(),
+        KeyCode::Tab => {
+            if app.quick_view {
+                app.toggle_preview_focus();
+            } else {
+                app.toggle_active();
+            }
+        }
+        KeyCode::Up if app.quick_view && app.preview_focus => app.scroll_preview_up(),
+        KeyCode::Down if app.quick_view && app.preview_focus => app.scroll_preview_down(),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
         KeyCode::Backspace => app.command_line_backspace(),
         KeyCode::Esc => app.command_line_clear(),
         // Classic Norton Commander: Enter runs whatever is typed on the
-        // command line, or opens the selected entry if nothing was typed.
+        // command line, or opens the selected entry if nothing was typed —
+        // unless keyboard focus is on the quick-view preview, which has
+        // nothing of its own to open.
         KeyCode::Enter => {
-            if !app.submit_command_line() {
+            let preview_has_focus = app.quick_view && app.preview_focus;
+            if !app.submit_command_line() && !preview_has_focus {
                 app.open_selected()?;
             }
         }

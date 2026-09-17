@@ -7,6 +7,7 @@ use crate::fs_ops;
 use crate::logging;
 use crate::menu::{Action, MENU_BAR};
 use crate::pane::Pane;
+use crate::preview;
 use crate::state;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,18 +82,21 @@ pub enum Dialog {
 pub enum SettingItem {
     WaitAfterShellCommand,
     HideHiddenFiles,
+    InternalPreview,
 }
 
 impl SettingItem {
     pub const ALL: &'static [SettingItem] = &[
         SettingItem::WaitAfterShellCommand,
         SettingItem::HideHiddenFiles,
+        SettingItem::InternalPreview,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
             SettingItem::WaitAfterShellCommand => "Wait for Enter after running commands",
             SettingItem::HideHiddenFiles => "Hide hidden files/folders",
+            SettingItem::InternalPreview => "F3 View uses the internal quick preview",
         }
     }
 
@@ -102,6 +106,7 @@ impl SettingItem {
         match self {
             SettingItem::WaitAfterShellCommand => "wait_after_shell_command",
             SettingItem::HideHiddenFiles => "hide_hidden_files",
+            SettingItem::InternalPreview => "internal_preview",
         }
     }
 }
@@ -133,6 +138,27 @@ pub struct App {
     /// "Press Enter to continue" afterward, or returns straight to the
     /// panels (output can still be seen later via Ctrl+O).
     pub wait_after_shell_command: bool,
+    /// Whether the inactive pane shows a live preview of the active pane's
+    /// selected entry instead of its own listing (F3, as in Total
+    /// Commander's Quick View).
+    pub quick_view: bool,
+    /// While `quick_view` is on, whether Tab has moved keyboard focus onto
+    /// the preview pane (so arrows scroll it) instead of the file listing.
+    pub preview_focus: bool,
+    /// Lines scrolled down within the current preview's in-memory buffer.
+    pub preview_scroll: usize,
+    /// The path the preview was last built for, so a change in selection
+    /// (arrow keys, entering a directory, cd, ...) can reset the scroll
+    /// position for the newly previewed entry.
+    last_preview_target: Option<PathBuf>,
+    /// Whether F3 (View) shows the internal quick preview or shells out to
+    /// $PAGER/less, per the "F3 View uses the internal quick preview"
+    /// setting.
+    pub internal_preview: bool,
+    /// Height (in text rows) of the preview pane in the last drawn frame,
+    /// so scrolling can stop once the last line reaches the bottom of the
+    /// visible area instead of scrolling it away entirely.
+    pub preview_visible_lines: usize,
 }
 
 impl App {
@@ -151,6 +177,10 @@ impl App {
             .get(SettingItem::HideHiddenFiles.key())
             .copied()
             .unwrap_or(false);
+        let internal_preview = saved_settings
+            .get(SettingItem::InternalPreview.key())
+            .copied()
+            .unwrap_or(true);
         Ok(App {
             left: Pane::new(left_dir, hide_hidden_files)?,
             right: Pane::new(right_dir, hide_hidden_files)?,
@@ -165,6 +195,12 @@ impl App {
             help_open: false,
             command_line: String::new(),
             wait_after_shell_command,
+            quick_view: false,
+            preview_focus: false,
+            preview_scroll: 0,
+            last_preview_target: None,
+            internal_preview,
+            preview_visible_lines: 0,
         })
     }
 
@@ -229,7 +265,10 @@ impl App {
         match action {
             Action::Open => entry.is_some_and(|e| e.is_dir),
             Action::Rename | Action::Copy | Action::Move | Action::Delete => has_real_selection,
-            Action::View | Action::Edit => selection_is_file,
+            // View also works on directories (and "..") — quick-view shows
+            // a name-only listing for those.
+            Action::View => entry.is_some(),
+            Action::Edit => selection_is_file,
             Action::MkDir | Action::NewFile | Action::Help | Action::Settings | Action::Quit => {
                 true
             }
@@ -248,6 +287,34 @@ impl App {
             Side::Left => Side::Right,
             Side::Right => Side::Left,
         };
+    }
+
+    pub fn toggle_preview_focus(&mut self) {
+        self.preview_focus = !self.preview_focus;
+    }
+
+    pub fn scroll_preview_up(&mut self) {
+        self.preview_scroll = self.preview_scroll.saturating_sub(1);
+    }
+
+    /// Stops at the point where the last line sits at the bottom of the
+    /// preview pane, rather than letting it scroll away past the top.
+    pub fn scroll_preview_down(&mut self) {
+        let total_lines = preview::build_preview(self.active_pane_ref()).line_count();
+        let max = total_lines.saturating_sub(self.preview_visible_lines);
+        self.preview_scroll = (self.preview_scroll + 1).min(max);
+    }
+
+    /// Resets the preview scroll position whenever the previewed entry has
+    /// changed since the last call (any kind of selection/cwd change).
+    /// Called once per input loop iteration rather than at every individual
+    /// call site that can move the selection, so nothing is missed.
+    pub fn sync_preview_scroll(&mut self) {
+        let target = self.active_pane_ref().preview_target();
+        if target != self.last_preview_target {
+            self.preview_scroll = 0;
+            self.last_preview_target = target;
+        }
     }
 
     pub fn quit(&mut self) {
@@ -341,7 +408,7 @@ impl App {
             Action::Delete => self.request_delete(),
             Action::MkDir => self.request_mkdir(),
             Action::NewFile => self.request_new_file(),
-            Action::View => self.request_external(ExternalRequest::View, "view"),
+            Action::View => self.view_selected(),
             Action::Edit => self.request_external(ExternalRequest::Edit, "edit"),
             Action::Help => self.help_open = true,
             Action::Quit => self.dialog = Dialog::ConfirmQuit,
@@ -369,6 +436,7 @@ impl App {
             // Both panes are always kept in sync, so either one reflects
             // the current value.
             SettingItem::HideHiddenFiles => self.left.hide_hidden,
+            SettingItem::InternalPreview => self.internal_preview,
         }
     }
 
@@ -385,6 +453,7 @@ impl App {
                     self.set_error(format!("Cannot reload right pane: {err}"));
                 }
             }
+            SettingItem::InternalPreview => self.internal_preview = value,
         }
     }
 
@@ -486,6 +555,28 @@ impl App {
             name: entry.name.clone(),
             src,
         };
+    }
+
+    /// F3: toggles the internal quick preview if that setting is on
+    /// (keyboard focus stays on the file listing; Tab moves it onto the
+    /// preview to scroll), closing it again on a second press regardless of
+    /// which side currently has focus. Otherwise shells out to $PAGER/less
+    /// as before.
+    fn view_selected(&mut self) {
+        if !self.internal_preview {
+            self.request_external(ExternalRequest::View, "view");
+            return;
+        }
+        if self.quick_view {
+            self.quick_view = false;
+            self.preview_focus = false;
+            return;
+        }
+        if self.active_pane_ref().selected_entry().is_none() {
+            return;
+        }
+        self.quick_view = true;
+        self.preview_scroll = 0;
     }
 
     fn request_external(&mut self, make: fn(PathBuf) -> ExternalRequest, verb: &str) {

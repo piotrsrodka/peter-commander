@@ -101,6 +101,20 @@ impl Pane {
         }
     }
 
+    /// The filesystem path the quick-view preview should show for the
+    /// current selection: the parent directory for "..", otherwise the
+    /// selected entry itself. Unlike `selected_path`, this resolves ".."
+    /// instead of returning `None`, since the preview always has something
+    /// to point at.
+    pub fn preview_target(&self) -> Option<PathBuf> {
+        let entry = self.selected_entry()?;
+        if entry.name == ".." {
+            Some(self.cwd.parent().unwrap_or(&self.cwd).to_path_buf())
+        } else {
+            Some(self.cwd.join(&entry.name))
+        }
+    }
+
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
@@ -136,10 +150,10 @@ impl Pane {
             return Ok(Some(format!("Cannot open directory: {err}")));
         }
 
-        if let Some(name) = select_name {
-            if let Some(index) = self.entries.iter().position(|e| e.name == name) {
-                self.selected = index;
-            }
+        if let Some(name) = select_name
+            && let Some(index) = self.entries.iter().position(|e| e.name == name)
+        {
+            self.selected = index;
         }
         Ok(None)
     }
