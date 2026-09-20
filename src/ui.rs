@@ -638,7 +638,21 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
     // as before. A 1-column gap between tiles (not before F1) needs
     // reserving len-1 columns up front.
     let gaps = FN_KEYS.len() as u16 - 1;
-    let tile_width = area.width.saturating_sub(gaps) / FN_KEYS.len() as u16;
+    let usable = area.width.saturating_sub(gaps);
+    let base_width = usable / FN_KEYS.len() as u16;
+    let remainder = (usable % FN_KEYS.len() as u16) as usize;
+
+    // Integer division always leaves 0-9 leftover columns; rather than
+    // stranding them as blank padding after the last tile, hand one extra
+    // column each to the `remainder` tiles with the longest label text —
+    // those already have the least slack, so widening them first keeps the
+    // row looking evenly balanced instead of the growth being arbitrary.
+    let mut widen_first: Vec<usize> = (0..FN_KEYS.len()).collect();
+    widen_first.sort_by_key(|&i| std::cmp::Reverse(FN_KEYS[i].label.len()));
+    let mut tile_widths = vec![base_width; FN_KEYS.len()];
+    for &i in widen_first.iter().take(remainder) {
+        tile_widths[i] += 1;
+    }
 
     let mut spans = Vec::new();
     for (idx, fn_key) in FN_KEYS.iter().enumerate() {
@@ -652,7 +666,7 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
                 .bg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         ));
-        let label_width = tile_width.saturating_sub(fn_key.key.len() as u16) as usize;
+        let label_width = tile_widths[idx].saturating_sub(fn_key.key.len() as u16) as usize;
         spans.push(Span::styled(
             format!("{:<label_width$}", fn_key.label),
             Style::default().fg(Color::Black).bg(Color::Cyan),
