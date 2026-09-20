@@ -603,13 +603,26 @@ fn draw_status_message(frame: &mut Frame, area: Rect, message: &str) {
 }
 
 fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
+    // Indented by 1 column to match Norton Commander's look, rather than
+    // starting flush against the screen edge.
+    let area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+
     // Spread the tiles evenly across the full width instead of packing them
     // to the left; on a narrow terminal the tail simply gets clipped, same
-    // as before.
-    let tile_width = area.width / FN_KEYS.len() as u16;
+    // as before. A 1-column gap between tiles (not before F1) needs
+    // reserving len-1 columns up front.
+    let gaps = FN_KEYS.len() as u16 - 1;
+    let tile_width = area.width.saturating_sub(gaps) / FN_KEYS.len() as u16;
 
     let mut spans = Vec::new();
-    for fn_key in FN_KEYS {
+    for (idx, fn_key) in FN_KEYS.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
         spans.push(Span::styled(
             fn_key.key,
             Style::default()
