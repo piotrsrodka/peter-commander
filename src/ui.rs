@@ -107,11 +107,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.help_open {
-        draw_help(frame);
+        draw_help(frame, app.help_page);
     }
 }
 
-const HELP_LINES: &[&str] = &[
+const HELP_PAGE_1: &[&str] = &[
     "F1        Help          Show this screen",
     "F2        Rename        Rename selection (move within same dir)",
     "F3        View          Page selected file with $PAGER",
@@ -134,7 +134,9 @@ const HELP_LINES: &[&str] = &[
     "Up/Down   Move the selection",
     "Home/End  Jump to the top/bottom of the listing",
     "PgUp/PgDn Move the selection by one screenful",
-    "",
+];
+
+const HELP_PAGE_2: &[&str] = &[
     "Type anywhere to fill the command line below the panes;",
     "Enter runs it in the active pane's directory, or opens",
     "the selected entry if the command line is empty.",
@@ -143,18 +145,29 @@ const HELP_LINES: &[&str] = &[
     "F9 > Options > Settings opens the settings screen: Up/Down",
     "to move, Space to toggle a checkbox, Enter to save, Esc to cancel.",
     "",
-    "Press any key to close this help",
+    "Mouse: scroll the active pane/preview, click the menu bar or an",
+    "F-key tile.",
 ];
 
-fn draw_help(frame: &mut Frame) {
-    let width = HELP_LINES
+const HELP_FOOTER: &str = "Left/Right: switch page   Any other key: close";
+
+fn draw_help(frame: &mut Frame, page: usize) {
+    let lines_for_page = if page == 0 { HELP_PAGE_1 } else { HELP_PAGE_2 };
+
+    // Sized from both pages combined (not just the one currently shown),
+    // so the window stays the same size when switching pages instead of
+    // resizing around whichever page happens to be shorter.
+    let width = HELP_PAGE_1
         .iter()
+        .chain(HELP_PAGE_2)
+        .chain([&HELP_FOOTER])
         .map(|line| line.chars().count())
         .max()
         .unwrap_or(20) as u16
         + 4;
     let width = width.min(frame.area().width);
-    let height = (HELP_LINES.len() as u16 + 2).min(frame.area().height);
+    let content_height = HELP_PAGE_1.len().max(HELP_PAGE_2.len()) as u16;
+    let height = (content_height + 4).min(frame.area().height);
 
     let area = Rect {
         x: (frame.area().width.saturating_sub(width)) / 2,
@@ -163,13 +176,21 @@ fn draw_help(frame: &mut Frame) {
         height,
     };
 
-    let lines: Vec<Line> = HELP_LINES
+    let mut lines: Vec<Line> = lines_for_page
         .iter()
         .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::White))))
         .collect();
+    // Pad the shorter page so the footer lands on the same row on both
+    // pages, not just the box being the same overall size.
+    lines.resize(content_height as usize, Line::from(""));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        HELP_FOOTER,
+        Style::default().fg(Color::DarkGray),
+    )));
 
     let block = Block::default()
-        .title("Help — Keybindings")
+        .title(format!("Help — Keybindings (Page {}/2)", page + 1))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(Color::Black).fg(Color::White));
@@ -456,6 +477,34 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
 const DATE_COLUMN_WIDTH: usize = 14;
 /// Width the size column is right-aligned to.
 const SIZE_COLUMN_WIDTH: usize = 10;
+/// Above this, the size column shows megabytes instead of a raw byte count
+/// — a precise byte count stops being useful reading once it's this large.
+const SIZE_COLLAPSE_THRESHOLD: u64 = 100 * 1024 * 1024;
+
+/// Inserts a comma every 3 digits, e.g. `1234567` -> `"1,234,567"`.
+fn with_thousands_separators(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut result = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(byte as char);
+    }
+    result
+}
+
+/// Formats a file size for the listing: a comma-grouped byte count below
+/// `SIZE_COLLAPSE_THRESHOLD`, or a comma-grouped megabyte count above it —
+/// an exact byte count stops being readable/useful once a file is that big.
+fn format_size(bytes: u64) -> String {
+    if bytes >= SIZE_COLLAPSE_THRESHOLD {
+        format!("{} MB", with_thousands_separators(bytes / (1024 * 1024)))
+    } else {
+        with_thousands_separators(bytes)
+    }
+}
 /// Never shrink the name column below this, even on a very narrow pane —
 /// beyond this point there just isn't a sane layout, so let the line clip
 /// instead of producing a useless sliver of a name column.
@@ -565,7 +614,7 @@ fn draw_pane(
             let size_label = if entry.is_dir {
                 String::new()
             } else {
-                entry.size.to_string()
+                format_size(entry.size)
             };
             let name = fit_name(&entry.name, name_width);
             let label = format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date} ");
@@ -743,6 +792,29 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thousands_separators_are_inserted_every_3_digits() {
+        assert_eq!(with_thousands_separators(0), "0");
+        assert_eq!(with_thousands_separators(42), "42");
+        assert_eq!(with_thousands_separators(999), "999");
+        assert_eq!(with_thousands_separators(1000), "1,000");
+        assert_eq!(with_thousands_separators(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn size_below_threshold_shows_a_comma_grouped_byte_count() {
+        assert_eq!(format_size(0), "0");
+        assert_eq!(format_size(1_234_567), "1,234,567");
+        assert_eq!(format_size(SIZE_COLLAPSE_THRESHOLD - 1), "104,857,599");
+    }
+
+    #[test]
+    fn size_at_or_above_threshold_collapses_to_megabytes() {
+        assert_eq!(format_size(SIZE_COLLAPSE_THRESHOLD), "100 MB");
+        assert_eq!(format_size(250 * 1024 * 1024), "250 MB");
+        assert_eq!(format_size(2_000 * 1024 * 1024), "2,000 MB");
+    }
 
     #[test]
     fn short_name_is_padded_not_truncated() {

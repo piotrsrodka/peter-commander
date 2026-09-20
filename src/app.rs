@@ -137,6 +137,9 @@ pub struct App {
     pub dialog: Dialog,
     pub external_request: Option<ExternalRequest>,
     pub help_open: bool,
+    /// Which of the two help screen pages is shown (0 or 1) — Left/Right
+    /// switch between them while help is open.
+    pub help_page: usize,
     pub command_line: String,
     /// Whether running a command from the command line pauses with
     /// "Press Enter to continue" afterward, or returns straight to the
@@ -233,6 +236,7 @@ impl App {
             dialog: Dialog::None,
             external_request: None,
             help_open: false,
+            help_page: 0,
             command_line: String::new(),
             wait_after_shell_command,
             quick_view: false,
@@ -530,7 +534,10 @@ impl App {
             Action::NewFile => self.request_new_file(),
             Action::View => self.view_selected(),
             Action::Edit => self.request_external(ExternalRequest::Edit, "edit"),
-            Action::Help => self.help_open = true,
+            Action::Help => {
+                self.help_open = true;
+                self.help_page = 0;
+            }
             Action::ShowTerminal => self.request_reveal_terminal(),
             Action::Quit => self.dialog = Dialog::ConfirmQuit,
             Action::Settings => {

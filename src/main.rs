@@ -405,7 +405,11 @@ fn menu_category_for(letter: char) -> Option<usize> {
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     if app.help_open {
-        app.help_open = false;
+        match code {
+            KeyCode::Left => app.help_page = 0,
+            KeyCode::Right => app.help_page = 1,
+            _ => app.help_open = false,
+        }
         return Ok(());
     }
 
