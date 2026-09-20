@@ -30,7 +30,7 @@ use ratatui::layout::Position;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 
-use app::{App, Dialog, ExternalRequest};
+use app::{App, Dialog, ExternalRequest, SettingItem};
 use menu::{Action, FN_KEYS, MENU_BAR};
 
 fn restore_terminal() {
@@ -54,18 +54,28 @@ fn main() -> Result<()> {
         flag::register(signal, Arc::clone(&should_exit))?;
     }
 
+    // Read directly rather than via App::new() (which happens later, inside
+    // run()) so the very first frame already has mouse capture in the
+    // state the user last left it in, instead of always starting enabled.
+    let mouse_capture_enabled = state::load_settings()
+        .get(SettingItem::MouseCapture.key())
+        .copied()
+        .unwrap_or(true);
+
     enable_raw_mode().context("enable_raw_mode")?;
     let mut stdout = io::stdout();
     stdout
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
-    stdout
-        .execute(EnableMouseCapture)
-        .context("EnableMouseCapture")?;
+    if mouse_capture_enabled {
+        stdout
+            .execute(EnableMouseCapture)
+            .context("EnableMouseCapture")?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal::new")?;
 
-    let result = run(&mut terminal, &should_exit);
+    let result = run(&mut terminal, &should_exit, mouse_capture_enabled);
 
     restore_terminal();
 
@@ -79,10 +89,20 @@ fn main() -> Result<()> {
 fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     should_exit: &AtomicBool,
+    mouse_capture_enabled: bool,
 ) -> Result<()> {
     let mut app = App::new()?;
+    // Tracks what's actually been sent to the terminal, so a change to the
+    // live "Capture mouse" setting (toggled in the Settings dialog) can be
+    // applied the moment it happens, not just at the next TUI suspend.
+    let mut mouse_capture_applied = mouse_capture_enabled;
 
     while !app.should_quit && !should_exit.load(Ordering::Relaxed) {
+        if app.mouse_capture != mouse_capture_applied {
+            set_mouse_capture(app.mouse_capture)?;
+            mouse_capture_applied = app.mouse_capture;
+        }
+
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -99,10 +119,27 @@ fn run(
 
         if let Some(request) = app.external_request.take() {
             run_external(terminal, request, &mut app)?;
+            // The suspend/resume path below re-applies mouse capture to
+            // match `app.mouse_capture` on its own; keep this in sync so
+            // the check above doesn't redundantly re-toggle it.
+            mouse_capture_applied = app.mouse_capture;
         }
     }
 
     app.save_state();
+    Ok(())
+}
+
+fn set_mouse_capture(enabled: bool) -> Result<()> {
+    if enabled {
+        io::stdout()
+            .execute(EnableMouseCapture)
+            .context("EnableMouseCapture")?;
+    } else {
+        io::stdout()
+            .execute(DisableMouseCapture)
+            .context("DisableMouseCapture")?;
+    }
     Ok(())
 }
 
@@ -123,7 +160,7 @@ fn run_external(
             run_pager_or_editor(terminal, "EDITOR", default_editor, &path, app)
         }
         ExternalRequest::Shell { command, cwd } => run_shell_command(terminal, &command, &cwd, app),
-        ExternalRequest::RevealTerminal => reveal_terminal(terminal),
+        ExternalRequest::RevealTerminal => reveal_terminal(terminal, app),
     }
 }
 
@@ -151,9 +188,7 @@ fn run_pager_or_editor(
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
-    io::stdout()
-        .execute(EnableMouseCapture)
-        .context("EnableMouseCapture")?;
+    set_mouse_capture(app.mouse_capture)?;
     terminal.clear()?;
 
     match status {
@@ -213,9 +248,7 @@ fn run_shell_command(
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
-    io::stdout()
-        .execute(EnableMouseCapture)
-        .context("EnableMouseCapture")?;
+    set_mouse_capture(app.mouse_capture)?;
     terminal.clear()?;
 
     match status {
@@ -243,7 +276,7 @@ fn run_shell_command(
 /// screen becomes permanent scrollback once later output scrolls past it,
 /// so even a "toast" hint ends up baked in as a stray line per use. Classic
 /// Norton Commander doesn't overlay anything on the revealed screen either.
-fn reveal_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn reveal_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> Result<()> {
     // Mouse capture would otherwise intercept the wheel instead of letting
     // the terminal scroll its own native scrollback, defeating the point.
     io::stdout()
@@ -268,9 +301,7 @@ fn reveal_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
-    io::stdout()
-        .execute(EnableMouseCapture)
-        .context("EnableMouseCapture")?;
+    set_mouse_capture(app.mouse_capture)?;
     terminal.clear()?;
     Ok(())
 }

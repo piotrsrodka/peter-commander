@@ -87,6 +87,7 @@ pub enum SettingItem {
     WaitAfterShellCommand,
     HideHiddenFiles,
     InternalPreview,
+    MouseCapture,
 }
 
 impl SettingItem {
@@ -94,6 +95,7 @@ impl SettingItem {
         SettingItem::WaitAfterShellCommand,
         SettingItem::HideHiddenFiles,
         SettingItem::InternalPreview,
+        SettingItem::MouseCapture,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -101,6 +103,7 @@ impl SettingItem {
             SettingItem::WaitAfterShellCommand => "Wait for Enter after running commands",
             SettingItem::HideHiddenFiles => "Hide hidden files/folders",
             SettingItem::InternalPreview => "F3 View uses the internal quick preview",
+            SettingItem::MouseCapture => "Capture mouse (scroll/click); off leaves it to the terminal",
         }
     }
 
@@ -111,6 +114,7 @@ impl SettingItem {
             SettingItem::WaitAfterShellCommand => "wait_after_shell_command",
             SettingItem::HideHiddenFiles => "hide_hidden_files",
             SettingItem::InternalPreview => "internal_preview",
+            SettingItem::MouseCapture => "mouse_capture",
         }
     }
 }
@@ -162,6 +166,14 @@ pub struct App {
     /// $PAGER/less, per the "F3 View uses the internal quick preview"
     /// setting.
     pub internal_preview: bool,
+    /// Whether the terminal's mouse reporting should be claimed at all.
+    /// When off, scroll/click inside PC do nothing, but the terminal's own
+    /// native mouse behavior (its scrollback, text selection, any
+    /// mouse-driven shortcuts like font zoom) works normally — the two are
+    /// mutually exclusive at the terminal-protocol level, so this can't be
+    /// "both at once". `main` reads this each loop iteration and issues
+    /// the actual Enable/DisableMouseCapture sequence when it changes.
+    pub mouse_capture: bool,
     /// Height (in text rows) of the preview pane in the last drawn frame,
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
@@ -224,6 +236,10 @@ impl App {
             .get(SettingItem::InternalPreview.key())
             .copied()
             .unwrap_or(true);
+        let mouse_capture = saved_settings
+            .get(SettingItem::MouseCapture.key())
+            .copied()
+            .unwrap_or(true);
         Ok(App {
             left: Pane::new(left_dir, hide_hidden_files)?,
             right: Pane::new(right_dir, hide_hidden_files)?,
@@ -244,6 +260,7 @@ impl App {
             preview_scroll: 0,
             last_preview_target: None,
             internal_preview,
+            mouse_capture,
             preview_visible_lines: 0,
             preview_visible_width: 0,
             pane_visible_lines: 0,
@@ -565,12 +582,14 @@ impl App {
             // the current value.
             SettingItem::HideHiddenFiles => self.left.hide_hidden,
             SettingItem::InternalPreview => self.internal_preview,
+            SettingItem::MouseCapture => self.mouse_capture,
         }
     }
 
     fn set_setting_value(&mut self, item: SettingItem, value: bool) {
         match item {
             SettingItem::WaitAfterShellCommand => self.wait_after_shell_command = value,
+            SettingItem::MouseCapture => self.mouse_capture = value,
             SettingItem::HideHiddenFiles => {
                 self.left.hide_hidden = value;
                 self.right.hide_hidden = value;
