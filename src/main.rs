@@ -23,7 +23,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 
 use app::{App, Dialog, ExternalRequest};
@@ -43,7 +43,9 @@ fn main() -> Result<()> {
     }));
 
     let should_exit = Arc::new(AtomicBool::new(false));
-    for signal in [SIGINT, SIGTERM, SIGHUP] {
+    // TERM_SIGNALS is itself platform-appropriate: no SIGHUP/SIGQUIT on
+    // Windows, since those don't exist there.
+    for &signal in TERM_SIGNALS {
         flag::register(signal, Arc::clone(&should_exit))?;
     }
 
@@ -101,8 +103,14 @@ fn run_external(
     app: &mut App,
 ) -> Result<()> {
     match request {
-        ExternalRequest::View(path) => run_pager_or_editor(terminal, "PAGER", "less", &path, app),
-        ExternalRequest::Edit(path) => run_pager_or_editor(terminal, "EDITOR", "vi", &path, app),
+        ExternalRequest::View(path) => {
+            let default_pager = if cfg!(windows) { "notepad" } else { "less" };
+            run_pager_or_editor(terminal, "PAGER", default_pager, &path, app)
+        }
+        ExternalRequest::Edit(path) => {
+            let default_editor = if cfg!(windows) { "notepad" } else { "vi" };
+            run_pager_or_editor(terminal, "EDITOR", default_editor, &path, app)
+        }
         ExternalRequest::Shell { command, cwd } => run_shell_command(terminal, &command, &cwd, app),
         ExternalRequest::RevealTerminal => reveal_terminal(terminal),
     }
@@ -158,13 +166,20 @@ fn run_shell_command(
     cwd: &Path,
     app: &mut App,
 ) -> Result<()> {
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let (shell, shell_flag) = if cfg!(windows) {
+        (
+            env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/C",
+        )
+    } else {
+        (env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()), "-c")
+    };
     let wait = app.wait_after_shell_command;
 
     restore_terminal();
     println!("$ {command}");
     let status = Command::new(&shell)
-        .arg("-c")
+        .arg(shell_flag)
         .arg(command)
         .current_dir(cwd)
         .status();

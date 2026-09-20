@@ -560,17 +560,23 @@ impl App {
 
     /// Enter: opens the selected directory; for a file with the executable
     /// permission bit set, runs it exactly as if its name had been typed on
-    /// the command line (`./name`); for a known media file (image, PDF,
-    /// audio, video, HTML), hands it to the desktop's default viewer
-    /// (`xdg-open`, or `open` on macOS). Anything else does nothing, same
+    /// the command line (`./name`, or just `name` on Windows, which has no
+    /// such convention); for a known media file (image, PDF, audio, video,
+    /// HTML), hands it to the desktop's default viewer (`xdg-open`, `open`
+    /// on macOS, or Explorer on Windows). Anything else does nothing, same
     /// as before.
     pub fn open_selected(&mut self) -> Result<()> {
         let pane = self.active_pane_ref();
         if let Some(entry) = pane.selected_entry()
             && entry.is_executable
         {
+            let command = if cfg!(windows) {
+                format!("\"{}\"", entry.name)
+            } else {
+                format!("./{}", shell_words::quote(&entry.name))
+            };
             self.external_request = Some(ExternalRequest::Shell {
-                command: format!("./{}", shell_words::quote(&entry.name)),
+                command,
                 cwd: pane.cwd.clone(),
             });
             return Ok(());
@@ -591,13 +597,24 @@ impl App {
         Ok(())
     }
 
-    /// Spawns `media_opener()` on `path` without waiting for it — a GUI
-    /// viewer can stay open indefinitely, and PC shouldn't block (or need
-    /// its terminal suspended) while the user looks at it. Its stdio is
-    /// discarded so any stray output from it can't corrupt our screen,
-    /// since we're not suspending the alternate screen for this.
+    /// Spawns the desktop's default viewer on `path` without waiting for it
+    /// — a GUI viewer can stay open indefinitely, and PC shouldn't block
+    /// (or need its terminal suspended) while the user looks at it. Its
+    /// stdio is discarded so any stray output from it can't corrupt our
+    /// screen, since we're not suspending the alternate screen for this.
     fn open_externally(&mut self, path: &Path) {
-        let opener = media_opener();
+        // `xdg-open`/`open` are real executables we can spawn directly;
+        // Windows has no such standalone program (`start` is a cmd.exe
+        // builtin, fiddly to invoke correctly), so Explorer is used
+        // instead — handed a file path, it opens it with the associated
+        // default app, the same as double-clicking it.
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(windows) {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
         match Command::new(opener)
             .arg(path)
             .stdin(Stdio::null())
@@ -910,17 +927,6 @@ fn is_media_file(name: &str) -> bool {
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| MEDIA_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-}
-
-/// The desktop command that opens a file with its associated default
-/// application, so we don't have to maintain our own program-per-extension
-/// mapping.
-fn media_opener() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    }
 }
 
 /// Recognizes `cd`, `cd <path>`, `cd ~`, and `cd ~/path` on the command

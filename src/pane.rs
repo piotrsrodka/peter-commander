@@ -1,9 +1,30 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Result;
+
+/// Whether `path` counts as "executable" — the same thing Enter checks to
+/// decide whether to run it. On Unix this is the permission bit; Windows
+/// has no such bit, so it goes by extension instead (the same signal the
+/// shell itself uses, via `PATHEXT`).
+#[cfg(unix)]
+fn is_executable_file(_path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path, _metadata: &fs::Metadata) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_lowercase().as_str(),
+                "exe" | "bat" | "cmd" | "com"
+            )
+        })
+}
 
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -73,7 +94,7 @@ impl Pane {
                 is_dir,
                 size: metadata.len(),
                 modified: metadata.modified().ok(),
-                is_executable: !is_dir && metadata.permissions().mode() & 0o111 != 0,
+                is_executable: !is_dir && is_executable_file(&entry.path(), &metadata),
             };
             if item.is_dir {
                 dirs.push(item);
@@ -228,8 +249,12 @@ impl Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    // Permission bits and symlink creation without elevated privileges are
+    // Unix-specific; these three tests don't have a Windows equivalent.
+    #[cfg(unix)]
     #[test]
     fn entering_unreadable_directory_shows_message_without_moving() {
         let base = std::env::temp_dir().join("pc_test_pane_noaccess");
@@ -255,6 +280,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_to_directory_is_classified_as_a_directory() {
         let base = std::env::temp_dir().join("pc_test_pane_symlink");
@@ -277,6 +303,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn broken_symlink_is_still_listed() {
         let base = std::env::temp_dir().join("pc_test_pane_broken_symlink");
