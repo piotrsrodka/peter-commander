@@ -419,7 +419,26 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-const NAME_COLUMN_WIDTH: usize = 30;
+/// Width of a formatted date/time like "20-09-26 15:57".
+const DATE_COLUMN_WIDTH: usize = 14;
+/// Width the size column is right-aligned to.
+const SIZE_COLUMN_WIDTH: usize = 10;
+/// Never shrink the name column below this, even on a very narrow pane —
+/// beyond this point there just isn't a sane layout, so let the line clip
+/// instead of producing a useless sliver of a name column.
+const MIN_NAME_COLUMN_WIDTH: usize = 8;
+
+/// How wide the name column should be so the full row (name + size + date)
+/// exactly fills `inner_width` (the pane's content width, borders already
+/// excluded) — rather than a fixed width that wastes space on a wide pane
+/// or overflows on a narrow one.
+fn name_column_width(inner_width: u16) -> usize {
+    // 2 separating spaces: one before the size column, one before the date.
+    let fixed_width = SIZE_COLUMN_WIDTH + DATE_COLUMN_WIDTH + 2;
+    (inner_width as usize)
+        .saturating_sub(fixed_width)
+        .max(MIN_NAME_COLUMN_WIDTH)
+}
 
 /// Truncates a name to fit the name column, appending an ellipsis, instead
 /// of letting a long name spill into the size/date columns.
@@ -479,6 +498,9 @@ fn draw_pane(
         None => pane.cwd.to_string_lossy().to_string(),
     };
 
+    // -2 for the pane's own left/right border.
+    let name_width = name_column_width(area.width.saturating_sub(2));
+
     let items: Vec<ListItem> = pane
         .entries
         .iter()
@@ -505,8 +527,8 @@ fn draw_pane(
             } else {
                 entry.size.to_string()
             };
-            let name = fit_name(&entry.name, NAME_COLUMN_WIDTH);
-            let label = format!("{name} {size_label:>10} {date}");
+            let name = fit_name(&entry.name, name_width);
+            let label = format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date}");
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
