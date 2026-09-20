@@ -1,8 +1,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::fs_ops;
@@ -161,6 +163,9 @@ pub struct App {
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
     pub preview_visible_lines: usize,
+    /// Width (in columns) of the preview pane's content area in the last
+    /// drawn frame, needed to compute how many rows text wraps to.
+    pub preview_visible_width: usize,
     /// Height (in rows) of a file-listing pane in the last drawn frame,
     /// used to size a PgUp/PgDown page jump.
     pub pane_visible_lines: usize,
@@ -175,6 +180,25 @@ pub struct App {
     /// listing while moving up, only settling into place near the top.
     pub left_list_state: ListState,
     pub right_list_state: ListState,
+    /// Screen areas of the two panes in the last drawn frame (list or
+    /// preview, whichever is showing), used to hit-test mouse events.
+    pub left_pane_area: Rect,
+    pub right_pane_area: Rect,
+    /// Clickable regions of the last drawn F-key bar: each tile's screen
+    /// area paired with the action pressing that F-key would run (`None`
+    /// for F9, which opens the menu instead of running an action).
+    pub fn_key_tiles: Vec<(Rect, Option<Action>)>,
+    /// Clickable regions of the top menu bar's category labels (File,
+    /// Options, Command), paired with each one's index into `MENU_BAR`.
+    pub menu_bar_tiles: Vec<(Rect, usize)>,
+    /// Clickable regions of the open dropdown's items, paired with each
+    /// one's index into the current category's item list. Empty unless
+    /// `menu_open`.
+    pub menu_item_tiles: Vec<(Rect, usize)>,
+    /// When the last scroll-wheel event was processed, to debounce
+    /// duplicate events some terminals/compositors emit for a single
+    /// physical wheel click (see `debounced_scroll`).
+    last_scroll_at: Option<Instant>,
 }
 
 impl App {
@@ -217,10 +241,17 @@ impl App {
             last_preview_target: None,
             internal_preview,
             preview_visible_lines: 0,
+            preview_visible_width: 0,
             pane_visible_lines: 0,
             background_children: Vec::new(),
             left_list_state: ListState::default(),
             right_list_state: ListState::default(),
+            left_pane_area: Rect::default(),
+            right_pane_area: Rect::default(),
+            fn_key_tiles: Vec::new(),
+            menu_bar_tiles: Vec::new(),
+            menu_item_tiles: Vec::new(),
+            last_scroll_at: None,
         })
     }
 
@@ -263,6 +294,16 @@ impl App {
 
     pub fn active_pane(&mut self) -> &mut Pane {
         match self.active {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        }
+    }
+
+    /// Unlike `active_pane`, gets a specific side regardless of keyboard
+    /// focus — for mouse interaction, which acts on whatever's under the
+    /// pointer rather than whichever pane Tab last selected.
+    pub fn pane_mut(&mut self, side: Side) -> &mut Pane {
+        match side {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
         }
@@ -316,6 +357,29 @@ impl App {
         self.preview_focus = !self.preview_focus;
     }
 
+    /// Some terminals/compositors (seen especially with Wayland's
+    /// high-resolution wheel reporting) occasionally emit two scroll
+    /// events for what was physically a single wheel click, arriving only
+    /// a few milliseconds apart — nothing a human scrolls that fast.
+    /// Returns true (and the caller should ignore the event) if it looks
+    /// like one of those duplicates rather than a genuine new click.
+    pub fn debounced_scroll(&mut self) -> bool {
+        let now = Instant::now();
+        let is_duplicate = self
+            .last_scroll_at
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(20));
+        self.last_scroll_at = Some(now);
+        is_duplicate
+    }
+
+    /// Rows the current preview actually renders to once wrapped to its
+    /// pane's width — the right unit for clamping scroll, since a long
+    /// logical line can span several visual rows.
+    fn preview_wrapped_line_count(&self) -> usize {
+        preview::build_preview(self.active_pane_ref())
+            .wrapped_line_count(self.preview_visible_width as u16)
+    }
+
     pub fn scroll_preview_up(&mut self) {
         self.preview_scroll = self.preview_scroll.saturating_sub(1);
     }
@@ -323,8 +387,9 @@ impl App {
     /// Stops at the point where the last line sits at the bottom of the
     /// preview pane, rather than letting it scroll away past the top.
     pub fn scroll_preview_down(&mut self) {
-        let total_lines = preview::build_preview(self.active_pane_ref()).line_count();
-        let max = total_lines.saturating_sub(self.preview_visible_lines);
+        let max = self
+            .preview_wrapped_line_count()
+            .saturating_sub(self.preview_visible_lines);
         self.preview_scroll = (self.preview_scroll + 1).min(max);
     }
 
@@ -335,8 +400,9 @@ impl App {
     /// End: same bottom-clamping as `scroll_preview_down` — lands with the
     /// last line at the bottom of the preview, not scrolled past it.
     pub fn scroll_preview_to_bottom(&mut self) {
-        let total_lines = preview::build_preview(self.active_pane_ref()).line_count();
-        self.preview_scroll = total_lines.saturating_sub(self.preview_visible_lines);
+        self.preview_scroll = self
+            .preview_wrapped_line_count()
+            .saturating_sub(self.preview_visible_lines);
     }
 
     pub fn scroll_preview_page_up(&mut self) {
@@ -346,8 +412,9 @@ impl App {
 
     pub fn scroll_preview_page_down(&mut self) {
         let page = self.preview_visible_lines.max(1);
-        let total_lines = preview::build_preview(self.active_pane_ref()).line_count();
-        let max = total_lines.saturating_sub(self.preview_visible_lines);
+        let max = self
+            .preview_wrapped_line_count()
+            .saturating_sub(self.preview_visible_lines);
         self.preview_scroll = (self.preview_scroll + page).min(max);
     }
 
@@ -368,8 +435,15 @@ impl App {
     }
 
     pub fn open_menu(&mut self) {
+        self.open_menu_at(0);
+    }
+
+    /// Opens the menu directly on `category` — used when clicking a menu
+    /// bar label, which should jump straight to that category rather than
+    /// always starting from File like `open_menu` does.
+    pub fn open_menu_at(&mut self, category: usize) {
         self.menu_open = true;
-        self.menu_category = 0;
+        self.menu_category = category.min(MENU_BAR.len() - 1);
         self.menu_item = 0;
         self.snap_menu_item_to_enabled();
     }

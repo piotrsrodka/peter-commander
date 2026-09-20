@@ -38,6 +38,24 @@ impl PreviewContent {
             _ => 0,
         }
     }
+
+    /// Like `line_count`, but for `Text` it's the number of rows the
+    /// content actually renders to once word-wrapped to `width` — a long
+    /// logical line can span several visual rows. Scroll clamping (so the
+    /// last line lands at the bottom instead of getting cut off) needs
+    /// this, not the logical count, once wrapping is in play.
+    pub fn wrapped_line_count(&self, width: u16) -> usize {
+        match self {
+            PreviewContent::Text(lines) => {
+                let rendered: Vec<ratatui::text::Line> =
+                    lines.iter().map(|line| line.as_str().into()).collect();
+                ratatui::widgets::Paragraph::new(rendered)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .line_count(width)
+            }
+            _ => self.line_count(),
+        }
+    }
 }
 
 pub fn build_preview(pane: &Pane) -> PreviewContent {

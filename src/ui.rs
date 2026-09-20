@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
 
 use crate::app::{App, Dialog, SettingItem, Side};
 use crate::menu::{FN_KEYS, MENU_BAR};
@@ -31,11 +31,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(root[1]);
 
     app.pane_visible_lines = panes[0].height.saturating_sub(2) as usize;
+    app.left_pane_area = panes[0];
+    app.right_pane_area = panes[1];
 
     if app.quick_view {
         match app.active {
             Side::Left => {
                 app.preview_visible_lines = panes[1].height.saturating_sub(2) as usize;
+                app.preview_visible_width = panes[1].width.saturating_sub(2) as usize;
                 draw_pane(
                     frame,
                     panes[0],
@@ -47,6 +50,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
             Side::Right => {
                 app.preview_visible_lines = panes[0].height.saturating_sub(2) as usize;
+                app.preview_visible_width = panes[0].width.saturating_sub(2) as usize;
                 draw_preview_pane(frame, panes[0], &app.right, app.preview_focus, app.preview_scroll);
                 draw_pane(
                     frame,
@@ -76,7 +80,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_command_line(frame, root[2], app);
     draw_status_message(frame, root[3], &app.status_message);
-    draw_fn_key_bar(frame, root[4]);
+    draw_fn_key_bar(frame, root[4], app);
 
     if app.menu_open {
         draw_menu_dropdown(frame, root[0], app);
@@ -122,6 +126,7 @@ const HELP_LINES: &[&str] = &[
     "",
     "Alt+F1    Left = Right   Point left pane at right pane's dir",
     "Alt+F2    Right = Left   Point right pane at left pane's dir",
+    "Alt+F/O/C Menu           Jump to the File/Options/Command menu",
     "Ctrl+O    Terminal       Reveal the terminal/scrollback under panels",
     "Ctrl+Q    Quit           Same as F10, in case your terminal eats F10",
     "",
@@ -292,7 +297,9 @@ fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.menu_bar_tiles.clear();
+    let mut x = area.x + 1; // the leading raw space
     let mut spans = Vec::new();
     spans.push(Span::raw(" "));
     for (idx, category) in MENU_BAR.iter().enumerate() {
@@ -305,6 +312,17 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default().fg(Color::Black).bg(Color::Gray)
         };
+        let tile_width = category.title.len() as u16 + 2;
+        app.menu_bar_tiles.push((
+            Rect {
+                x,
+                y: area.y,
+                width: tile_width,
+                height: 1,
+            },
+            idx,
+        ));
+        x += tile_width;
         spans.push(Span::styled(format!(" {} ", category.title), style));
     }
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Gray));
@@ -351,7 +369,7 @@ fn draw_shadow_for(frame: &mut Frame, area: Rect) {
     frame.render_widget(Shadow, shadow_area);
 }
 
-fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
+fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
     // Compute the x offset of the selected category so the dropdown appears under it.
     let mut x = menu_bar_area.x + 1;
     for category in &MENU_BAR[..app.menu_category] {
@@ -377,6 +395,21 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
         width,
         height,
     };
+
+    // Item rows sit 1 cell in from the block's border on every side.
+    app.menu_item_tiles = (0..category.items.len())
+        .map(|idx| {
+            (
+                Rect {
+                    x: area.x + 1,
+                    y: area.y + 1 + idx as u16,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                },
+                idx,
+            )
+        })
+        .collect();
 
     let items: Vec<ListItem> = category
         .items
@@ -433,8 +466,9 @@ const MIN_NAME_COLUMN_WIDTH: usize = 8;
 /// excluded) — rather than a fixed width that wastes space on a wide pane
 /// or overflows on a narrow one.
 fn name_column_width(inner_width: u16) -> usize {
-    // 2 separating spaces: one before the size column, one before the date.
-    let fixed_width = SIZE_COLUMN_WIDTH + DATE_COLUMN_WIDTH + 2;
+    // 3 spaces: one before the size column, one before the date, and one
+    // trailing margin after it.
+    let fixed_width = SIZE_COLUMN_WIDTH + DATE_COLUMN_WIDTH + 3;
     (inner_width as usize)
         .saturating_sub(fixed_width)
         .max(MIN_NAME_COLUMN_WIDTH)
@@ -453,6 +487,12 @@ fn fit_name(name: &str, width: usize) -> String {
 }
 
 fn draw_command_line(frame: &mut Frame, area: Rect, app: &App) {
+    // Indented 1 column, matching the F-key bar below it.
+    let area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
     let cwd = match app.active {
         Side::Left => &app.left.cwd,
         Side::Right => &app.right.cwd,
@@ -528,7 +568,7 @@ fn draw_pane(
                 entry.size.to_string()
             };
             let name = fit_name(&entry.name, name_width);
-            let label = format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date}");
+            let label = format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date} ");
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
@@ -582,6 +622,13 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool
         .borders(Borders::ALL)
         .border_style(border_style);
 
+    // For everything except Text, the scroll offset is applied by
+    // skipping whole (never-wrapped) entries up front. Text is different:
+    // it's word-wrapped, so a scroll offset in *logical* lines would be
+    // wrong once a long line spans multiple visual rows — instead all
+    // lines are kept and `paragraph_scroll` is handed to Ratatui's own
+    // `.scroll()`, which operates in post-wrap visual rows.
+    let mut paragraph_scroll: u16 = 0;
     let lines: Vec<Line> = match preview::build_preview(source) {
         PreviewContent::Empty => Vec::new(),
         PreviewContent::Directory(entries) => entries
@@ -606,14 +653,17 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool
             format!("Cannot preview: {err}"),
             Style::default().fg(Color::Red),
         ))],
-        PreviewContent::Text(text_lines) => text_lines
-            .into_iter()
-            .skip(scroll)
-            .map(Line::from)
-            .collect(),
+        PreviewContent::Text(text_lines) => {
+            paragraph_scroll = scroll as u16;
+            text_lines.into_iter().map(Line::from).collect()
+        }
     };
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((paragraph_scroll, 0));
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_status_message(frame: &mut Frame, area: Rect, message: &str) {
@@ -624,7 +674,7 @@ fn draw_status_message(frame: &mut Frame, area: Rect, message: &str) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
+fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     // Indented by 1 column to match Norton Commander's look, rather than
     // starting flush against the screen edge.
     let area = Rect {
@@ -654,11 +704,25 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect) {
         tile_widths[i] += 1;
     }
 
+    app.fn_key_tiles.clear();
+    let mut x = area.x;
     let mut spans = Vec::new();
     for (idx, fn_key) in FN_KEYS.iter().enumerate() {
         if idx > 0 {
             spans.push(Span::raw(" "));
+            x += 1;
         }
+        app.fn_key_tiles.push((
+            Rect {
+                x,
+                y: area.y,
+                width: tile_widths[idx],
+                height: 1,
+            },
+            fn_key.action,
+        ));
+        x += tile_widths[idx];
+
         spans.push(Span::styled(
             fn_key.key,
             Style::default()

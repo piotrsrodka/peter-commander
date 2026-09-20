@@ -17,20 +17,25 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Position;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 
 use app::{App, Dialog, ExternalRequest};
-use menu::{Action, FN_KEYS};
+use menu::{Action, FN_KEYS, MENU_BAR};
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
+    let _ = io::stdout().execute(DisableMouseCapture);
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
 
@@ -54,6 +59,9 @@ fn main() -> Result<()> {
     stdout
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
+    stdout
+        .execute(EnableMouseCapture)
+        .context("EnableMouseCapture")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal::new")?;
 
@@ -77,11 +85,14 @@ fn run(
     while !app.should_quit && !should_exit.load(Ordering::Relaxed) {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
-        if event::poll(Duration::from_millis(200))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            handle_key(&mut app, key.code, key.modifiers)?;
+        if event::poll(Duration::from_millis(200))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(&mut app, key.code, key.modifiers)?;
+                }
+                Event::Mouse(mouse) => handle_mouse(&mut app, mouse)?,
+                _ => {}
+            }
         }
         app.sync_preview_scroll();
         app.reap_finished_children();
@@ -140,6 +151,9 @@ fn run_pager_or_editor(
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
+    io::stdout()
+        .execute(EnableMouseCapture)
+        .context("EnableMouseCapture")?;
     terminal.clear()?;
 
     match status {
@@ -199,6 +213,9 @@ fn run_shell_command(
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
+    io::stdout()
+        .execute(EnableMouseCapture)
+        .context("EnableMouseCapture")?;
     terminal.clear()?;
 
     match status {
@@ -227,6 +244,11 @@ fn run_shell_command(
 /// so even a "toast" hint ends up baked in as a stray line per use. Classic
 /// Norton Commander doesn't overlay anything on the revealed screen either.
 fn reveal_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    // Mouse capture would otherwise intercept the wheel instead of letting
+    // the terminal scroll its own native scrollback, defeating the point.
+    io::stdout()
+        .execute(DisableMouseCapture)
+        .context("DisableMouseCapture")?;
     io::stdout()
         .execute(LeaveAlternateScreen)
         .context("LeaveAlternateScreen")?;
@@ -246,8 +268,139 @@ fn reveal_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Res
     io::stdout()
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
+    io::stdout()
+        .execute(EnableMouseCapture)
+        .context("EnableMouseCapture")?;
     terminal.clear()?;
     Ok(())
+}
+
+/// Which pane (if any) a screen position falls in, based on the areas
+/// recorded during the last drawn frame.
+fn side_at(app: &App, column: u16, row: u16) -> Option<app::Side> {
+    let pos = Position::new(column, row);
+    if app.left_pane_area.contains(pos) {
+        Some(app::Side::Left)
+    } else if app.right_pane_area.contains(pos) {
+        Some(app::Side::Right)
+    } else {
+        None
+    }
+}
+
+/// Mouse support: wheel scrolls a pane (or the quick-view preview, if that's
+/// what's showing under the pointer) by exactly one row per notch, and
+/// clicking an F-key bar tile does whatever pressing that key would do.
+/// Ignored while a dialog, the pulldown menu, or help is open, matching how
+/// `handle_key` gates those same keyboard shortcuts.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+    if app.help_open
+        || app.dialog_is_text_input()
+        || app.dialog_is_settings()
+        || !matches!(app.dialog, Dialog::None)
+    {
+        return Ok(());
+    }
+
+    match mouse.kind {
+        // Only the active pane has a visible highlight, so scrolling the
+        // inactive one would move its selection with no visible feedback.
+        // Blocked while the menu is open too, same as the keyboard's
+        // arrows are repurposed for menu navigation in that state.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if !app.menu_open => {
+            if app.debounced_scroll() {
+                return Ok(());
+            }
+            if let Some(side) = side_at(app, mouse.column, mouse.row) {
+                // The active side always shows the file list (whether or
+                // not quick_view is on); when quick_view is on, the other
+                // side shows the preview instead of a second list.
+                let is_preview_side = app.quick_view && side != app.active;
+                let is_list_side = side == app.active;
+                let scroll_up = mouse.kind == MouseEventKind::ScrollUp;
+                // Text scrolls faster per notch than the file list — 1 row
+                // per click feels sluggish for reading, matching the usual
+                // "a few lines per wheel click" convention.
+                const WHEEL_PREVIEW_LINES: usize = 3;
+                match (is_preview_side, is_list_side, scroll_up) {
+                    (true, _, true) => {
+                        for _ in 0..WHEEL_PREVIEW_LINES {
+                            app.scroll_preview_up();
+                        }
+                    }
+                    (true, _, false) => {
+                        for _ in 0..WHEEL_PREVIEW_LINES {
+                            app.scroll_preview_down();
+                        }
+                    }
+                    (false, true, true) => app.pane_mut(side).move_up(),
+                    (false, true, false) => app.pane_mut(side).move_down(),
+                    (false, false, _) => {}
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => handle_mouse_click(app, mouse.column, mouse.row)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_mouse_click(app: &mut App, column: u16, row: u16) -> Result<()> {
+    let pos = Position::new(column, row);
+
+    // A menu bar label is clickable whether or not the menu is already
+    // open — either opens it fresh on that category, or switches to it.
+    let bar_category = app
+        .menu_bar_tiles
+        .iter()
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|&(_, category)| category);
+    if let Some(category) = bar_category {
+        app.open_menu_at(category);
+        return Ok(());
+    }
+
+    if app.menu_open {
+        let item = app
+            .menu_item_tiles
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|&(_, idx)| idx);
+        if let Some(idx) = item {
+            let action = MENU_BAR[app.menu_category].items[idx];
+            if app.action_enabled(action) {
+                app.menu_item = idx;
+                app.confirm_menu_selection()?;
+            }
+        } else {
+            // Clicked outside the bar and the dropdown: dismiss it, same
+            // as clicking away from a menu does in any GUI.
+            app.close_menu();
+        }
+        return Ok(());
+    }
+
+    let clicked = app
+        .fn_key_tiles
+        .iter()
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|(_, action)| *action);
+    if let Some(clicked_action) = clicked {
+        match clicked_action {
+            Some(action) => app.run_action(action)?,
+            None => app.open_menu(),
+        }
+    }
+    Ok(())
+}
+
+/// The `MENU_BAR` category whose title starts with `letter` (case
+/// insensitive), if any — used for the Alt+F/O/C mnemonic shortcuts.
+fn menu_category_for(letter: char) -> Option<usize> {
+    let lower = letter.to_ascii_lowercase();
+    MENU_BAR
+        .iter()
+        .position(|category| category.title.to_ascii_lowercase().starts_with(lower))
 }
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
@@ -304,6 +457,14 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             KeyCode::Down => app.menu_down(),
             KeyCode::Enter => app.confirm_menu_selection()?,
             KeyCode::F(9) => app.close_menu(),
+            // The mnemonic letter switches category even while the menu
+            // is already open (with or without Alt still held), so Alt+F
+            // then Alt+O jumps straight from File to Options.
+            KeyCode::Char(c) => {
+                if let Some(idx) = menu_category_for(c) {
+                    app.open_menu_at(idx);
+                }
+            }
             _ => {}
         }
         return Ok(());
@@ -355,6 +516,15 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         }
         KeyCode::F(2) if modifiers.contains(KeyModifiers::ALT) => {
             app.sync_right_to_left_dir()?;
+        }
+        // Alt+<first letter> jumps straight to that menu category — Alt+F
+        // for File, Alt+O for Options, Alt+C for Command — matching each
+        // category's title rather than hardcoding the letters, so this
+        // stays correct if MENU_BAR is ever relabeled.
+        KeyCode::Char(c) if modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(idx) = menu_category_for(c) {
+                app.open_menu_at(idx);
+            }
         }
         KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.request_reveal_terminal();
