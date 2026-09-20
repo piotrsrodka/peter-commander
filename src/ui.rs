@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
 
 use crate::app::{App, Dialog, SettingItem, Side};
+use crate::logging;
 use crate::menu::{FN_KEYS, MENU_BAR};
 use crate::pane::Pane;
 use crate::preview::{self, PreviewContent};
@@ -18,7 +19,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(1), // menu bar
             Constraint::Min(3),    // panes
             Constraint::Length(1), // command line
-            Constraint::Length(1), // status message
             Constraint::Length(1), // F-key bar
         ])
         .split(frame.area());
@@ -45,19 +45,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &app.left,
                     !app.preview_focus,
                     &mut app.left_list_state,
+                    app.classic_style,
                 );
-                draw_preview_pane(frame, panes[1], &app.left, app.preview_focus, app.preview_scroll);
+                draw_preview_pane(
+                    frame,
+                    panes[1],
+                    &app.left,
+                    app.preview_focus,
+                    app.preview_scroll,
+                    app.classic_style,
+                );
             }
             Side::Right => {
                 app.preview_visible_lines = panes[0].height.saturating_sub(2) as usize;
                 app.preview_visible_width = panes[0].width.saturating_sub(2) as usize;
-                draw_preview_pane(frame, panes[0], &app.right, app.preview_focus, app.preview_scroll);
+                draw_preview_pane(
+                    frame,
+                    panes[0],
+                    &app.right,
+                    app.preview_focus,
+                    app.preview_scroll,
+                    app.classic_style,
+                );
                 draw_pane(
                     frame,
                     panes[1],
                     &app.right,
                     !app.preview_focus,
                     &mut app.right_list_state,
+                    app.classic_style,
                 );
             }
         }
@@ -68,6 +84,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &app.left,
             app.active == Side::Left,
             &mut app.left_list_state,
+            app.classic_style,
         );
         draw_pane(
             frame,
@@ -75,12 +92,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &app.right,
             app.active == Side::Right,
             &mut app.right_list_state,
+            app.classic_style,
         );
     }
 
     draw_command_line(frame, root[2], app);
-    draw_status_message(frame, root[3], &app.status_message);
-    draw_fn_key_bar(frame, root[4], app);
+    draw_fn_key_bar(frame, root[3], app);
 
     if app.menu_open {
         draw_menu_dropdown(frame, root[0], app);
@@ -108,6 +125,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.help_open {
         draw_help(frame, app.help_page);
+    }
+
+    if app.logs_open {
+        draw_logs(frame);
     }
 }
 
@@ -144,6 +165,9 @@ const HELP_PAGE_2: &[&str] = &[
     "",
     "F9 > Options > Settings opens the settings screen: Up/Down",
     "to move, Space to toggle a checkbox, Enter to save, Esc to cancel.",
+    "",
+    "F9 > Command > Show Logs shows recent status/error messages —",
+    "there's no dedicated status line any more, they're logged instead.",
     "",
     "Mouse: scroll the active pane/preview, click the menu bar or an",
     "F-key tile.",
@@ -325,13 +349,17 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     spans.push(Span::raw(" "));
     for (idx, category) in MENU_BAR.iter().enumerate() {
         let is_selected = app.menu_open && idx == app.menu_category;
-        let style = if is_selected {
-            Style::default()
+        let style = match (app.classic_style, is_selected) {
+            (true, true) => Style::default()
+                .fg(classic::MENU_BAR_SELECTED_FG)
+                .bg(classic::MENU_BAR_SELECTED_BG)
+                .add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(classic::MENU_BAR_FG).bg(classic::MENU_BAR_BG),
+            (false, true) => Style::default()
                 .fg(Color::White)
                 .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Black).bg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+            (false, false) => Style::default().fg(Color::Black).bg(Color::Gray),
         };
         let tile_width = category.title.len() as u16 + 2;
         app.menu_bar_tiles.push((
@@ -346,27 +374,55 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
         x += tile_width;
         spans.push(Span::styled(format!(" {} ", category.title), style));
     }
-    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Gray));
+    let bar_bg = if app.classic_style {
+        classic::MENU_BAR_BG
+    } else {
+        Color::Gray
+    };
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
     frame.render_widget(bar, area);
 }
 
-/// A drop-shadow overlay. Two failed attempts taught what doesn't work
+/// A drop-shadow overlay. Two earlier attempts taught what doesn't work
 /// here: `Modifier::DIM` only dims a cell's foreground per the ANSI spec,
 /// not its background, and most of the shadow falls on blank/background
 /// cells; and named colors like `Color::DarkGray` are whatever the
 /// terminal's color scheme remaps them to (some dark themes map it close
-/// to black, same trap as the old hardcoded `Color::White` text bug). A
-/// fixed `Color::Rgb` sidesteps theme remapping entirely — this exact gray
-/// renders the same regardless of the terminal's palette.
+/// to black, same trap as the old hardcoded `Color::White` text bug).
+///
+/// Where the cell underneath is a known `Color::Rgb` (true in classic
+/// mode, since every classic color is an explicit RGB constant), this
+/// darkens that exact color instead of replacing it — real "see-through"
+/// shadow rather than a flat gray patch. For anything else (a named/Reset
+/// color, i.e. following the terminal's own theme, where the actual RGB
+/// isn't knowable) it falls back to a fixed dark gray fill — reverse video
+/// was tried here too, but looked inconsistent against Omarchy's dynamic
+/// theming, so a flat fill is the more predictable choice for that case.
 struct Shadow;
+
+/// Multiplies each RGB channel by this factor to darken it for the shadow.
+const SHADOW_DARKEN_FACTOR: f32 = 0.35;
+/// Flat fallback for cells whose color isn't a known RGB to darken.
+const SHADOW_FALLBACK: Color = Color::Rgb(30, 30, 30);
+
+fn darken(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return SHADOW_FALLBACK;
+    };
+    Color::Rgb(
+        (r as f32 * SHADOW_DARKEN_FACTOR) as u8,
+        (g as f32 * SHADOW_DARKEN_FACTOR) as u8,
+        (b as f32 * SHADOW_DARKEN_FACTOR) as u8,
+    )
+}
 
 impl Widget for Shadow {
     fn render(self, area: Rect, buf: &mut Buffer) {
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_bg(Color::Rgb(90, 90, 90));
-                    cell.modifier.insert(Modifier::DIM);
+                    cell.set_bg(darken(cell.bg));
+                    cell.set_fg(darken(cell.fg));
                 }
             }
         }
@@ -439,33 +495,60 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
         .map(|(idx, action)| {
             let is_selected = idx == app.menu_item;
             let enabled = app.action_enabled(*action);
-            let style = match (is_selected, enabled) {
-                (true, true) => Style::default()
+            let style = match (app.classic_style, is_selected, enabled) {
+                (true, true, _) => Style::default()
+                    .fg(classic::MENU_SELECTED_ITEM_FG)
+                    .bg(classic::MENU_SELECTED_ITEM_BG)
+                    .add_modifier(Modifier::BOLD),
+                (true, false, true) => {
+                    Style::default().fg(classic::MENU_ITEM_FG).bg(classic::MENU_BG)
+                }
+                (true, false, false) => {
+                    Style::default().fg(classic::MENU_DISABLED_FG).bg(classic::MENU_BG)
+                }
+                (false, true, true) => Style::default()
                     .fg(Color::White)
                     .bg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
-                (true, false) => Style::default().fg(Color::DarkGray).bg(Color::Blue),
-                (false, true) => Style::default().fg(Color::Black).bg(Color::Gray),
-                (false, false) => Style::default().fg(Color::DarkGray).bg(Color::Gray),
+                (false, true, false) => Style::default().fg(Color::DarkGray).bg(Color::Blue),
+                (false, false, true) => Style::default().fg(Color::Black).bg(Color::Gray),
+                (false, false, false) => Style::default().fg(Color::DarkGray).bg(Color::Gray),
             };
-            let text = match action.shortcut() {
-                Some(shortcut) => {
-                    format!(
-                        "{:<label_width$}{shortcut:>shortcut_width$}",
-                        action.label(),
-                        label_width = row_text_width - shortcut.len(),
-                        shortcut_width = shortcut.len(),
-                    )
-                }
-                None => format!("{:<row_text_width$}", action.label()),
+            // Classic NC shows the shortcut in white regardless of the
+            // (yellow/muted) label color, but only for a plain, unselected
+            // row — a selected/highlighted row is one uniform reverse-video
+            // color for the whole line, same as everywhere else.
+            let shortcut_style = if app.classic_style && !is_selected && enabled {
+                Style::default().fg(Color::Rgb(255, 255, 255)).bg(classic::MENU_BG)
+            } else {
+                style
             };
-            ListItem::new(Line::from(Span::styled(format!(" {text} "), style)))
+            let (label_part, shortcut_part) = match action.shortcut() {
+                Some(shortcut) => (
+                    format!("{:<label_width$}", action.label(), label_width = row_text_width - shortcut.len()),
+                    format!("{shortcut:>shortcut_width$}", shortcut_width = shortcut.len()),
+                ),
+                None => (format!("{:<row_text_width$}", action.label()), String::new()),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(" ", style),
+                Span::styled(label_part, style),
+                Span::styled(shortcut_part, shortcut_style),
+                Span::styled(" ", style),
+            ]))
         })
         .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().bg(Color::Gray).fg(Color::Black));
+    let block = if app.classic_style {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(classic::MENU_BORDER_FG).add_modifier(Modifier::BOLD))
+            .style(Style::default().bg(classic::MENU_BG).fg(classic::MENU_ITEM_FG))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .style(Style::default().bg(Color::Gray).fg(Color::Black))
+    };
 
     draw_shadow_for(frame, area);
 
@@ -536,26 +619,62 @@ fn fit_name(name: &str, width: usize) -> String {
 }
 
 fn draw_command_line(frame: &mut Frame, area: Rect, app: &App) {
-    // Indented 1 column, matching the F-key bar below it.
-    let area = Rect {
-        x: area.x + 1,
-        width: area.width.saturating_sub(1),
-        ..area
-    };
     let cwd = match app.active {
         Side::Left => &app.left.cwd,
         Side::Right => &app.right.cwd,
     };
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{}> ", cwd.display()),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(&app.command_line, Style::default().fg(Color::Reset)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    // Once the row's background is forced to black below, the typed text
+    // can't be left as Color::Reset (the terminal's own default foreground)
+    // — on a light terminal theme that default is a dark color, which
+    // would go invisible on a now-black background. Same lesson as the
+    // earlier white-on-white pane text bug.
+    // 0xAFA8AF sampled from the reference screenshot's prompt text — the
+    // classic DOS "light gray" (palette color 7), not pure white.
+    let typed_text_fg = if app.classic_style {
+        Color::Rgb(0xAF, 0xA8, 0xAF)
+    } else {
+        Color::Reset
+    };
+    // Indented 1 column, matching the F-key bar below it — as a real
+    // painted leading space rather than shrinking the render area, so
+    // that column gets the row's own background instead of leaving it
+    // untouched (showing whatever was underneath, e.g. the terminal's own
+    // background peeking through as a stray-colored notch).
+    let indent_style = if app.classic_style {
+        Style::default().bg(classic::PROMPT_BG)
+    } else {
+        Style::default()
+    };
+    // The reference screenshot doesn't highlight the cwd at all — the
+    // whole prompt is one uniform gray. Named `Color::Green` is also
+    // exactly the kind of color a dynamically-themed terminal (e.g.
+    // Omarchy) can remap to something else entirely — it showed up as
+    // yellow, not green, the same lesson as every other named-color bug
+    // this session.
+    let cwd_fg = if app.classic_style {
+        typed_text_fg
+    } else {
+        Color::Green
+    };
+    let mut spans = Vec::new();
+    // The 1-column indent looks right against the terminal's own
+    // background, but looks off-balance once the row has its own solid
+    // blue/black backgrounds (classic mode) — skip it there.
+    if !app.classic_style {
+        spans.push(Span::styled(" ", indent_style));
+    }
+    spans.push(Span::styled(
+        format!("{}> ", cwd.display()),
+        Style::default().fg(cwd_fg).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(&app.command_line, Style::default().fg(typed_text_fg)));
+    let line = Line::from(spans);
+    let paragraph = if app.classic_style {
+        Paragraph::new(line).style(Style::default().bg(classic::PROMPT_BG))
+    } else {
+        Paragraph::new(line)
+    };
+    frame.render_widget(paragraph, area);
 }
 
 fn format_modified(modified: Option<std::time::SystemTime>) -> String {
@@ -567,14 +686,66 @@ fn format_modified(modified: Option<std::time::SystemTime>) -> String {
     }
 }
 
+/// Fixed colors for the "Classic retro Norton Commander" setting — real
+/// RGB rather than named ANSI colors, so a dynamically-themed terminal
+/// (e.g. Omarchy's per-wallpaper palette) can't remap them away from the
+/// intended look, the same lesson learned from the menu shadow.
+mod classic {
+    use ratatui::style::Color;
+
+    pub const BG: Color = Color::Rgb(0, 0, 170);
+    pub const DIR_FG: Color = Color::Rgb(255, 255, 255);
+    // 0x50FFFF from the reference screenshot — a light turquoise, used for
+    // both plain file text and the active pane's border.
+    pub const FILE_FG: Color = Color::Rgb(0x50, 0xFF, 0xFF);
+    pub const ACTIVE_BORDER_FG: Color = FILE_FG;
+    pub const INACTIVE_BORDER_FG: Color = Color::Rgb(0, 170, 170);
+    pub const HIGHLIGHT_BG: Color = Color::Rgb(0, 170, 170);
+    pub const HIGHLIGHT_FG: Color = Color::Rgb(0, 0, 0);
+
+    // Menu bar and dropdown — same turquoise background as the dropdown,
+    // not black, with mostly-white text (a single accelerator letter is
+    // yellow in the reference screenshot; not implemented yet).
+    pub const MENU_BG: Color = Color::Rgb(0, 170, 170);
+    pub const MENU_BAR_BG: Color = MENU_BG;
+    pub const MENU_BAR_FG: Color = Color::Rgb(255, 255, 255);
+    pub const MENU_BAR_SELECTED_BG: Color = Color::Rgb(255, 255, 255);
+    pub const MENU_BAR_SELECTED_FG: Color = Color::Rgb(0, 0, 0);
+    pub const MENU_ITEM_FG: Color = Color::Rgb(255, 255, 255);
+    pub const MENU_DISABLED_FG: Color = Color::Rgb(0, 85, 85);
+    pub const MENU_SELECTED_ITEM_BG: Color = Color::Rgb(0, 0, 0);
+    pub const MENU_SELECTED_ITEM_FG: Color = Color::Rgb(255, 255, 255);
+    pub const MENU_BORDER_FG: Color = Color::Rgb(255, 255, 255);
+
+    // F-key bar.
+    // Sampled from the reference: the F-key number is the same light gray
+    // as the prompt text, not yellow.
+    pub const FN_KEY_NUM_FG: Color = Color::Rgb(0xAF, 0xA8, 0xAF);
+    pub const FN_KEY_NUM_BG: Color = Color::Rgb(0, 0, 0);
+    pub const FN_KEY_LABEL_FG: Color = Color::Rgb(0, 0, 0);
+    pub const FN_KEY_LABEL_BG: Color = Color::Rgb(0, 170, 170);
+
+    // The command-line and status rows sit on plain black, not the pane's
+    // blue — matching the original, where only the two panels are blue.
+    pub const PROMPT_BG: Color = Color::Rgb(0, 0, 0);
+}
+
 fn draw_pane(
     frame: &mut Frame,
     area: Rect,
     pane: &Pane,
     is_active: bool,
     list_state: &mut ListState,
+    classic_style: bool,
 ) {
-    let border_style = if is_active {
+    let border_style = if classic_style {
+        let fg = if is_active {
+            classic::ACTIVE_BORDER_FG
+        } else {
+            classic::INACTIVE_BORDER_FG
+        };
+        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    } else if is_active {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -595,13 +766,16 @@ fn draw_pane(
         .iter()
         .map(|entry| {
             let style = if entry.is_dir {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                let fg = if classic_style { classic::DIR_FG } else { Color::Cyan };
+                Style::default().fg(fg).add_modifier(Modifier::BOLD)
             } else if entry.is_executable {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
+                // Classic mode treats executables exactly like directories
+                // (same white, bold) rather than a distinct green — the
+                // size/date columns already tell them apart.
+                let fg = if classic_style { classic::DIR_FG } else { Color::Green };
+                Style::default().fg(fg).add_modifier(Modifier::BOLD)
+            } else if classic_style {
+                Style::default().fg(classic::FILE_FG)
             } else {
                 // Not White: this renders straight onto the terminal's own
                 // background with no contrasting box behind it, so it must
@@ -612,7 +786,7 @@ fn draw_pane(
             };
             let date = format_modified(entry.modified);
             let size_label = if entry.is_dir {
-                String::new()
+                if classic_style { "<DIR>".to_string() } else { String::new() }
             } else {
                 format_size(entry.size)
             };
@@ -622,18 +796,28 @@ fn draw_pane(
         })
         .collect();
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
+    if classic_style {
+        block = block.style(Style::default().bg(classic::BG));
+    }
 
-    let highlight_style = if is_active {
+    // Only the active pane shows a highlight at all (see the note below on
+    // `list_state.select`), independent of which palette is in use.
+    let highlight_style = if !is_active {
+        Style::default()
+    } else if classic_style {
+        Style::default()
+            .bg(classic::HIGHLIGHT_BG)
+            .fg(classic::HIGHLIGHT_FG)
+            .add_modifier(Modifier::BOLD)
+    } else {
         Style::default()
             .bg(Color::Blue)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
     };
     let list = List::new(items).block(block).highlight_style(highlight_style);
 
@@ -650,7 +834,14 @@ fn draw_pane(
 /// place of the opposite pane's own listing (Ctrl+Q). `focused` is whether
 /// Tab has moved scroll focus onto this pane; `scroll` is how many lines of
 /// a text preview are skipped from the top.
-fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool, scroll: usize) {
+fn draw_preview_pane(
+    frame: &mut Frame,
+    area: Rect,
+    source: &Pane,
+    focused: bool,
+    scroll: usize,
+    classic_style: bool,
+) {
     let title = match source.selected_entry() {
         Some(entry) if entry.name != ".." => {
             source.cwd.join(&entry.name).to_string_lossy().to_string()
@@ -658,7 +849,14 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool
         _ => source.cwd.to_string_lossy().to_string(),
     };
 
-    let border_style = if focused {
+    let border_style = if classic_style {
+        let fg = if focused {
+            classic::ACTIVE_BORDER_FG
+        } else {
+            classic::INACTIVE_BORDER_FG
+        };
+        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    } else if focused {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -666,10 +864,14 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool
         Style::default().fg(Color::DarkGray)
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(format!("Preview: {title}"))
         .borders(Borders::ALL)
         .border_style(border_style);
+    if classic_style {
+        block = block
+            .style(Style::default().bg(classic::BG).fg(classic::FILE_FG));
+    }
 
     // For everything except Text, the scroll offset is applied by
     // skipping whole (never-wrapped) entries up front. Text is different:
@@ -685,9 +887,10 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool
             .skip(scroll)
             .map(|entry| {
                 let style = if entry.is_dir {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    let fg = if classic_style { classic::DIR_FG } else { Color::Cyan };
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD)
+                } else if classic_style {
+                    Style::default().fg(classic::FILE_FG)
                 } else {
                     Style::default().fg(Color::Reset)
                 };
@@ -715,29 +918,68 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, source: &Pane, focused: bool
     frame.render_widget(paragraph, area);
 }
 
-fn draw_status_message(frame: &mut Frame, area: Rect, message: &str) {
-    let paragraph = Paragraph::new(Line::from(Span::styled(
-        format!(" {}", message),
-        Style::default().fg(Color::Yellow),
-    )));
-    frame.render_widget(paragraph, area);
+/// Command > Show Logs: reads the tail of the log file fresh each draw
+/// (simple, and the file is small enough that this is cheap) and shows as
+/// many of the most recent lines as fit.
+fn draw_logs(frame: &mut Frame) {
+    let width = frame.area().width.saturating_sub(4).max(20);
+    let height = frame.area().height.saturating_sub(4).max(3);
+    let area = Rect {
+        x: (frame.area().width.saturating_sub(width)) / 2,
+        y: (frame.area().height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let visible_rows = height.saturating_sub(2) as usize; // minus the block's borders
+    let all_lines = std::fs::read_to_string(logging::log_path()).unwrap_or_default();
+    let mut lines: Vec<&str> = all_lines.lines().collect();
+    let total = lines.len();
+    if total > visible_rows {
+        lines = lines.split_off(total - visible_rows);
+    }
+    let shown: Vec<Line> = if lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "(no log entries yet)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        lines
+            .iter()
+            .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::White))))
+            .collect()
+    };
+
+    let block = Block::default()
+        .title(format!("Logs — last {} lines — press any key to close", shown.len()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(shown).block(block), area);
 }
 
 fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
-    // Indented by 1 column to match Norton Commander's look, rather than
-    // starting flush against the screen edge.
-    let area = Rect {
-        x: area.x + 1,
-        width: area.width.saturating_sub(1),
-        ..area
+    // Same reasoning as draw_command_line: the 1-column indent and the
+    // gaps between tiles are real painted spaces (styled with the row's
+    // background), not just skipped/unshrunk area — otherwise those
+    // columns show whatever was underneath instead of matching the row.
+    let gap_style = if app.classic_style {
+        Style::default().bg(classic::PROMPT_BG)
+    } else {
+        Style::default()
     };
+    // Same as draw_command_line: the leading indent looks off-balance once
+    // the row has its own solid background (classic mode), so skip it there.
+    let indent = if app.classic_style { 0u16 } else { 1u16 };
 
     // Spread the tiles evenly across the full width instead of packing them
     // to the left; on a narrow terminal the tail simply gets clipped, same
     // as before. A 1-column gap between tiles (not before F1) needs
     // reserving len-1 columns up front.
     let gaps = FN_KEYS.len() as u16 - 1;
-    let usable = area.width.saturating_sub(gaps);
+    let usable = area.width.saturating_sub(indent + gaps);
     let base_width = usable / FN_KEYS.len() as u16;
     let remainder = (usable % FN_KEYS.len() as u16) as usize;
 
@@ -754,11 +996,15 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     app.fn_key_tiles.clear();
-    let mut x = area.x;
-    let mut spans = Vec::new();
+    let mut x = area.x + indent;
+    let mut spans = if indent > 0 {
+        vec![Span::styled(" ", gap_style)]
+    } else {
+        Vec::new()
+    };
     for (idx, fn_key) in FN_KEYS.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::raw(" "));
+            spans.push(Span::styled(" ", gap_style));
             x += 1;
         }
         app.fn_key_tiles.push((
@@ -772,17 +1018,24 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
         ));
         x += tile_widths[idx];
 
+        let (num_fg, num_bg, label_fg, label_bg) = if app.classic_style {
+            (
+                classic::FN_KEY_NUM_FG,
+                classic::FN_KEY_NUM_BG,
+                classic::FN_KEY_LABEL_FG,
+                classic::FN_KEY_LABEL_BG,
+            )
+        } else {
+            (Color::Yellow, Color::Black, Color::Black, Color::Cyan)
+        };
         spans.push(Span::styled(
             fn_key.key,
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(Color::Black)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(num_fg).bg(num_bg).add_modifier(Modifier::BOLD),
         ));
         let label_width = tile_widths[idx].saturating_sub(fn_key.key.len() as u16) as usize;
         spans.push(Span::styled(
             format!("{:<label_width$}", fn_key.label),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(label_fg).bg(label_bg),
         ));
     }
     let bar = Paragraph::new(Line::from(spans));
@@ -838,6 +1091,10 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut app = App::new().unwrap();
+        // Deterministic regardless of whatever's actually saved on disk —
+        // App::new() loads real persisted settings, and classic_style
+        // changes what color the shadow darkens to.
+        app.classic_style = false;
         app.open_menu();
 
         let backend = TestBackend::new(80, 24);
@@ -871,7 +1128,9 @@ mod tests {
         let shadow_only_y = area.y + 1;
 
         let cell = &buf[(shadow_only_x, shadow_only_y)];
-        assert_eq!(cell.bg, Color::Rgb(90, 90, 90));
+        // Non-classic mode: the cell underneath is a named/Reset color, so
+        // the shadow falls back to a flat dark gray fill.
+        assert_eq!(cell.bg, Color::Rgb(30, 30, 30));
     }
 
     #[test]

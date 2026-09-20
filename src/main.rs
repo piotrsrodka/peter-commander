@@ -326,6 +326,7 @@ fn side_at(app: &App, column: u16, row: u16) -> Option<app::Side> {
 /// `handle_key` gates those same keyboard shortcuts.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     if app.help_open
+        || app.logs_open
         || app.dialog_is_text_input()
         || app.dialog_is_settings()
         || !matches!(app.dialog, Dialog::None)
@@ -441,6 +442,11 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             KeyCode::Right => app.help_page = 1,
             _ => app.help_open = false,
         }
+        return Ok(());
+    }
+
+    if app.logs_open {
+        app.logs_open = false;
         return Ok(());
     }
 

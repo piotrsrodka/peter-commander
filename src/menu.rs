@@ -12,6 +12,7 @@ pub enum Action {
     Help,
     Settings,
     ShowTerminal,
+    ShowLogs,
     Quit,
 }
 
@@ -30,6 +31,7 @@ impl Action {
             Action::Help => "Help",
             Action::Settings => "Settings",
             Action::ShowTerminal => "Show Terminal",
+            Action::ShowLogs => "Show Logs",
             Action::Quit => "Quit",
         }
     }
@@ -77,7 +79,7 @@ pub const MENU_BAR: &[MenuCategory] = &[
     },
     MenuCategory {
         title: "Command",
-        items: &[Action::ShowTerminal, Action::Quit],
+        items: &[Action::ShowTerminal, Action::ShowLogs, Action::Quit],
     },
 ];
 

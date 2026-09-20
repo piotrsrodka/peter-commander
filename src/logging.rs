@@ -13,6 +13,18 @@ pub fn log_error(message: &str) {
     log_to(Path::new(LOG_PATH), message);
 }
 
+/// Same as `log_error`, for routine status confirmations (e.g. "Deleted
+/// x.txt") rather than actual failures — kept in the same file/format so
+/// "Show Logs" (Command menu) shows one merged, chronological view.
+pub fn log_info(message: &str) {
+    log_to(Path::new(LOG_PATH), message);
+}
+
+/// The path `log_error`/`log_info` write to, for "Show Logs" to read back.
+pub fn log_path() -> &'static Path {
+    Path::new(LOG_PATH)
+}
+
 fn log_to(path: &Path, message: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(

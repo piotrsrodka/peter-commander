@@ -88,6 +88,7 @@ pub enum SettingItem {
     HideHiddenFiles,
     InternalPreview,
     MouseCapture,
+    ClassicStyle,
 }
 
 impl SettingItem {
@@ -96,6 +97,7 @@ impl SettingItem {
         SettingItem::HideHiddenFiles,
         SettingItem::InternalPreview,
         SettingItem::MouseCapture,
+        SettingItem::ClassicStyle,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -104,6 +106,7 @@ impl SettingItem {
             SettingItem::HideHiddenFiles => "Hide hidden files/folders",
             SettingItem::InternalPreview => "F3 View uses the internal quick preview",
             SettingItem::MouseCapture => "Capture mouse (scroll/click); off leaves it to the terminal",
+            SettingItem::ClassicStyle => "Classic retro Norton Commander colors",
         }
     }
 
@@ -115,6 +118,7 @@ impl SettingItem {
             SettingItem::HideHiddenFiles => "hide_hidden_files",
             SettingItem::InternalPreview => "internal_preview",
             SettingItem::MouseCapture => "mouse_capture",
+            SettingItem::ClassicStyle => "classic_style",
         }
     }
 }
@@ -144,6 +148,9 @@ pub struct App {
     /// Which of the two help screen pages is shown (0 or 1) — Left/Right
     /// switch between them while help is open.
     pub help_page: usize,
+    /// Command > Show Logs: a full-screen view of the recent contents of
+    /// the error/status log file, closed by any key like help.
+    pub logs_open: bool,
     pub command_line: String,
     /// Whether running a command from the command line pauses with
     /// "Press Enter to continue" afterward, or returns straight to the
@@ -174,6 +181,10 @@ pub struct App {
     /// "both at once". `main` reads this each loop iteration and issues
     /// the actual Enable/DisableMouseCapture sequence when it changes.
     pub mouse_capture: bool,
+    /// Whether panes render with the fixed classic-DOS Norton Commander
+    /// palette (blue background, cyan/white text) instead of following
+    /// the terminal's own theme.
+    pub classic_style: bool,
     /// Height (in text rows) of the preview pane in the last drawn frame,
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
@@ -240,6 +251,10 @@ impl App {
             .get(SettingItem::MouseCapture.key())
             .copied()
             .unwrap_or(true);
+        let classic_style = saved_settings
+            .get(SettingItem::ClassicStyle.key())
+            .copied()
+            .unwrap_or(false);
         Ok(App {
             left: Pane::new(left_dir, hide_hidden_files)?,
             right: Pane::new(right_dir, hide_hidden_files)?,
@@ -253,6 +268,7 @@ impl App {
             external_request: None,
             help_open: false,
             help_page: 0,
+            logs_open: false,
             command_line: String::new(),
             wait_after_shell_command,
             quick_view: false,
@@ -261,6 +277,7 @@ impl App {
             last_preview_target: None,
             internal_preview,
             mouse_capture,
+            classic_style,
             preview_visible_lines: 0,
             preview_visible_width: 0,
             pane_visible_lines: 0,
@@ -280,10 +297,18 @@ impl App {
         state::save(&self.left.cwd, &self.right.cwd);
     }
 
-    /// Sets the status message and appends it to the error log. Use this for
-    /// unexpected failures (I/O errors), not routine user-facing guidance.
+    /// Records an unexpected failure (I/O errors etc.) to the log — for
+    /// routine confirmations ("Deleted x.txt"), use `set_status` instead.
     pub fn set_error(&mut self, message: String) {
         logging::log_error(&message);
+        self.status_message = message;
+    }
+
+    /// Records a routine status confirmation (e.g. "Deleted x.txt") to the
+    /// log — there's no dedicated on-screen status line any more; Command >
+    /// Show Logs is where these are actually read.
+    fn set_status(&mut self, message: String) {
+        logging::log_info(&message);
         self.status_message = message;
     }
 
@@ -345,7 +370,9 @@ impl App {
         let selection_is_file = entry.is_some_and(|e| e.name != ".." && !e.is_dir);
 
         match action {
-            Action::Open => entry.is_some_and(|e| e.is_dir),
+            // Also enabled for executables: Open runs `open_selected`,
+            // which already runs them directly (same as pressing Enter).
+            Action::Open => entry.is_some_and(|e| e.is_dir || e.is_executable),
             Action::Rename | Action::Copy | Action::Move | Action::Delete => has_real_selection,
             // View also works on directories (and "..") — quick-view shows
             // a name-only listing for those.
@@ -356,6 +383,7 @@ impl App {
             | Action::Help
             | Action::Settings
             | Action::ShowTerminal
+            | Action::ShowLogs
             | Action::Quit => true,
         }
     }
@@ -556,6 +584,7 @@ impl App {
                 self.help_page = 0;
             }
             Action::ShowTerminal => self.request_reveal_terminal(),
+            Action::ShowLogs => self.logs_open = true,
             Action::Quit => self.dialog = Dialog::ConfirmQuit,
             Action::Settings => {
                 let original = SettingItem::ALL
@@ -583,6 +612,7 @@ impl App {
             SettingItem::HideHiddenFiles => self.left.hide_hidden,
             SettingItem::InternalPreview => self.internal_preview,
             SettingItem::MouseCapture => self.mouse_capture,
+            SettingItem::ClassicStyle => self.classic_style,
         }
     }
 
@@ -590,6 +620,7 @@ impl App {
         match item {
             SettingItem::WaitAfterShellCommand => self.wait_after_shell_command = value,
             SettingItem::MouseCapture => self.mouse_capture = value,
+            SettingItem::ClassicStyle => self.classic_style = value,
             SettingItem::HideHiddenFiles => {
                 self.left.hide_hidden = value;
                 self.right.hide_hidden = value;
@@ -802,7 +833,7 @@ impl App {
             return;
         };
         if entry.is_dir {
-            self.status_message = format!("Cannot {verb} a directory");
+            self.set_status(format!("Cannot {verb} a directory"));
             return;
         }
         if let Some(path) = pane.selected_path() {
@@ -832,15 +863,18 @@ impl App {
 
                 match kind {
                     DialogKind::Delete => match fs_ops::delete_recursive(&src) {
-                        Ok(()) => self.status_message = format!("Deleted {name}"),
+                        Ok(()) => self.set_status(format!("Deleted {name}")),
                         Err(err) => self.set_error(format!("Delete failed: {err}")),
                     },
                     DialogKind::Copy => {
                         let dest = self.inactive_pane().cwd.join(&name);
                         match fs_ops::copy_recursive(&src, &dest) {
                             Ok(()) => {
-                                self.status_message =
-                                    format!("Copied {} to {}", src.display(), dest.display());
+                                self.set_status(format!(
+                                    "Copied {} to {}",
+                                    src.display(),
+                                    dest.display()
+                                ));
                             }
                             Err(err) => self.set_error(format!("Copy failed: {err}")),
                         }
@@ -849,8 +883,11 @@ impl App {
                         let dest = self.inactive_pane().cwd.join(&name);
                         match fs_ops::move_path(&src, &dest) {
                             Ok(()) => {
-                                self.status_message =
-                                    format!("Moved {} to {}", src.display(), dest.display());
+                                self.set_status(format!(
+                                    "Moved {} to {}",
+                                    src.display(),
+                                    dest.display()
+                                ));
                             }
                             Err(err) => self.set_error(format!("Move failed: {err}")),
                         }
@@ -865,7 +902,7 @@ impl App {
                 let new_name = input.clone();
                 let src = src.clone();
                 if new_name.trim().is_empty() {
-                    self.status_message = "Name cannot be empty".to_string();
+                    self.set_status("Name cannot be empty".to_string());
                     self.dialog = Dialog::None;
                     return Ok(());
                 }
@@ -873,7 +910,7 @@ impl App {
                     Some(parent) => {
                         let dest = parent.join(&new_name);
                         match fs_ops::move_path(&src, &dest) {
-                            Ok(()) => self.status_message = format!("Renamed to {new_name}"),
+                            Ok(()) => self.set_status(format!("Renamed to {new_name}")),
                             Err(err) => self.set_error(format!("Rename failed: {err}")),
                         }
                     }
@@ -888,7 +925,7 @@ impl App {
                 let kind = *kind;
                 let name = input.clone();
                 if name.trim().is_empty() {
-                    self.status_message = "Name cannot be empty".to_string();
+                    self.set_status("Name cannot be empty".to_string());
                     self.dialog = Dialog::None;
                     return Ok(());
                 }
@@ -896,11 +933,11 @@ impl App {
 
                 match kind {
                     TextInputKind::MkDir => match std::fs::create_dir(&target) {
-                        Ok(()) => self.status_message = format!("Created directory {name}"),
+                        Ok(()) => self.set_status(format!("Created directory {name}")),
                         Err(err) => self.set_error(format!("MkDir failed: {err}")),
                     },
                     TextInputKind::NewFile => match std::fs::File::create(&target) {
-                        Ok(_) => self.status_message = format!("Created file {name}"),
+                        Ok(_) => self.set_status(format!("Created file {name}")),
                         Err(err) => self.set_error(format!("New file failed: {err}")),
                     },
                 }
