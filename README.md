@@ -4,7 +4,7 @@
 
 A dual-pane, keyboard-driven terminal file manager in the tradition of
 Norton Commander. Built for Omarchy in Rust with Ratatui https://ratatui.rs.
-Should work in any Linux or Mac
+Should work on any Linux, macOS, or Windows.
 
 ![Peter Commander](https://github.com/user-attachments/assets/02c00005-04ce-4dc2-b1d8-f02159687e04)
 
@@ -22,6 +22,12 @@ Should work in any Linux or Mac
 - Configurable settings: hidden files, F3 preview mode
 
 ## Installing
+
+Already have Rust? This works on Linux, macOS, and Windows:
+
+```sh
+cargo install peter-commander
+```
 
 ### Arch Linux / Omarchy
 
@@ -69,6 +75,12 @@ cd peter-commander
 ```
 
 No sudo needed. Installs to `~/.local/bin` and sets up a `pc` alias.
+
+### Windows
+
+Download `peter-commander.exe` from the
+[latest release](https://github.com/piotrsrodka/peter-commander/releases/latest)
+and run it — no installer needed.
 
 ---
 

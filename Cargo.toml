@@ -5,6 +5,9 @@ edition = "2024"
 description = "A terminal file manager"
 license = "MIT"
 repository = "https://github.com/piotrsrodka/peter-commander"
+readme = "README.md"
+keywords = ["file-manager", "tui", "terminal", "norton-commander"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 anyhow = "1.0.104"
