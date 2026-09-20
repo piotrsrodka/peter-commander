@@ -6,7 +6,7 @@ A dual-pane, keyboard-driven terminal file manager in the tradition of
 Norton Commander. Built for Omarchy in Rust with Ratatui https://ratatui.rs.
 Should work on any Linux, macOS, or Windows.
 
-![Peter Commander](https://github.com/user-attachments/assets/02c00005-04ce-4dc2-b1d8-f02159687e04)
+![Peter Commander](docs/screenshot-2026-09-17_12-55-42.png)
 
 ## Features
 
