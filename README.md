@@ -2,8 +2,9 @@
 
 [![Rust](https://github.com/piotrsrodka/peter-commander/actions/workflows/rust.yml/badge.svg)](https://github.com/piotrsrodka/peter-commander/actions/workflows/rust.yml)
 
-A dual-pane, keyboard-driven terminal file manager, in the tradition of
-Norton Commander — built in Rust with ratatui (https://ratatui.rs).
+A dual-pane, keyboard-driven terminal file manager in the tradition of
+Norton Commander. Built for Omarchy in Rust with Ratatui https://ratatui.rs.
+Should work in any Linux or Mac
 
 ![Peter Commander](https://github.com/user-attachments/assets/02c00005-04ce-4dc2-b1d8-f02159687e04)
 
@@ -11,6 +12,7 @@ Norton Commander — built in Rust with ratatui (https://ratatui.rs).
 
 - Dual-pane file browsing
 - File operations: rename, copy, move, mkdir, new file, delete
+- Respects theme selection in Omarchy
 - Quick preview (F3) for text, directories, and binaries
 - Edit (F4) with your `$EDITOR`
 - Runs executable scripts and binaries directly
