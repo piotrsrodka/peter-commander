@@ -8,6 +8,11 @@ Should work on any Linux, macOS, or Windows.
 
 ![Peter Commander](docs/ethereal.png)
 
+Also comes with an optional classic retro Norton Commander color scheme
+(Options > Settings):
+
+![Peter Commander in classic Norton Commander colors](docs/classic.png)
+
 ## Features
 
 - Dual-pane file browsing
