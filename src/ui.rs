@@ -1,9 +1,10 @@
 use chrono::{DateTime, Local};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget};
 
 use crate::app::{App, Dialog, SettingItem, Side};
 use crate::menu::{FN_KEYS, MENU_BAR};
@@ -228,6 +229,7 @@ fn draw_confirm_dialog(frame: &mut Frame, message: &str) {
     )))
     .block(block);
 
+    draw_shadow_for(frame, area);
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
@@ -309,6 +311,46 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(bar, area);
 }
 
+/// A drop-shadow overlay. Two failed attempts taught what doesn't work
+/// here: `Modifier::DIM` only dims a cell's foreground per the ANSI spec,
+/// not its background, and most of the shadow falls on blank/background
+/// cells; and named colors like `Color::DarkGray` are whatever the
+/// terminal's color scheme remaps them to (some dark themes map it close
+/// to black, same trap as the old hardcoded `Color::White` text bug). A
+/// fixed `Color::Rgb` sidesteps theme remapping entirely — this exact gray
+/// renders the same regardless of the terminal's palette.
+struct Shadow;
+
+impl Widget for Shadow {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(Color::Rgb(90, 90, 90));
+                    cell.modifier.insert(Modifier::DIM);
+                }
+            }
+        }
+    }
+}
+
+/// Draws a `Shadow` offset from `area` — call this before clearing/drawing
+/// into `area` itself, so only the shadow's bottom/right sliver ends up
+/// visible once the real content is drawn on top of it. The right side is
+/// offset by 2 columns rather than 1 (matching classic Norton Commander):
+/// terminal cells are roughly twice as tall as they are wide, so a 1-row
+/// bottom shadow needs 2 columns on the right to look proportional instead
+/// of lopsided.
+fn draw_shadow_for(frame: &mut Frame, area: Rect) {
+    let shadow_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width + 1,
+        height: area.height,
+    };
+    frame.render_widget(Shadow, shadow_area);
+}
+
 fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
     // Compute the x offset of the selected category so the dropdown appears under it.
     let mut x = menu_bar_area.x + 1;
@@ -370,6 +412,8 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().bg(Color::Gray).fg(Color::Black));
+
+    draw_shadow_for(frame, area);
 
     frame.render_widget(Clear, area);
     frame.render_widget(List::new(items).block(block), area);
@@ -600,6 +644,49 @@ mod tests {
         assert_eq!(result.chars().count(), 10);
         assert!(result.ends_with('\u{2026}'));
         assert!(result.starts_with("this_is_a"));
+    }
+
+    #[test]
+    fn menu_dropdown_shadow_survives_to_final_buffer() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new().unwrap();
+        app.open_menu();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+
+        // Recompute the same area/shadow_area the real code computes, to
+        // find a cell that should be shadow-only (outside the dropdown's
+        // own area, inside shadow_area).
+        let category = &MENU_BAR[0];
+        let row_text_width = category
+            .items
+            .iter()
+            .map(|action| {
+                let shortcut_width = action.shortcut().map_or(0, |s| s.len() + 3);
+                action.label().len() + shortcut_width
+            })
+            .max()
+            .unwrap_or(4);
+        let width = (row_text_width as u16) + 4;
+        let height = category.items.len() as u16 + 2;
+        let area = Rect {
+            x: 1,
+            y: 1,
+            width,
+            height,
+        };
+        let shadow_only_x = area.x + area.width; // one past the dropdown's right edge
+        let shadow_only_y = area.y + 1;
+
+        let cell = &buf[(shadow_only_x, shadow_only_y)];
+        assert_eq!(cell.bg, Color::Rgb(90, 90, 90));
     }
 
     #[test]
