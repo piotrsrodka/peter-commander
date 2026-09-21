@@ -136,9 +136,12 @@ fn set_mouse_capture(enabled: bool) -> Result<()> {
             .execute(EnableMouseCapture)
             .context("EnableMouseCapture")?;
     } else {
-        io::stdout()
-            .execute(DisableMouseCapture)
-            .context("DisableMouseCapture")?;
+        // Best-effort, like restore_terminal()'s disable: on Windows,
+        // crossterm errors ("Initial console modes not set") disabling
+        // mouse capture that was never enabled in this session (e.g.
+        // "Capture mouse" was already off at startup) — there's nothing to
+        // actually undo in that case, and it shouldn't be fatal.
+        let _ = io::stdout().execute(DisableMouseCapture);
     }
     Ok(())
 }
@@ -291,9 +294,10 @@ fn run_shell_command(
 fn reveal_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> Result<()> {
     // Mouse capture would otherwise intercept the wheel instead of letting
     // the terminal scroll its own native scrollback, defeating the point.
-    io::stdout()
-        .execute(DisableMouseCapture)
-        .context("DisableMouseCapture")?;
+    // Best-effort, like set_mouse_capture()'s disable branch: on Windows,
+    // crossterm errors disabling mouse capture that was never enabled in
+    // this session, which isn't fatal — it's already off either way.
+    let _ = io::stdout().execute(DisableMouseCapture);
     io::stdout()
         .execute(LeaveAlternateScreen)
         .context("LeaveAlternateScreen")?;
