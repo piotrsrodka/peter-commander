@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -32,7 +32,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(root[1]);
 
-    app.pane_visible_lines = panes[0].height.saturating_sub(2) as usize;
+    // -2 for the pane's own top/bottom border, and 2 more for the divider +
+    // status footer row when that's on (see `draw_pane`), so PgUp/PgDn page
+    // by exactly what's actually visible in the file listing.
+    let footer_rows = if app.pane_totals { 2 } else { 0 };
+    app.pane_visible_lines = panes[0].height.saturating_sub(2 + footer_rows) as usize;
     app.left_pane_area = panes[0];
     app.right_pane_area = panes[1];
 
@@ -48,6 +52,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     !app.preview_focus,
                     &mut app.left_list_state,
                     app.classic_style,
+                    app.pane_totals,
                 );
                 draw_preview_pane(
                     frame,
@@ -76,6 +81,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     !app.preview_focus,
                     &mut app.right_list_state,
                     app.classic_style,
+                    app.pane_totals,
                 );
             }
         }
@@ -87,6 +93,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.active == Side::Left,
             &mut app.left_list_state,
             app.classic_style,
+            app.pane_totals,
         );
         draw_pane(
             frame,
@@ -95,6 +102,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.active == Side::Right,
             &mut app.right_list_state,
             app.classic_style,
+            app.pane_totals,
         );
     }
 
@@ -106,14 +114,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     match &app.dialog {
-        Dialog::Confirm { kind, name, .. } => {
+        Dialog::Confirm { kind, items } => {
             let destination = matches!(kind, DialogKind::Copy | DialogKind::Move)
                 .then(|| app.inactive_pane_ref().cwd.display().to_string());
+            let summary = match items.as_slice() {
+                [(name, _)] => format!("\"{name}\""),
+                _ => format!("{} items", items.len()),
+            };
             draw_confirm_dialog(
                 frame,
                 app.classic_style,
                 *kind,
-                name,
+                &summary,
                 destination.as_deref(),
                 app.dialog_cancel_focused,
             );
@@ -246,10 +258,10 @@ const HELP_PAGE_1: &[&str] = &[
     "F3        View          Page selected file with $PAGER",
     "F4        Edit          Edit selected file with $EDITOR",
     "Shift+F4  New File      Create a new empty file",
-    "F5        Copy          Copy selection to the other pane",
-    "F6        Move          Move selection to the other pane",
+    "F5        Copy          Copy selection (or marked files) to the other pane",
+    "F6        Move          Move selection (or marked files) to the other pane",
     "F7        MkDir         Create a new directory",
-    "F8        Delete        Delete selection (asks to confirm)",
+    "F8        Delete        Delete selection or marked files (asks to confirm)",
     "F9        Menu          Open the pulldown menu",
     "F10       Quit          Quit PeterCommander (asks to confirm)",
     "",
@@ -263,6 +275,7 @@ const HELP_PAGE_1: &[&str] = &[
     "Up/Down   Move the selection",
     "Home/End  Jump to the top/bottom of the listing",
     "PgUp/PgDn Move the selection by one screenful",
+    "Insert    Mark/unmark the entry and move down",
 ];
 
 const HELP_PAGE_2: &[&str] = &[
@@ -565,7 +578,7 @@ fn draw_confirm_dialog(
     frame: &mut Frame,
     classic_style: bool,
     kind: DialogKind,
-    name: &str,
+    summary: &str,
     destination: Option<&str>,
     cancel_focused: bool,
 ) {
@@ -573,8 +586,8 @@ fn draw_confirm_dialog(
     let verb = kind.verb();
 
     let message = match destination {
-        Some(_) => format!("{verb} \"{name}\" to"),
-        None => format!("{verb} \"{name}\"?"),
+        Some(_) => format!("{verb} {summary} to"),
+        None => format!("{verb} {summary}?"),
     };
     let mut sections = vec![vec![DialogLine::Text(Line::from(Span::styled(
         message,
@@ -1128,6 +1141,11 @@ mod classic {
     pub const DIALOG_BORDER_FG: Color = Color::Rgb(0, 0, 0);
 }
 
+/// Insert-tagged entries render in this color in both themes, so marking
+/// stays visible regardless of the active palette — including on the
+/// cursor row itself, where it overrides the highlight's own fg.
+const MARKED_FG: Color = Color::Rgb(0xFF, 0xFF, 0x50);
+
 fn draw_pane(
     frame: &mut Frame,
     area: Rect,
@@ -1135,6 +1153,7 @@ fn draw_pane(
     is_active: bool,
     list_state: &mut ListState,
     classic_style: bool,
+    show_totals: bool,
 ) {
     let border_style = if classic_style {
         let fg = if is_active {
@@ -1151,10 +1170,11 @@ fn draw_pane(
         Style::default().fg(Color::DarkGray)
     };
 
-    let title = match pane.selected_entry() {
-        Some(entry) => pane.cwd.join(&entry.name).to_string_lossy().to_string(),
-        None => pane.cwd.to_string_lossy().to_string(),
-    };
+    // The title is just the pane's own directory — it used to fold in the
+    // selected entry's name too, which meant it changed on every Up/Down
+    // press. That per-selection detail now lives in the status footer
+    // below instead, where it belongs with the rest of the file info.
+    let title = pane.cwd.to_string_lossy().to_string();
 
     // -2 for the pane's own left/right border.
     let name_width = name_column_width(area.width.saturating_sub(2));
@@ -1162,26 +1182,56 @@ fn draw_pane(
     let items: Vec<ListItem> = pane
         .entries
         .iter()
-        .map(|entry| {
-            let style = if entry.is_dir {
-                let fg = if classic_style { classic::DIR_FG } else { Color::Cyan };
-                Style::default().fg(fg).add_modifier(Modifier::BOLD)
+        .enumerate()
+        .map(|(idx, entry)| {
+            let is_marked = pane.marked.contains(&entry.name);
+            let fg = if is_marked {
+                MARKED_FG
+            } else if entry.is_dir {
+                if classic_style { classic::DIR_FG } else { Color::Cyan }
             } else if entry.is_executable {
                 // Classic mode treats executables exactly like directories
                 // (same white, bold) rather than a distinct green — the
                 // size/date columns already tell them apart.
-                let fg = if classic_style { classic::DIR_FG } else { Color::Green };
-                Style::default().fg(fg).add_modifier(Modifier::BOLD)
+                if classic_style { classic::DIR_FG } else { Color::Green }
             } else if classic_style {
-                Style::default().fg(classic::FILE_FG)
+                classic::FILE_FG
             } else {
                 // Not White: this renders straight onto the terminal's own
                 // background with no contrasting box behind it, so it must
                 // follow the terminal's default foreground instead of
                 // assuming a dark theme (a hardcoded white was invisible on
                 // light-background terminals).
-                Style::default().fg(Color::Reset)
+                Color::Reset
             };
+            let bold = is_marked || entry.is_dir || entry.is_executable;
+
+            // The cursor row's highlight is baked in per-item (instead of
+            // going through `List::highlight_style`, which would apply one
+            // fixed fg to every row) so a marked entry keeps its yellow text
+            // instead of being swallowed by the highlight's own fg when
+            // it's also under the cursor.
+            let style = if is_active && idx == pane.selected {
+                let bg = if classic_style { classic::HIGHLIGHT_BG } else { Color::Blue };
+                let cursor_fg = if is_marked {
+                    fg
+                } else if classic_style {
+                    classic::HIGHLIGHT_FG
+                } else {
+                    Color::White
+                };
+                Style::default()
+                    .bg(bg)
+                    .fg(cursor_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                let mut style = Style::default().fg(fg);
+                if bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                style
+            };
+
             let date = format_modified(entry.modified);
             let size_label = if entry.is_dir {
                 if classic_style { "<DIR>".to_string() } else { String::new() }
@@ -1202,30 +1252,117 @@ fn draw_pane(
         block = block.style(Style::default().bg(classic::BG));
     }
 
-    // Only the active pane shows a highlight at all (see the note below on
-    // `list_state.select`), independent of which palette is in use.
-    let highlight_style = if !is_active {
-        Style::default()
-    } else if classic_style {
-        Style::default()
-            .bg(classic::HIGHLIGHT_BG)
-            .fg(classic::HIGHLIGHT_FG)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
+    let status_text = show_totals.then(|| match pane.marked_summary() {
+        Some((count, bytes)) => format!(
+            "{} bytes in {count} selected file{}",
+            with_thousands_separators(bytes),
+            if count == 1 { "" } else { "s" }
+        ),
+        // Nothing marked: show the cursor's entry — name, size, date —
+        // instead, now that the title above no longer does. Falls back to
+        // plain totals for "..", which has none of those to show.
+        // Lined up under the listing's own Name/Size/Date columns (same
+        // widths as each row above), instead of just running the three
+        // together against the left edge.
+        None => match pane.selected_entry() {
+            Some(entry) if entry.name != ".." => {
+                let size = if entry.is_dir {
+                    if classic_style { "<DIR>".to_string() } else { String::new() }
+                } else {
+                    format_size(entry.size)
+                };
+                let date = format_modified(entry.modified);
+                let name = fit_name(&entry.name, name_width);
+                format!("{name} {size:>SIZE_COLUMN_WIDTH$} {date}")
+            }
+            _ => {
+                let (files, dirs) = pane.totals();
+                format!("{files} files, {dirs} dirs")
+            }
+        },
+    });
+
+    // A real last row (plus a divider above it) inside the border, instead
+    // of the old `title_bottom` approach that wrote the status straight
+    // onto the border line itself — that crowded the last listed entry
+    // right up against it, unlike the top, where the ".." entry already
+    // gives the path title some breathing room below it.
+    let inner = block.inner(area);
+    let footer_rows = if inner.height >= 2 { 2 } else { 0 };
+    let (list_area, show_footer) = match &status_text {
+        Some(_) if footer_rows > 0 => (
+            Rect {
+                height: inner.height - footer_rows,
+                ..inner
+            },
+            true,
+        ),
+        _ => (inner, false),
     };
-    let list = List::new(items).block(block).highlight_style(highlight_style);
+
+    frame.render_widget(block, area);
+
+    // The cursor row's highlight is already baked into its `ListItem`
+    // style above (so a marked entry can keep its own fg there), so `List`
+    // itself doesn't need a `highlight_style` patched on top.
+    let list = List::new(items);
 
     // Always keep the selection tracked (not just while active) so the
     // persisted `list_state`'s scroll offset stays correct for this pane
-    // even while the other pane has focus; `highlight_style` above is what
-    // actually hides the highlight when inactive.
+    // even while the other pane has focus; the `is_active` check above is
+    // what actually hides the highlight when inactive.
     list_state.select(Some(pane.selected));
 
-    frame.render_stateful_widget(list, area, list_state);
+    frame.render_stateful_widget(list, list_area, list_state);
+
+    if show_footer {
+        let divider_y = list_area.y + list_area.height;
+        let status_y = divider_y + 1;
+        frame.render_widget(
+            Paragraph::new("─".repeat(inner.width as usize)).style(border_style),
+            Rect {
+                x: inner.x,
+                y: divider_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        let is_marked_summary = pane.marked_summary().is_some();
+        let status_style = if is_marked_summary {
+            Style::default().fg(MARKED_FG).add_modifier(Modifier::BOLD)
+        } else {
+            border_style
+        };
+        // Centered for the marked-files summary (a standalone sentence);
+        // the per-entry line stays left-aligned so it lines up with the
+        // listing's own Name/Size/Date columns above it.
+        let status_paragraph = Paragraph::new(status_text.unwrap_or_default())
+            .style(status_style)
+            .alignment(if is_marked_summary {
+                Alignment::Center
+            } else {
+                Alignment::Left
+            });
+        frame.render_widget(
+            status_paragraph,
+            Rect {
+                x: inner.x,
+                y: status_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+
+        // Tee the divider into the pane's own left/right border, matching
+        // the dialogs' section separators.
+        let buf = frame.buffer_mut();
+        if let Some(cell) = buf.cell_mut((area.x, divider_y)) {
+            cell.set_symbol("├").set_style(border_style);
+        }
+        if let Some(cell) = buf.cell_mut((area.x + area.width.saturating_sub(1), divider_y)) {
+            cell.set_symbol("┤").set_style(border_style);
+        }
+    }
 }
 
 /// Quick-view: renders a live preview of `source`'s selected entry, in

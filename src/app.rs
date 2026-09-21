@@ -69,8 +69,10 @@ pub enum Dialog {
     None,
     Confirm {
         kind: DialogKind,
-        name: String,
-        src: PathBuf,
+        /// `(display name, full source path)` for every item this confirms
+        /// acting on — one entry for the common single-selection case, or
+        /// every marked item when the active pane has tags.
+        items: Vec<(String, PathBuf)>,
     },
     TextInput {
         kind: TextInputKind,
@@ -97,6 +99,7 @@ pub enum SettingItem {
     MouseCapture,
     ClassicStyle,
     StartLeftInCwd,
+    PaneTotals,
 }
 
 impl SettingItem {
@@ -107,6 +110,7 @@ impl SettingItem {
         SettingItem::MouseCapture,
         SettingItem::ClassicStyle,
         SettingItem::StartLeftInCwd,
+        SettingItem::PaneTotals,
     ];
 
     /// Label shown on the "off" side of the two-way switch (i.e. when
@@ -119,6 +123,7 @@ impl SettingItem {
             SettingItem::MouseCapture => "Terminal mouse",
             SettingItem::ClassicStyle => "Terminal theme colors",
             SettingItem::StartLeftInCwd => "Restore last session",
+            SettingItem::PaneTotals => "Plain panes",
         }
     }
 
@@ -132,6 +137,7 @@ impl SettingItem {
             SettingItem::MouseCapture => "App mouse clicks",
             SettingItem::ClassicStyle => "Classic NC colors",
             SettingItem::StartLeftInCwd => "Start in launch dir",
+            SettingItem::PaneTotals => "Show file/byte counts",
         }
     }
 
@@ -145,6 +151,7 @@ impl SettingItem {
             SettingItem::MouseCapture => "mouse_capture",
             SettingItem::ClassicStyle => "classic_style",
             SettingItem::StartLeftInCwd => "start_left_in_cwd",
+            SettingItem::PaneTotals => "pane_totals",
         }
     }
 }
@@ -228,6 +235,10 @@ pub struct App {
     /// (the right pane always restores its last session directory either
     /// way). Only takes effect on the next launch, not live.
     pub start_left_in_cwd: bool,
+    /// Whether each pane's bottom border shows a totals line — file/dir
+    /// counts normally, or a byte-count summary of the marked files while
+    /// any are tagged.
+    pub pane_totals: bool,
     /// Height (in text rows) of the preview pane in the last drawn frame,
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
@@ -276,6 +287,10 @@ impl App {
         let saved_settings = state::load_settings();
         let start_left_in_cwd = saved_settings
             .get(SettingItem::StartLeftInCwd.key())
+            .copied()
+            .unwrap_or(true);
+        let pane_totals = saved_settings
+            .get(SettingItem::PaneTotals.key())
             .copied()
             .unwrap_or(true);
         let (left_dir, right_dir) = match state::load() {
@@ -329,6 +344,7 @@ impl App {
             mouse_capture,
             classic_style,
             start_left_in_cwd,
+            pane_totals,
             preview_visible_lines: 0,
             preview_visible_width: 0,
             pane_visible_lines: 0,
@@ -676,6 +692,7 @@ impl App {
             SettingItem::MouseCapture => self.mouse_capture,
             SettingItem::ClassicStyle => self.classic_style,
             SettingItem::StartLeftInCwd => self.start_left_in_cwd,
+            SettingItem::PaneTotals => self.pane_totals,
         }
     }
 
@@ -685,6 +702,7 @@ impl App {
             SettingItem::MouseCapture => self.mouse_capture = value,
             SettingItem::ClassicStyle => self.classic_style = value,
             SettingItem::StartLeftInCwd => self.start_left_in_cwd = value,
+            SettingItem::PaneTotals => self.pane_totals = value,
             SettingItem::HideHiddenFiles => {
                 self.left.hide_hidden = value;
                 self.right.hide_hidden = value;
@@ -872,17 +890,19 @@ impl App {
 
     fn request_transfer(&mut self, kind: DialogKind) {
         let pane = self.active_pane();
-        let Some(src) = pane.selected_path() else {
-            return;
+        let items = pane.marked_items();
+        let items = if items.is_empty() {
+            let Some(src) = pane.selected_path() else {
+                return;
+            };
+            let Some(entry) = pane.selected_entry() else {
+                return;
+            };
+            vec![(entry.name.clone(), src)]
+        } else {
+            items
         };
-        let Some(entry) = pane.selected_entry() else {
-            return;
-        };
-        self.dialog = Dialog::Confirm {
-            kind,
-            name: entry.name.clone(),
-            src,
-        };
+        self.dialog = Dialog::Confirm { kind, items };
         self.dialog_cancel_focused = !kind.default_yes();
     }
 
@@ -924,58 +944,83 @@ impl App {
 
     fn request_delete(&mut self) {
         let pane = self.active_pane();
-        if let Some(path) = pane.selected_path()
-            && let Some(entry) = pane.selected_entry()
-        {
-            self.dialog = Dialog::Confirm {
-                kind: DialogKind::Delete,
-                name: entry.name.clone(),
-                src: path,
+        let items = pane.marked_items();
+        let items = if items.is_empty() {
+            let Some(path) = pane.selected_path() else {
+                return;
             };
-            self.dialog_cancel_focused = !DialogKind::Delete.default_yes();
-        }
+            let Some(entry) = pane.selected_entry() else {
+                return;
+            };
+            vec![(entry.name.clone(), path)]
+        } else {
+            items
+        };
+        self.dialog = Dialog::Confirm {
+            kind: DialogKind::Delete,
+            items,
+        };
+        self.dialog_cancel_focused = !DialogKind::Delete.default_yes();
     }
 
     pub fn confirm_dialog(&mut self) -> Result<()> {
         match &self.dialog {
-            Dialog::Confirm { kind, name, src } => {
+            Dialog::Confirm { kind, items } => {
                 let kind = *kind;
-                let name = name.clone();
-                let src = src.clone();
+                let items = items.clone();
+                let src_dir = self.active_pane_ref().cwd.clone();
+                let dest_dir = self.inactive_pane().cwd.clone();
 
-                match kind {
-                    DialogKind::Delete => match fs_ops::delete_recursive(&src) {
-                        Ok(()) => self.set_status(format!("Deleted {name}")),
-                        Err(err) => self.set_error(format!("Delete failed: {err}")),
-                    },
-                    DialogKind::Copy => {
-                        let dest = self.inactive_pane().cwd.join(&name);
-                        match fs_ops::copy_recursive(&src, &dest) {
-                            Ok(()) => {
-                                self.set_status(format!(
-                                    "Copied {} to {}",
-                                    src.display(),
-                                    dest.display()
-                                ));
-                            }
-                            Err(err) => self.set_error(format!("Copy failed: {err}")),
-                        }
-                    }
-                    DialogKind::Move => {
-                        let dest = self.inactive_pane().cwd.join(&name);
-                        match fs_ops::move_path(&src, &dest) {
-                            Ok(()) => {
-                                self.set_status(format!(
-                                    "Moved {} to {}",
-                                    src.display(),
-                                    dest.display()
-                                ));
-                            }
-                            Err(err) => self.set_error(format!("Move failed: {err}")),
-                        }
+                let mut done = 0usize;
+                let mut errors: Vec<String> = Vec::new();
+                for (name, src) in &items {
+                    let result = match kind {
+                        DialogKind::Delete => fs_ops::delete_recursive(src),
+                        DialogKind::Copy => fs_ops::copy_recursive(src, &dest_dir.join(name)),
+                        DialogKind::Move => fs_ops::move_path(src, &dest_dir.join(name)),
+                    };
+                    match result {
+                        Ok(()) => done += 1,
+                        Err(err) => errors.push(format!("{name}: {err}")),
                     }
                 }
 
+                let verb_done = match kind {
+                    DialogKind::Delete => "Deleted",
+                    DialogKind::Copy => "Copied",
+                    DialogKind::Move => "Moved",
+                };
+                if errors.is_empty() {
+                    // A single item logs its full from/to paths (as
+                    // before); a batch would make that unreadably long, so
+                    // it logs a count plus the shared source/destination
+                    // directories instead of nothing at all.
+                    let message = match (kind, items.as_slice()) {
+                        (DialogKind::Delete, [(name, _)]) => format!("Deleted {name}"),
+                        (DialogKind::Delete, _) => {
+                            format!("Deleted {done} items from {}", src_dir.display())
+                        }
+                        (_, [(name, src)]) => {
+                            format!("{verb_done} {} to {}", src.display(), dest_dir.join(name).display())
+                        }
+                        (_, _) => format!(
+                            "{verb_done} {done} items from {} to {}",
+                            src_dir.display(),
+                            dest_dir.display()
+                        ),
+                    };
+                    self.set_status(message);
+                } else {
+                    self.set_error(format!(
+                        "{} failed for {} of {} item(s): {}",
+                        kind.verb(),
+                        errors.len(),
+                        items.len(),
+                        errors.join("; ")
+                    ));
+                }
+
+                self.active_pane().clear_marks();
                 self.dialog = Dialog::None;
                 self.left.reload()?;
                 self.right.reload()?;

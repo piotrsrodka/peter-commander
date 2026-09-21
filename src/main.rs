@@ -554,6 +554,10 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         KeyCode::Down if app.quick_view && app.preview_focus => app.scroll_preview_down(),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
+        // Classic Norton Commander: Insert tags the entry under the cursor
+        // for F5/F6/F8 to act on as a batch, and steps down so repeated
+        // presses sweep through a run of files.
+        KeyCode::Insert => app.active_pane().toggle_mark_selected(),
         KeyCode::Home if app.quick_view && app.preview_focus => app.scroll_preview_to_top(),
         KeyCode::End if app.quick_view && app.preview_focus => app.scroll_preview_to_bottom(),
         KeyCode::PageUp if app.quick_view && app.preview_focus => app.scroll_preview_page_up(),

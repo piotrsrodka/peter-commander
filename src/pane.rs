@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -66,6 +67,10 @@ pub struct Pane {
     /// Whether dotfiles (names starting with `.`) are filtered out of the
     /// listing. The ".." pseudo-entry is always shown regardless.
     pub hide_hidden: bool,
+    /// Names tagged with Insert, independent of the cursor position — F5/
+    /// F6/F8 act on this whole set when it's non-empty, instead of just the
+    /// entry under the cursor. Never contains "..".
+    pub marked: HashSet<String>,
 }
 
 impl Pane {
@@ -75,6 +80,7 @@ impl Pane {
             entries: Vec::new(),
             selected: 0,
             hide_hidden,
+            marked: HashSet::new(),
         };
         pane.reload()?;
         Ok(pane)
@@ -138,11 +144,88 @@ impl Pane {
         if self.selected >= self.entries.len() {
             self.selected = self.entries.len().saturating_sub(1);
         }
+        if !self.marked.is_empty() {
+            let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+            self.marked.retain(|m| names.contains(m.as_str()));
+        }
         Ok(())
     }
 
     pub fn selected_entry(&self) -> Option<&Entry> {
         self.entries.get(self.selected)
+    }
+
+    /// Insert: tags/untags the entry under the cursor (a no-op on "..",
+    /// which can never be marked, but — matching the original NC — still
+    /// steps the cursor down like any other entry) and moves the cursor
+    /// down, so repeated presses sweep down through a run of files.
+    pub fn toggle_mark_selected(&mut self) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        if entry.name != ".." {
+            let name = entry.name.clone();
+            if !self.marked.remove(&name) {
+                self.marked.insert(name);
+            }
+        }
+        self.move_down();
+    }
+
+    /// The marked entries as `(name, full path)` pairs, in listing order.
+    /// Empty when nothing is tagged — callers fall back to the entry under
+    /// the cursor in that case.
+    pub fn marked_items(&self) -> Vec<(String, PathBuf)> {
+        self.entries
+            .iter()
+            .filter(|e| self.marked.contains(&e.name))
+            .map(|e| (e.name.clone(), self.cwd.join(&e.name)))
+            .collect()
+    }
+
+    pub fn clear_marks(&mut self) {
+        self.marked.clear();
+    }
+
+    /// `(count, total bytes)` of the marked entries, for the pane's status
+    /// line — `None` when nothing is tagged, so the caller falls back to
+    /// showing the plain file/dir totals instead. Directory sizes aren't
+    /// summed in (a directory's raw metadata length isn't its content
+    /// size), matching how the listing itself never shows a byte size for
+    /// directories either.
+    pub fn marked_summary(&self) -> Option<(usize, u64)> {
+        if self.marked.is_empty() {
+            return None;
+        }
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for entry in &self.entries {
+            if self.marked.contains(&entry.name) {
+                count += 1;
+                if !entry.is_dir {
+                    bytes += entry.size;
+                }
+            }
+        }
+        Some((count, bytes))
+    }
+
+    /// `(files, dirs)` in the listing, excluding the ".." pseudo-entry —
+    /// the pane's status line default when nothing is marked.
+    pub fn totals(&self) -> (usize, usize) {
+        let mut files = 0usize;
+        let mut dirs = 0usize;
+        for entry in &self.entries {
+            if entry.name == ".." {
+                continue;
+            }
+            if entry.is_dir {
+                dirs += 1;
+            } else {
+                files += 1;
+            }
+        }
+        (files, dirs)
     }
 
     /// The filesystem path of the selected entry, or `None` for the ".." pseudo-entry.
@@ -214,12 +297,19 @@ impl Pane {
     fn set_cwd_selecting(&mut self, new_path: PathBuf, select_name: Option<&str>) -> Result<Option<String>> {
         let previous_cwd = self.cwd.clone();
         let previous_selected = self.selected;
+        // Marks belong to the listing they were made in — carrying them by
+        // name into a different directory would tag an unrelated file that
+        // happens to share a name (e.g. every directory's own ".gitignore"),
+        // and silently drop the rest. So a real directory change starts
+        // from a clean slate, same as the fresh `Pane` the app boots with.
+        let previous_marked = std::mem::take(&mut self.marked);
         self.cwd = new_path;
         self.selected = 0;
 
         if let Err(err) = self.reload() {
             self.cwd = previous_cwd;
             self.selected = previous_selected;
+            self.marked = previous_marked;
             return Ok(Some(format!("Cannot open directory: {err}")));
         }
 
@@ -425,6 +515,124 @@ mod tests {
 
         let pane = Pane::new(base.clone(), false).unwrap();
         assert!(pane.entries.iter().any(|e| e.name == ".hidden_file"));
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn toggle_mark_selected_tags_and_steps_down_but_skips_dotdot() {
+        let base = std::env::temp_dir().join("pc_test_pane_mark");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("a.txt"), "").unwrap();
+        fs::write(base.join("b.txt"), "").unwrap();
+
+        let mut pane = Pane::new(base.clone(), false).unwrap();
+        // Entries are ".." (dirs come first, and ".." is always first), then
+        // the two files sorted by name.
+        pane.selected = 0;
+        pane.toggle_mark_selected();
+        assert!(
+            pane.marked.is_empty(),
+            "\"..\" must never be markable"
+        );
+        assert_eq!(
+            pane.selected, 1,
+            "but the cursor still steps down over it, like any other entry"
+        );
+
+        pane.toggle_mark_selected();
+        assert!(pane.marked.contains("a.txt"));
+        assert_eq!(pane.selected, 2, "marking steps the cursor down");
+
+        pane.toggle_mark_selected();
+        assert!(pane.marked.contains("a.txt"));
+        assert!(pane.marked.contains("b.txt"));
+
+        let items = pane.marked_items();
+        assert_eq!(
+            items,
+            vec![
+                ("a.txt".to_string(), base.join("a.txt")),
+                ("b.txt".to_string(), base.join("b.txt")),
+            ]
+        );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn reload_drops_marks_for_entries_that_no_longer_exist() {
+        let base = std::env::temp_dir().join("pc_test_pane_mark_reload");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("a.txt"), "").unwrap();
+        fs::write(base.join("b.txt"), "").unwrap();
+
+        let mut pane = Pane::new(base.clone(), false).unwrap();
+        pane.marked.insert("a.txt".to_string());
+        pane.marked.insert("b.txt".to_string());
+
+        fs::remove_file(base.join("a.txt")).unwrap();
+        pane.reload().unwrap();
+
+        assert!(!pane.marked.contains("a.txt"));
+        assert!(pane.marked.contains("b.txt"));
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn marked_summary_sums_bytes_of_marked_files_only() {
+        let base = std::env::temp_dir().join("pc_test_pane_marked_summary");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("subdir")).unwrap();
+        fs::write(base.join("a.txt"), "12345").unwrap();
+        fs::write(base.join("b.txt"), "1234567890").unwrap();
+
+        let mut pane = Pane::new(base.clone(), false).unwrap();
+        assert_eq!(pane.marked_summary(), None, "nothing marked yet");
+
+        pane.marked.insert("a.txt".to_string());
+        pane.marked.insert("subdir".to_string());
+        let (count, bytes) = pane.marked_summary().unwrap();
+        assert_eq!(count, 2, "counts marked dirs too");
+        assert_eq!(bytes, 5, "but only sums bytes of marked files");
+
+        let (files, dirs) = pane.totals();
+        assert_eq!((files, dirs), (2, 1), "totals() excludes \"..\"");
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn changing_directory_clears_marks_even_when_the_other_dir_has_a_same_named_file() {
+        let base = std::env::temp_dir().join("pc_test_pane_mark_dir_change");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join(".gitignore"), "top").unwrap();
+        fs::write(base.join("only_here.txt"), "").unwrap();
+        // A same-named file in the other directory used to survive the
+        // round trip and look "still marked" even though it's a completely
+        // different file.
+        fs::write(base.join("sub").join(".gitignore"), "nested").unwrap();
+
+        let mut pane = Pane::new(base.clone(), false).unwrap();
+        pane.marked.insert(".gitignore".to_string());
+        pane.marked.insert("only_here.txt".to_string());
+
+        pane.change_dir(Path::new("sub")).unwrap();
+        assert!(
+            pane.marked.is_empty(),
+            "entering a different directory must not carry marks over by name"
+        );
+
+        pane.marked.insert(".gitignore".to_string());
+        pane.change_dir(&base).unwrap();
+        assert!(
+            pane.marked.is_empty(),
+            "leaving a directory must not leave stale marks behind either"
+        );
 
         fs::remove_dir_all(&base).unwrap();
     }
