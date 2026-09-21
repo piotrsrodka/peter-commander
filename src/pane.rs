@@ -26,6 +26,27 @@ fn is_executable_file(path: &Path, _metadata: &fs::Metadata) -> bool {
         })
 }
 
+/// Whether "hide hidden files" should skip this entry. Unix hides by
+/// dotfile-naming convention only. Windows keeps that (dotfiles like
+/// `.gitignore` are common even there) but additionally hides via the
+/// Hidden file attribute — this is also how Windows marks the legacy
+/// localized-name compatibility junctions in the user profile (e.g. "Moje
+/// Dokumenty" alongside the real "Documents"), which additionally deny
+/// direct access (`ERROR_ACCESS_DENIED`) if entered, so hiding them by
+/// convention avoids a dead end in the listing rather than just a cosmetic
+/// duplicate.
+#[cfg(windows)]
+fn is_hidden_entry(name: &str, metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    name.starts_with('.') || metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
+#[cfg(unix)]
+fn is_hidden_entry(name: &str, _metadata: &fs::Metadata) -> bool {
+    name.starts_with('.')
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
@@ -79,15 +100,20 @@ impl Pane {
             // issues on a single item) instead of failing the whole listing.
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
-            if self.hide_hidden && name.starts_with('.') {
+            // The hidden check always uses the entry's own (non-following)
+            // metadata: a reparse point like a Windows compatibility
+            // junction transparently forwards a followed stat to its
+            // target's attributes, losing the junction's own Hidden flag.
+            let Ok(link_metadata) = entry.metadata() else {
+                continue;
+            };
+            if self.hide_hidden && is_hidden_entry(&name, &link_metadata) {
                 continue;
             }
             // Follow symlinks for classification (so a symlink to a
             // directory is treated as a directory, matching `ls -L`);
             // fall back to the link's own metadata for broken symlinks.
-            let Ok(metadata) = fs::metadata(entry.path()).or_else(|_| entry.metadata()) else {
-                continue;
-            };
+            let metadata = fs::metadata(entry.path()).unwrap_or(link_metadata);
             let is_dir = metadata.is_dir();
             let item = Entry {
                 name,
