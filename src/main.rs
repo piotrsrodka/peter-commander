@@ -341,7 +341,8 @@ fn side_at(app: &App, column: u16, row: u16) -> Option<app::Side> {
 /// Ignored while a dialog, the pulldown menu, or help is open, matching how
 /// `handle_key` gates those same keyboard shortcuts.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
-    if app.help_open
+    if app.error_dialog.is_some()
+        || app.help_open
         || app.logs_open
         || app.dialog_is_text_input()
         || app.dialog_is_settings()
@@ -452,6 +453,11 @@ fn menu_category_for(letter: char) -> Option<usize> {
 }
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    if app.error_dialog.is_some() {
+        app.error_dialog = None;
+        return Ok(());
+    }
+
     if app.help_open {
         match code {
             KeyCode::Left => app.help_page = 0,

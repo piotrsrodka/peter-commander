@@ -130,6 +130,86 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.logs_open {
         draw_logs(frame);
     }
+
+    if let Some(message) = &app.error_dialog {
+        draw_error_dialog(frame, message);
+    }
+}
+
+/// A blocking "in your face" popup for `App::set_error` — unlike a routine
+/// confirmation, an error demands a keypress to dismiss (any key, handled in
+/// `main.rs`) so it can't be missed the way the log-only status line can.
+fn draw_error_dialog(frame: &mut Frame, message: &str) {
+    let area = frame.area();
+    let inner_width = area.width.saturating_sub(4).clamp(20, 64) as usize;
+    let hint = "Press any key to continue";
+    let wrapped = wrap_message(message, inner_width);
+    let content_width = wrapped
+        .iter()
+        .map(|line| line.len())
+        .max()
+        .unwrap_or(0)
+        .max(hint.len());
+    let width = (content_width as u16 + 4).min(area.width);
+    let height = wrapped.len() as u16 + 4;
+    let dialog_area = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let block = Block::default()
+        .title(" Error ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+
+    let mut lines: Vec<Line> = wrapped
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                line,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines).block(block);
+
+    draw_shadow_for(frame, dialog_area);
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+/// Greedy word-wrap to at most `width` columns per line — good enough for
+/// short error messages, no need for the full richness of a text-shaping
+/// crate here.
+fn wrap_message(message: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in message.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 const HELP_PAGE_1: &[&str] = &[

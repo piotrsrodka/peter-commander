@@ -151,6 +151,12 @@ pub struct App {
     /// Command > Show Logs: a full-screen view of the recent contents of
     /// the error/status log file, closed by any key like help.
     pub logs_open: bool,
+    /// A blocking "in your face" popup for the most recent error (e.g.
+    /// "Access is denied" entering a locked directory) — unlike
+    /// `status_message`, which only reaches the log file, this demands a
+    /// keypress to dismiss so it can't be missed. Not shown for routine
+    /// confirmations (`set_status`), only real failures (`set_error`).
+    pub error_dialog: Option<String>,
     pub command_line: String,
     /// Whether running a command from the command line pauses with
     /// "Press Enter to continue" afterward, or returns straight to the
@@ -269,6 +275,7 @@ impl App {
             help_open: false,
             help_page: 0,
             logs_open: false,
+            error_dialog: None,
             command_line: String::new(),
             wait_after_shell_command,
             quick_view: false,
@@ -301,7 +308,8 @@ impl App {
     /// routine confirmations ("Deleted x.txt"), use `set_status` instead.
     pub fn set_error(&mut self, message: String) {
         logging::log_error(&message);
-        self.status_message = message;
+        self.status_message = message.clone();
+        self.error_dialog = Some(message);
     }
 
     /// Records a routine status confirmation (e.g. "Deleted x.txt") to the
