@@ -267,9 +267,34 @@ impl Pane {
         } else {
             self.cwd.join(target)
         };
-        let new_path = fs::canonicalize(&candidate).unwrap_or(candidate);
+        let new_path = fs::canonicalize(&candidate)
+            .map(strip_verbatim_prefix)
+            .unwrap_or(candidate);
         self.set_cwd(new_path)
     }
+}
+
+/// `fs::canonicalize` on Windows always returns a `\\?\`-prefixed "verbatim"
+/// path (e.g. `\\?\C:\Users\Piotr`) — harmless to Win32 APIs, but ugly in
+/// the prompt and not understood by every external program `cd` might hand
+/// the path to. This strips that prefix back to the ordinary form, same as
+/// what a plain (non-canonicalized) path would look like. A no-op on other
+/// platforms, where `canonicalize` doesn't add such a prefix.
+#[cfg(windows)]
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
+}
+
+#[cfg(not(windows))]
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 #[cfg(test)]
@@ -356,11 +381,14 @@ mod tests {
 
         let result = pane.change_dir(Path::new("sub")).unwrap();
         assert!(result.is_none());
-        assert_eq!(pane.cwd, base.join("sub").canonicalize().unwrap());
+        assert_eq!(
+            pane.cwd,
+            strip_verbatim_prefix(base.join("sub").canonicalize().unwrap())
+        );
 
         let result = pane.change_dir(&base).unwrap();
         assert!(result.is_none());
-        assert_eq!(pane.cwd, base.canonicalize().unwrap());
+        assert_eq!(pane.cwd, strip_verbatim_prefix(base.canonicalize().unwrap()));
 
         fs::remove_dir_all(&base).unwrap();
     }

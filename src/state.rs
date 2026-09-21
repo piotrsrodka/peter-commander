@@ -24,8 +24,11 @@ pub fn load() -> Option<LastDirs> {
     let path = state_file()?;
     let contents = fs::read_to_string(path).ok()?;
     let mut lines = contents.lines();
-    let left = PathBuf::from(lines.next()?);
-    let right = PathBuf::from(lines.next()?);
+    // Older versions of this file may carry a `\\?\`-prefixed verbatim path
+    // (from `fs::canonicalize` on Windows, before that got cleaned up) —
+    // strip it here too so a stale saved path doesn't outlive the fix.
+    let left = crate::pane::strip_verbatim_prefix(PathBuf::from(lines.next()?));
+    let right = crate::pane::strip_verbatim_prefix(PathBuf::from(lines.next()?));
 
     if left.is_dir() && right.is_dir() {
         Some(LastDirs { left, right })
