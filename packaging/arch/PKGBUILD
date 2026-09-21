@@ -1,6 +1,6 @@
 # Maintainer: Piotr Srodka <piotr.srodka@hey.com>
 pkgname=peter-commander
-pkgver=0.6.1
+pkgver=0.7.0
 pkgrel=1
 pkgdesc="A dual-pane terminal file manager"
 arch=('x86_64' 'aarch64')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('gcc-libs')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/piotrsrodka/peter-commander/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('acdd21edc52517932b1c26157f0fa01ddd7866a6eaae32087ba08effc3c32aff')
+sha256sums=('fa89a82724c150aa9ef3da0ad51388168009eb2e118c88daf538100e2b9cb27e')
 
 prepare() {
     cd "$pkgname-$pkgver"
