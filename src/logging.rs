@@ -1,28 +1,35 @@
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use chrono::Local;
 
-const LOG_PATH: &str = "/tmp/peter-commander.log";
+/// The OS temp directory (`$TMPDIR`/`/tmp` on Unix, `%TEMP%` on Windows),
+/// resolved once and cached — `std::env::temp_dir()` is portable, unlike a
+/// hardcoded `/tmp` path.
+fn log_path_cell() -> &'static PathBuf {
+    static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+    LOG_PATH.get_or_init(|| std::env::temp_dir().join("peter-commander.log"))
+}
 
-/// Appends a timestamped line to /tmp/peter-commander.log. Best-effort: if the
-/// log file can't be opened/written, the error is silently dropped rather than
+/// Appends a timestamped line to the log file. Best-effort: if the log file
+/// can't be opened/written, the error is silently dropped rather than
 /// crashing the app over a logging failure.
 pub fn log_error(message: &str) {
-    log_to(Path::new(LOG_PATH), message);
+    log_to(log_path_cell(), message);
 }
 
 /// Same as `log_error`, for routine status confirmations (e.g. "Deleted
 /// x.txt") rather than actual failures — kept in the same file/format so
 /// "Show Logs" (Command menu) shows one merged, chronological view.
 pub fn log_info(message: &str) {
-    log_to(Path::new(LOG_PATH), message);
+    log_to(log_path_cell(), message);
 }
 
 /// The path `log_error`/`log_info` write to, for "Show Logs" to read back.
 pub fn log_path() -> &'static Path {
-    Path::new(LOG_PATH)
+    log_path_cell()
 }
 
 fn log_to(path: &Path, message: &str) {
