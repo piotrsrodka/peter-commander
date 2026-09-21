@@ -5,10 +5,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Widget, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Widget, Wrap,
 };
 
-use crate::app::{App, Dialog, SettingItem, Side};
+use crate::app::{App, Dialog, DialogKind, SettingItem, Side};
 use crate::logging;
 use crate::menu::{FN_KEYS, MENU_BAR};
 use crate::pane::Pane;
@@ -107,17 +107,43 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match &app.dialog {
         Dialog::Confirm { kind, name, .. } => {
-            let hint = if kind.default_yes() { "[Y/n]" } else { "[y/N]" };
-            draw_confirm_dialog(frame, &format!("{} '{}'? {}", kind.verb(), name, hint));
+            let destination = matches!(kind, DialogKind::Copy | DialogKind::Move)
+                .then(|| app.inactive_pane_ref().cwd.display().to_string());
+            draw_confirm_dialog(
+                frame,
+                app.classic_style,
+                *kind,
+                name,
+                destination.as_deref(),
+                app.dialog_cancel_focused,
+            );
         }
         Dialog::TextInput { kind, input } => {
-            draw_text_input_dialog(frame, kind.prompt(), input);
+            draw_input_dialog(
+                frame,
+                app.classic_style,
+                kind.title(),
+                kind.prompt(),
+                input,
+                app.dialog_cancel_focused,
+            );
         }
-        Dialog::Rename { input, .. } => {
-            draw_text_input_dialog(frame, "Rename to:", input);
+        Dialog::Rename { input, src } => {
+            let old_name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            draw_input_dialog(
+                frame,
+                app.classic_style,
+                "Rename",
+                &format!("Rename \"{old_name}\" to:"),
+                input,
+                app.dialog_cancel_focused,
+            );
         }
         Dialog::ConfirmQuit => {
-            draw_confirm_dialog(frame, "Quit PeterCommander? [Y/n]");
+            draw_quit_dialog(frame, app.classic_style, app.dialog_cancel_focused);
         }
         Dialog::Settings { selected, .. } => {
             draw_settings_dialog(frame, app, *selected);
@@ -307,63 +333,326 @@ fn draw_help(frame: &mut Frame, page: usize) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_text_input_dialog(frame: &mut Frame, prompt: &str, input: &str) {
-    let width = (prompt.len().max(input.len() + 2) as u16 + 4).min(frame.area().width);
-    let height = 4;
-    let area = Rect {
-        x: (frame.area().width.saturating_sub(width)) / 2,
-        y: (frame.area().height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
-    let block = Block::default()
-        .title(prompt)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(input, Style::default().fg(Color::White)),
-        Span::styled(
-            "_",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::SLOW_BLINK),
-        ),
-    ]))
-    .block(block);
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(paragraph, area);
+/// Color palette for the big double-bordered dialog frame shared by every
+/// modal (Copy/Move/Delete confirm, Rename, MkDir/New file, Quit). The
+/// *shape* — double border, sectioned content, a `[ Button ]` row — is the
+/// same in both modes; only the colors swap: `classic_style` uses the fixed
+/// retro gray/teal DOS palette, otherwise everything follows the terminal's
+/// own theme colors.
+struct DialogPalette {
+    bg: Color,
+    fg: Color,
+    border_fg: Color,
+    field_bg: Color,
+    field_fg: Color,
+    button_default_bg: Color,
+    button_default_fg: Color,
 }
 
-fn draw_confirm_dialog(frame: &mut Frame, message: &str) {
-    let width = (message.len() as u16 + 4).min(frame.area().width);
-    let height = 3;
+fn dialog_palette(classic_style: bool) -> DialogPalette {
+    if classic_style {
+        DialogPalette {
+            bg: classic::DIALOG_BG,
+            fg: classic::DIALOG_FG,
+            border_fg: classic::DIALOG_BORDER_FG,
+            field_bg: classic::HIGHLIGHT_BG,
+            field_fg: classic::HIGHLIGHT_FG,
+            button_default_bg: classic::HIGHLIGHT_BG,
+            button_default_fg: classic::HIGHLIGHT_FG,
+        }
+    } else {
+        DialogPalette {
+            bg: Color::Black,
+            fg: Color::White,
+            border_fg: Color::Cyan,
+            field_bg: Color::Cyan,
+            field_fg: Color::Black,
+            button_default_bg: Color::Cyan,
+            button_default_fg: Color::Black,
+        }
+    }
+}
+
+/// One line of dialog content. `Field` is padded to the dialog's full inner
+/// width when rendered so its background fills the whole row, like the
+/// highlighted destination/input bar in classic Norton Commander dialogs;
+/// `Text`/`Centered` are rendered as-is (`Centered` for the button row).
+enum DialogLine<'a> {
+    Text(Line<'a>),
+    Field { content: Vec<Span<'a>>, fill_bg: Color },
+    Centered(Line<'a>),
+}
+
+impl DialogLine<'_> {
+    fn natural_width(&self) -> usize {
+        match self {
+            DialogLine::Text(line) | DialogLine::Centered(line) => line.width(),
+            DialogLine::Field { content, .. } => {
+                content.iter().map(Span::width).sum::<usize>() + 2 * DIALOG_PAD
+            }
+        }
+    }
+}
+
+fn button_row<'a>(buttons: &[(&'a str, bool)], pal: &DialogPalette) -> DialogLine<'a> {
+    let mut spans = Vec::new();
+    for (idx, (label, is_default)) in buttons.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let style = if *is_default {
+            Style::default()
+                .bg(pal.button_default_bg)
+                .fg(pal.button_default_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal.fg)
+        };
+        spans.push(Span::styled(format!("[ {label} ]"), style));
+    }
+    DialogLine::Centered(Line::from(spans))
+}
+
+/// Renders `sections` stacked inside a double-bordered box, each section
+/// separated by a full-width single-line divider that tees into the border
+/// (`╟──────╢`) — the "big, proud" classic dialog look the whole family of
+/// modals shares.
+/// 1-column margin of dialog background kept between the border and the
+/// content on every side (except the divider rows, which deliberately span
+/// edge-to-edge to tee into the border).
+const DIALOG_PAD: usize = 1;
+
+/// A second margin of dialog background *outside* the border too, between
+/// it and whatever's behind the dialog — so the border never sits flush
+/// against the panes/shadow. Wider on the sides than top/bottom, matching
+/// the reference look.
+const OUTER_PAD_X: u16 = 2;
+const OUTER_PAD_Y: u16 = 1;
+
+fn draw_dialog_frame(
+    frame: &mut Frame,
+    classic_style: bool,
+    title: &str,
+    sections: Vec<Vec<DialogLine>>,
+    min_half_screen: bool,
+) {
+    let pal = dialog_palette(classic_style);
+
+    let content_width = sections
+        .iter()
+        .flat_map(|section| section.iter())
+        .map(DialogLine::natural_width)
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count() + 4);
+    let box_width = content_width as u16 + 2 * DIALOG_PAD as u16 + 2;
+    // Never narrower than half the screen, however short the content is —
+    // applied to the full outer footprint, border pad included. Quit opts
+    // out, staying sized to its (short) content instead.
+    let min_width = if min_half_screen {
+        frame.area().width / 2
+    } else {
+        0
+    };
+    let total_width = (box_width + 2 * OUTER_PAD_X)
+        .max(min_width)
+        .min(frame.area().width);
+    let width = total_width.saturating_sub(2 * OUTER_PAD_X);
+    let inner_width = width.saturating_sub(2) as usize;
+
+    // Block's own left/right border glyph is drawn independently for every
+    // row, including this one, so the divider's content can't include `╠`/
+    // `╣` itself (that would double up with the border's `║`) — it's plain
+    // `═` here, and the two edge cells get patched to `╠`/`╣` after the
+    // paragraph is rendered, to actually tee into the border.
+    let divider = Line::from(Span::styled(
+        "─".repeat(inner_width),
+        Style::default().fg(pal.border_fg),
+    ));
+
+    let divider_count = sections.len().saturating_sub(1);
+    let content_height: usize = sections.iter().map(Vec::len).sum();
+    let box_height = (content_height + divider_count + 2) as u16;
+    let total_height = (box_height + 2 * OUTER_PAD_Y).min(frame.area().height);
+    let height = total_height.saturating_sub(2 * OUTER_PAD_Y);
+
+    let outer_area = Rect {
+        x: (frame.area().width.saturating_sub(total_width)) / 2,
+        y: (frame.area().height.saturating_sub(total_height)) / 2,
+        width: total_width,
+        height: total_height,
+    };
     let area = Rect {
-        x: (frame.area().width.saturating_sub(width)) / 2,
-        y: (frame.area().height.saturating_sub(height)) / 2,
+        x: outer_area.x + OUTER_PAD_X,
+        y: outer_area.y + OUTER_PAD_Y,
         width,
         height,
     };
 
     let block = Block::default()
+        .title_top(Line::from(format!(" {title} ")).centered())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(pal.border_fg))
+        .style(Style::default().bg(pal.bg).fg(pal.fg));
 
-    let paragraph = Paragraph::new(Line::from(Span::styled(
-        message,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )))
-    .block(block);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut divider_rows: Vec<u16> = Vec::new();
+    for (idx, section) in sections.into_iter().enumerate() {
+        if idx > 0 {
+            divider_rows.push(lines.len() as u16);
+            lines.push(divider.clone());
+        }
+        for dialog_line in section {
+            lines.push(match dialog_line {
+                DialogLine::Text(mut line) => {
+                    line.spans.insert(
+                        0,
+                        Span::styled(" ".repeat(DIALOG_PAD), Style::default().bg(pal.bg)),
+                    );
+                    line
+                }
+                DialogLine::Centered(line) => line.centered(),
+                DialogLine::Field { content, fill_bg } => {
+                    let content_width: usize = content.iter().map(Span::width).sum();
+                    let mut spans =
+                        vec![Span::styled(" ".repeat(DIALOG_PAD), Style::default().bg(pal.bg))];
+                    spans.extend(content);
+                    let used = DIALOG_PAD + content_width;
+                    let bar_end = inner_width.saturating_sub(DIALOG_PAD);
+                    if bar_end > used {
+                        spans.push(Span::styled(
+                            " ".repeat(bar_end - used),
+                            Style::default().bg(fill_bg),
+                        ));
+                    }
+                    Line::from(spans)
+                }
+            });
+        }
+    }
 
-    draw_shadow_for(frame, area);
-    frame.render_widget(Clear, area);
+    let paragraph = Paragraph::new(lines).block(block);
+
+    draw_shadow_for(frame, outer_area);
+    frame.render_widget(Clear, outer_area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(pal.bg)),
+        outer_area,
+    );
     frame.render_widget(paragraph, area);
+
+    // Patch the border column on each divider row into a single-line-into-
+    // double-border tee (`╟`/`╢`) now that the block has drawn its own `║`
+    // there — content-row index `row` sits at `area.y + 1 + row` since the
+    // top border consumes row 0.
+    let buf = frame.buffer_mut();
+    let border_style = Style::default().fg(pal.border_fg).bg(pal.bg);
+    for row in divider_rows {
+        let y = area.y + 1 + row;
+        if let Some(cell) = buf.cell_mut((area.x, y)) {
+            cell.set_symbol("╟").set_style(border_style);
+        }
+        if let Some(cell) = buf.cell_mut((area.x + width.saturating_sub(1), y)) {
+            cell.set_symbol("╢").set_style(border_style);
+        }
+    }
+}
+
+/// Copy/Move/Delete confirmation — Copy and Move also show the destination
+/// (the other pane's directory, not editable) as a highlighted line.
+fn draw_confirm_dialog(
+    frame: &mut Frame,
+    classic_style: bool,
+    kind: DialogKind,
+    name: &str,
+    destination: Option<&str>,
+    cancel_focused: bool,
+) {
+    let pal = dialog_palette(classic_style);
+    let verb = kind.verb();
+
+    let message = match destination {
+        Some(_) => format!("{verb} \"{name}\" to"),
+        None => format!("{verb} \"{name}\"?"),
+    };
+    let mut sections = vec![vec![DialogLine::Text(Line::from(Span::styled(
+        message,
+        Style::default().fg(pal.fg),
+    )))]];
+
+    if let Some(dest) = destination {
+        sections.push(vec![DialogLine::Field {
+            content: vec![Span::styled(
+                dest.to_string(),
+                Style::default().bg(pal.field_bg).fg(pal.field_fg),
+            )],
+            fill_bg: pal.field_bg,
+        }]);
+    }
+
+    sections.push(vec![button_row(
+        &[(verb, !cancel_focused), ("Cancel", cancel_focused)],
+        &pal,
+    )]);
+
+    draw_dialog_frame(frame, classic_style, verb, sections, true);
+}
+
+fn draw_quit_dialog(frame: &mut Frame, classic_style: bool, cancel_focused: bool) {
+    let pal = dialog_palette(classic_style);
+    let sections = vec![
+        vec![DialogLine::Text(Line::from(Span::styled(
+            "Quit PeterCommander?",
+            Style::default().fg(pal.fg),
+        )))],
+        vec![button_row(
+            &[("Quit", !cancel_focused), ("Cancel", cancel_focused)],
+            &pal,
+        )],
+    ];
+    draw_dialog_frame(frame, classic_style, "Quit", sections, false);
+}
+
+/// Rename and MkDir/New file: a label line, a highlighted editable-field
+/// line showing the text typed so far (with a blinking cursor), and a
+/// button row.
+fn draw_input_dialog(
+    frame: &mut Frame,
+    classic_style: bool,
+    title: &str,
+    prompt: &str,
+    input: &str,
+    cancel_focused: bool,
+) {
+    let pal = dialog_palette(classic_style);
+    let sections = vec![
+        vec![DialogLine::Text(Line::from(Span::styled(
+            prompt.to_string(),
+            Style::default().fg(pal.fg),
+        )))],
+        vec![DialogLine::Field {
+            content: vec![
+                Span::styled(
+                    input.to_string(),
+                    Style::default().bg(pal.field_bg).fg(pal.field_fg),
+                ),
+                Span::styled(
+                    "_",
+                    Style::default()
+                        .bg(pal.field_bg)
+                        .fg(pal.field_fg)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ],
+            fill_bg: pal.field_bg,
+        }],
+        vec![button_row(
+            &[("OK", !cancel_focused), ("Cancel", cancel_focused)],
+            &pal,
+        )],
+    ];
+    draw_dialog_frame(frame, classic_style, title, sections, true);
 }
 
 const SETTINGS_HINT: &str = " \u{2190}/\u{2192}/Space: toggle   Enter: save   Esc: cancel";
@@ -831,6 +1120,12 @@ mod classic {
     // The command-line and status rows sit on plain black, not the pane's
     // blue — matching the original, where only the two panels are blue.
     pub const PROMPT_BG: Color = Color::Rgb(0, 0, 0);
+
+    // Big double-bordered dialogs (Copy/Move/Delete, Rename, MkDir/New
+    // file, Quit) — the classic DOS gray dialog box, not the panels' blue.
+    pub const DIALOG_BG: Color = Color::Rgb(0xAF, 0xA8, 0xAF);
+    pub const DIALOG_FG: Color = Color::Rgb(0, 0, 0);
+    pub const DIALOG_BORDER_FG: Color = Color::Rgb(0, 0, 0);
 }
 
 fn draw_pane(

@@ -50,6 +50,13 @@ pub enum TextInputKind {
 }
 
 impl TextInputKind {
+    pub fn title(&self) -> &'static str {
+        match self {
+            TextInputKind::MkDir => "New directory",
+            TextInputKind::NewFile => "New file",
+        }
+    }
+
     pub fn prompt(&self) -> &'static str {
         match self {
             TextInputKind::MkDir => "New directory name:",
@@ -162,6 +169,12 @@ pub struct App {
     pub menu_item: usize,
     pub status_message: String,
     pub dialog: Dialog,
+    /// Which button of the current dialog's `[ Primary ]  [ Cancel ]` row
+    /// has keyboard focus — Left/Right toggle it, Enter activates whichever
+    /// is focused. Reset by each `request_*`/dialog-opening call to that
+    /// dialog's safe default (`false` = primary, matching `y`/`n` shortcuts
+    /// still working independently of focus).
+    pub dialog_cancel_focused: bool,
     pub external_request: Option<ExternalRequest>,
     pub help_open: bool,
     /// Which of the two help screen pages is shown (0 or 1) — Left/Right
@@ -300,6 +313,7 @@ impl App {
             menu_item: 0,
             status_message: String::new(),
             dialog: Dialog::None,
+            dialog_cancel_focused: false,
             external_request: None,
             help_open: false,
             help_page: 0,
@@ -397,6 +411,13 @@ impl App {
         match self.active {
             Side::Left => &self.left,
             Side::Right => &self.right,
+        }
+    }
+
+    pub fn inactive_pane_ref(&self) -> &Pane {
+        match self.active {
+            Side::Left => &self.right,
+            Side::Right => &self.left,
         }
     }
 
@@ -623,7 +644,10 @@ impl App {
             }
             Action::ShowTerminal => self.request_reveal_terminal(),
             Action::ShowLogs => self.logs_open = true,
-            Action::Quit => self.dialog = Dialog::ConfirmQuit,
+            Action::Quit => {
+                self.dialog = Dialog::ConfirmQuit;
+                self.dialog_cancel_focused = false;
+            }
             Action::Settings => {
                 let original = SettingItem::ALL
                     .iter()
@@ -835,6 +859,7 @@ impl App {
             return;
         };
         self.dialog = Dialog::Rename { input: name, src };
+        self.dialog_cancel_focused = false;
     }
 
     fn request_copy(&mut self) {
@@ -858,6 +883,7 @@ impl App {
             name: entry.name.clone(),
             src,
         };
+        self.dialog_cancel_focused = !kind.default_yes();
     }
 
     /// F3: toggles the internal quick preview if that setting is on
@@ -906,6 +932,7 @@ impl App {
                 name: entry.name.clone(),
                 src: path,
             };
+            self.dialog_cancel_focused = !DialogKind::Delete.default_yes();
         }
     }
 
@@ -1026,6 +1053,7 @@ impl App {
             kind: TextInputKind::MkDir,
             input: String::new(),
         };
+        self.dialog_cancel_focused = false;
     }
 
     pub fn request_new_file(&mut self) {
@@ -1033,17 +1061,14 @@ impl App {
             kind: TextInputKind::NewFile,
             input: String::new(),
         };
+        self.dialog_cancel_focused = false;
     }
 
-    pub fn dialog_default_yes(&self) -> bool {
-        match &self.dialog {
-            Dialog::Confirm { kind, .. } => kind.default_yes(),
-            Dialog::ConfirmQuit => true,
-            Dialog::TextInput { .. }
-            | Dialog::Rename { .. }
-            | Dialog::Settings { .. }
-            | Dialog::None => false,
-        }
+    /// Left/Right in a dialog: swap which button — the primary action or
+    /// Cancel — Enter would activate. There are only ever two, so this is a
+    /// plain flip rather than tracking an index.
+    pub fn toggle_dialog_focus(&mut self) {
+        self.dialog_cancel_focused = !self.dialog_cancel_focused;
     }
 
     pub fn text_input_push(&mut self, c: char) {

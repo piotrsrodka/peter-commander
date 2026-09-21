@@ -474,8 +474,15 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
 
     if app.dialog_is_text_input() {
         match code {
-            KeyCode::Enter => app.confirm_dialog()?,
+            KeyCode::Enter => {
+                if app.dialog_cancel_focused {
+                    app.cancel_dialog();
+                } else {
+                    app.confirm_dialog()?;
+                }
+            }
             KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Left | KeyCode::Right => app.toggle_dialog_focus(),
             KeyCode::Backspace => app.text_input_backspace(),
             KeyCode::Char(c) => app.text_input_push(c),
             _ => {}
@@ -499,13 +506,13 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
 
     if !matches!(app.dialog, Dialog::None) {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_dialog()?,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Left | KeyCode::Right => app.toggle_dialog_focus(),
             KeyCode::Enter => {
-                if app.dialog_default_yes() {
-                    app.confirm_dialog()?;
-                } else {
+                if app.dialog_cancel_focused {
                     app.cancel_dialog();
+                } else {
+                    app.confirm_dialog()?;
                 }
             }
             _ => {}
