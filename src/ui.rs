@@ -4,7 +4,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Widget, Wrap,
+};
 
 use crate::app::{App, Dialog, SettingItem, Side};
 use crate::logging;
@@ -364,17 +366,30 @@ fn draw_confirm_dialog(frame: &mut Frame, message: &str) {
     frame.render_widget(paragraph, area);
 }
 
-const SETTINGS_HINT: &str = " Space: toggle   Enter: save   Esc: cancel";
+const SETTINGS_HINT: &str = " \u{2190}/\u{2192}/Space: toggle   Enter: save   Esc: cancel";
+
+/// Each setting is shown as a two-way switch — "left label [ ]----[x] right
+/// label" — rather than a single generic checkbox, so both what's on and
+/// what's off are named in positive language instead of one hard-to-phrase
+/// boolean. The left column is padded to the widest left label so the
+/// switches themselves line up in a column.
+const SWITCH_TRACK: &str = "----";
 
 fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
+    let left_col_width = SettingItem::ALL
+        .iter()
+        .map(|item| item.left_label().chars().count())
+        .max()
+        .unwrap_or(0);
+
     let items: Vec<ListItem> = SettingItem::ALL
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            let checkbox = if app.setting_value(*item) {
-                "[x]"
+            let (left_box, right_box) = if app.setting_value(*item) {
+                ("[ ]", "[x]")
             } else {
-                "[ ]"
+                ("[x]", "[ ]")
             };
             let style = if idx == selected {
                 Style::default()
@@ -385,7 +400,11 @@ fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
                 Style::default().fg(Color::White)
             };
             ListItem::new(Line::from(Span::styled(
-                format!(" {checkbox} {}", item.label()),
+                format!(
+                    " {:<left_col_width$} {left_box}{SWITCH_TRACK}{right_box} {}",
+                    item.left_label(),
+                    item.right_label(),
+                ),
                 style,
             )))
         })
@@ -396,14 +415,17 @@ fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
         .collect();
 
     let hint_len = SETTINGS_HINT.chars().count();
+    let switch_width = 3 + SWITCH_TRACK.len() + 3; // "[ ]" + track + "[x]"
     let width = SettingItem::ALL
         .iter()
-        .map(|item| item.label().chars().count() + 6)
+        .map(|item| 1 + left_col_width + 1 + switch_width + 1 + item.right_label().chars().count() + 2)
         .chain(std::iter::once(hint_len + 2))
         .max()
         .unwrap_or(20) as u16;
-    let width = width.min(frame.area().width);
-    let height = (SettingItem::ALL.len() as u16 + 3).min(frame.area().height);
+    // +2 for a 1-column/1-row padding between the border and the content,
+    // on top of the border itself.
+    let width = (width + 2).min(frame.area().width);
+    let height = (SettingItem::ALL.len() as u16 + 3 + 2).min(frame.area().height);
 
     let area = Rect {
         x: (frame.area().width.saturating_sub(width)) / 2,
@@ -416,7 +438,8 @@ fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
         .title("Settings")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+        .style(Style::default().bg(Color::Black).fg(Color::White))
+        .padding(Padding::uniform(1));
 
     frame.render_widget(Clear, area);
     frame.render_widget(List::new(items).block(block), area);

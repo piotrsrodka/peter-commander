@@ -89,6 +89,7 @@ pub enum SettingItem {
     InternalPreview,
     MouseCapture,
     ClassicStyle,
+    StartLeftInCwd,
 }
 
 impl SettingItem {
@@ -98,15 +99,32 @@ impl SettingItem {
         SettingItem::InternalPreview,
         SettingItem::MouseCapture,
         SettingItem::ClassicStyle,
+        SettingItem::StartLeftInCwd,
     ];
 
-    pub fn label(&self) -> &'static str {
+    /// Label shown on the "off" side of the two-way switch (i.e. when
+    /// `App::setting_value` is `false`).
+    pub fn left_label(&self) -> &'static str {
         match self {
-            SettingItem::WaitAfterShellCommand => "Wait for Enter after running commands",
-            SettingItem::HideHiddenFiles => "Hide hidden files/folders",
-            SettingItem::InternalPreview => "F3 View uses the internal quick preview",
-            SettingItem::MouseCapture => "Capture mouse (scroll/click); off leaves it to the terminal",
-            SettingItem::ClassicStyle => "Classic retro Norton Commander colors",
+            SettingItem::WaitAfterShellCommand => "Return immediately",
+            SettingItem::HideHiddenFiles => "Show hidden files",
+            SettingItem::InternalPreview => "External pager (F3)",
+            SettingItem::MouseCapture => "Terminal mouse",
+            SettingItem::ClassicStyle => "Terminal theme colors",
+            SettingItem::StartLeftInCwd => "Restore last session",
+        }
+    }
+
+    /// Label shown on the "on" side of the two-way switch (i.e. when
+    /// `App::setting_value` is `true`).
+    pub fn right_label(&self) -> &'static str {
+        match self {
+            SettingItem::WaitAfterShellCommand => "Wait for Enter",
+            SettingItem::HideHiddenFiles => "Hide hidden files",
+            SettingItem::InternalPreview => "Built-in preview",
+            SettingItem::MouseCapture => "App mouse clicks",
+            SettingItem::ClassicStyle => "Classic NC colors",
+            SettingItem::StartLeftInCwd => "Start in launch dir",
         }
     }
 
@@ -119,6 +137,7 @@ impl SettingItem {
             SettingItem::InternalPreview => "internal_preview",
             SettingItem::MouseCapture => "mouse_capture",
             SettingItem::ClassicStyle => "classic_style",
+            SettingItem::StartLeftInCwd => "start_left_in_cwd",
         }
     }
 }
@@ -191,6 +210,11 @@ pub struct App {
     /// palette (blue background, cyan/white text) instead of following
     /// the terminal's own theme.
     pub classic_style: bool,
+    /// Whether the left pane starts each new run in the directory `pc` was
+    /// launched from, instead of restoring where it was left last session
+    /// (the right pane always restores its last session directory either
+    /// way). Only takes effect on the next launch, not live.
+    pub start_left_in_cwd: bool,
     /// Height (in text rows) of the preview pane in the last drawn frame,
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
@@ -236,11 +260,16 @@ pub struct App {
 impl App {
     pub fn new() -> Result<Self> {
         let cwd = env::current_dir()?;
+        let saved_settings = state::load_settings();
+        let start_left_in_cwd = saved_settings
+            .get(SettingItem::StartLeftInCwd.key())
+            .copied()
+            .unwrap_or(true);
         let (left_dir, right_dir) = match state::load() {
+            Some(last) if start_left_in_cwd => (cwd.clone(), last.right),
             Some(last) => (last.left, last.right),
             None => (cwd.clone(), cwd),
         };
-        let saved_settings = state::load_settings();
         let wait_after_shell_command = saved_settings
             .get(SettingItem::WaitAfterShellCommand.key())
             .copied()
@@ -285,6 +314,7 @@ impl App {
             internal_preview,
             mouse_capture,
             classic_style,
+            start_left_in_cwd,
             preview_visible_lines: 0,
             preview_visible_width: 0,
             pane_visible_lines: 0,
@@ -621,6 +651,7 @@ impl App {
             SettingItem::InternalPreview => self.internal_preview,
             SettingItem::MouseCapture => self.mouse_capture,
             SettingItem::ClassicStyle => self.classic_style,
+            SettingItem::StartLeftInCwd => self.start_left_in_cwd,
         }
     }
 
@@ -629,6 +660,7 @@ impl App {
             SettingItem::WaitAfterShellCommand => self.wait_after_shell_command = value,
             SettingItem::MouseCapture => self.mouse_capture = value,
             SettingItem::ClassicStyle => self.classic_style = value,
+            SettingItem::StartLeftInCwd => self.start_left_in_cwd = value,
             SettingItem::HideHiddenFiles => {
                 self.left.hide_hidden = value;
                 self.right.hide_hidden = value;
@@ -667,13 +699,28 @@ impl App {
         }
     }
 
-    /// Toggles the selected checkbox in memory only — not persisted until
+    /// Toggles the selected switch in memory only — not persisted until
     /// `settings_save`, so `settings_cancel` can still revert it.
     pub fn settings_toggle_selected(&mut self) {
         if let Dialog::Settings { selected, .. } = &self.dialog {
             let item = SettingItem::ALL[*selected];
             let value = self.setting_value(item);
             self.set_setting_value(item, !value);
+        }
+    }
+
+    /// Left/Right arrows: snap the selected switch to its left (`false`) or
+    /// right (`true`) side directly, rather than toggling — pressing the
+    /// arrow for the side that's already active is a no-op.
+    pub fn settings_select_left(&mut self) {
+        if let Dialog::Settings { selected, .. } = &self.dialog {
+            self.set_setting_value(SettingItem::ALL[*selected], false);
+        }
+    }
+
+    pub fn settings_select_right(&mut self) {
+        if let Dialog::Settings { selected, .. } = &self.dialog {
+            self.set_setting_value(SettingItem::ALL[*selected], true);
         }
     }
 

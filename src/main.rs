@@ -488,6 +488,8 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             KeyCode::Up => app.settings_move_up(),
             KeyCode::Down => app.settings_move_down(),
             KeyCode::Char(' ') => app.settings_toggle_selected(),
+            KeyCode::Left => app.settings_select_left(),
+            KeyCode::Right => app.settings_select_right(),
             KeyCode::Enter => app.settings_save(),
             KeyCode::Esc | KeyCode::F(9) => app.settings_cancel(),
             _ => {}
