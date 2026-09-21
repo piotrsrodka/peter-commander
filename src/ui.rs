@@ -270,6 +270,8 @@ const HELP_PAGE_1: &[&str] = &[
     "Alt+F/O/C Menu           Jump to the File/Options/Command menu",
     "Ctrl+O    Terminal       Reveal the terminal/scrollback under panels",
     "Ctrl+Q    Quit           Same as F10, in case your terminal eats F10",
+    "Ctrl+L    Show Logs      Same as F9 > Command > Show Logs",
+    "Ctrl+S    Settings       Same as F9 > Options > Settings",
     "",
     "Tab       Switch the active pane",
     "Up/Down   Move the selection",

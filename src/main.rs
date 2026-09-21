@@ -605,6 +605,12 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.request_reveal_terminal();
         }
+        KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.run_action(Action::ShowLogs)?;
+        }
+        KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.run_action(Action::Settings)?;
+        }
         // Some terminals (e.g. GNOME/ptyxis) intercept F10 for their own
         // menu and never forward it to us, leaving F10-only Quit
         // unreachable there. Ctrl+Q is a widely recognized "quit" shortcut

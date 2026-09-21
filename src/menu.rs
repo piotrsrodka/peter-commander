@@ -44,6 +44,8 @@ impl Action {
             Action::Open => Some("Enter"),
             Action::NewFile => Some("Shift+F4"),
             Action::ShowTerminal => Some("Ctrl+O"),
+            Action::ShowLogs => Some("Ctrl+L"),
+            Action::Settings => Some("Ctrl+S"),
             other => FN_KEYS
                 .iter()
                 .find(|fn_key| fn_key.action == Some(*other))
