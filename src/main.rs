@@ -227,11 +227,23 @@ fn run_shell_command(
 
     restore_terminal();
     println!("$ {command}");
-    let status = Command::new(&shell)
-        .arg(shell_flag)
-        .arg(command)
-        .current_dir(cwd)
-        .status();
+    let mut cmd = Command::new(&shell);
+    cmd.arg(shell_flag);
+    #[cfg(windows)]
+    {
+        // cmd.exe parses its own quotes out of the raw command line, so the
+        // quotes app.rs puts around an executable name must reach it
+        // untouched. `.arg()` would otherwise backslash-escape them for
+        // CreateProcess, leaving cmd.exe looking at `\"name\"` and failing
+        // to find the program.
+        use std::os::windows::process::CommandExt;
+        cmd.raw_arg(command);
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.arg(command);
+    }
+    let status = cmd.current_dir(cwd).status();
 
     if wait {
         match &status {
