@@ -11,7 +11,7 @@ Should work on any Linux, macOS, or Windows.
 Also comes with an optional classic retro Norton Commander color scheme
 (Options > Settings):
 
-![Peter Commander in classic Norton Commander colors](docs/classic.png)
+![Peter Commander in classic Norton Commander colors](docs/nc.jpeg)
 
 ## Features
 
