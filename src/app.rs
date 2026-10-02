@@ -1010,9 +1010,13 @@ impl App {
                 match src.parent() {
                     Some(parent) => {
                         let dest = parent.join(&new_name);
-                        match fs_ops::move_path(&src, &dest) {
-                            Ok(()) => self.set_status(format!("Renamed to {new_name}")),
-                            Err(err) => self.set_error(format!("Rename failed: {err}")),
+                        if fs_ops::rename_target_taken(&src, &dest) {
+                            self.set_error(format!("Rename failed: \"{new_name}\" already exists"));
+                        } else {
+                            match fs_ops::move_path(&src, &dest) {
+                                Ok(()) => self.set_status(format!("Renamed to {new_name}")),
+                                Err(err) => self.set_error(format!("Rename failed: {err}")),
+                            }
                         }
                     }
                     None => self.set_error("Cannot rename: no parent directory".to_string()),
@@ -1037,8 +1041,13 @@ impl App {
                         Ok(()) => self.set_status(format!("Created directory {name}")),
                         Err(err) => self.set_error(format!("MkDir failed: {err}")),
                     },
-                    TextInputKind::NewFile => match std::fs::File::create(&target) {
+                    // create_new, not create: File::create truncates an
+                    // existing file of that name to zero bytes.
+                    TextInputKind::NewFile => match std::fs::File::create_new(&target) {
                         Ok(_) => self.set_status(format!("Created file {name}")),
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            self.set_error(format!("New file failed: \"{name}\" already exists"))
+                        }
                         Err(err) => self.set_error(format!("New file failed: {err}")),
                     },
                 }

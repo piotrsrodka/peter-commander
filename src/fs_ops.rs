@@ -34,6 +34,31 @@ pub fn is_same_path(a: &Path, b: &Path) -> bool {
     matches!((resolve_parent(a), resolve_parent(b)), (Some(a), Some(b)) if a == b)
 }
 
+/// Whether renaming `src` to `dest` would replace some *other* entry.
+/// `fs::rename` silently overwrites an existing file, so Rename has to ask
+/// first. On case-insensitive filesystems (macOS, Windows) `readme` →
+/// `README` finds `dest` "existing" because it's `src` itself; comparing
+/// file identity keeps that case-only rename allowed.
+pub fn rename_target_taken(src: &Path, dest: &Path) -> bool {
+    fs::symlink_metadata(dest).is_ok() && !is_same_file(src, dest)
+}
+
+#[cfg(unix)]
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    // No stable file-id API on Windows; canonicalize returns the on-disk
+    // spelling, so two spellings of one file compare equal.
+    matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
+
 /// Canonicalizes everything but the last component, so a symlink is
 /// compared as the link itself rather than its target, and a destination
 /// that doesn't exist yet can still be compared.
@@ -62,6 +87,12 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
         // own modified time.
         preserve_modified(&meta, dest);
     } else {
+        // fs::copy on a named pipe or device reads until a writer shows up
+        // or the device runs dry, which can be never; refuse instead of
+        // freezing the UI.
+        if !meta.is_file() && !meta.file_type().is_symlink() {
+            bail!("Cannot copy a special file (pipe, socket or device)");
+        }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -437,6 +468,65 @@ mod tests {
 
         assert!(is_same_path(&dir.join("a.txt"), &dir.join("sub/../a.txt")));
         assert!(!is_same_path(&dir.join("a.txt"), &dir.join("sub/a.txt")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rename_target_taken_only_for_another_existing_entry() {
+        let dir = std::env::temp_dir().join("pc_test_rename_target_taken");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "draft").unwrap();
+        fs::write(dir.join("b.txt"), "final").unwrap();
+
+        assert!(rename_target_taken(&dir.join("a.txt"), &dir.join("b.txt")));
+        assert!(!rename_target_taken(&dir.join("a.txt"), &dir.join("c.txt")));
+        // Renaming to its own name is not a conflict.
+        assert!(!rename_target_taken(&dir.join("a.txt"), &dir.join("a.txt")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn case_only_rename_is_not_a_conflict() {
+        // On a case-insensitive filesystem (macOS, Windows CI) "README.TXT"
+        // resolves to "readme.txt" itself; on Linux it doesn't exist. Either
+        // way the rename must stay allowed.
+        let dir = std::env::temp_dir().join("pc_test_case_only_rename");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("readme.txt"), "x").unwrap();
+
+        assert!(!rename_target_taken(&dir.join("readme.txt"), &dir.join("README.TXT")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_copy_a_named_pipe() {
+        let dir = std::env::temp_dir().join("pc_test_copy_fifo");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+
+        // Without the guard this blocks forever waiting for a writer.
+        assert!(copy_recursive(&fifo, &dir.join("pipe-copy")).is_err());
+
+        assert!(!dir.join("pipe-copy").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_copy_a_socket() {
+        let dir = std::env::temp_dir().join("pc_test_copy_socket");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        assert!(copy_recursive(&socket, &dir.join("sock-copy")).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

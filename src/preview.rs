@@ -73,6 +73,18 @@ pub fn build_preview(pane: &Pane) -> PreviewContent {
         };
     }
 
+    // Opening a named pipe blocks until something writes to it (and reading
+    // a device can block or never end), which froze the whole UI; only
+    // regular files get read.
+    match fs::metadata(&path) {
+        Ok(meta) if !meta.is_file() => {
+            return PreviewContent::Error(
+                "Special file (pipe, socket or device): not previewed".to_string(),
+            );
+        }
+        Ok(_) => {}
+        Err(err) => return PreviewContent::Error(err.to_string()),
+    }
     let mut file = match File::open(&path) {
         Ok(file) => file,
         Err(err) => return PreviewContent::Error(err.to_string()),
@@ -127,4 +139,43 @@ fn list_dir(path: &Path, hide_hidden: bool) -> std::io::Result<Vec<DirEntryPrevi
             .map(|name| DirEntryPreview { name, is_dir: false }),
     );
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn named_pipe_is_not_read_for_preview() {
+        let base = std::env::temp_dir().join("pc_test_preview_fifo");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("pipe"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        let mut pane = Pane::new(base.clone(), false).unwrap();
+        pane.selected = pane.entries.iter().position(|e| e.name == "pipe").unwrap();
+
+        // Without the guard File::open blocks forever waiting for a writer.
+        assert!(matches!(build_preview(&pane), PreviewContent::Error(_)));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn regular_file_is_still_previewed_as_text() {
+        let base = std::env::temp_dir().join("pc_test_preview_text");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("a.txt"), "hello\nworld\n").unwrap();
+
+        let mut pane = Pane::new(base.clone(), false).unwrap();
+        pane.selected = pane.entries.iter().position(|e| e.name == "a.txt").unwrap();
+
+        assert!(matches!(build_preview(&pane), PreviewContent::Text(lines) if lines[0] == "hello"));
+        fs::remove_dir_all(&base).unwrap();
+    }
 }
