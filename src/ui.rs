@@ -130,6 +130,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.dialog_cancel_focused,
             );
         }
+        Dialog::ConfirmOverwrite {
+            items, conflicts, ..
+        } => {
+            let dest_dir = &app.inactive_pane_ref().cwd;
+            let comparison = match conflicts.as_slice() {
+                [name] => items
+                    .iter()
+                    .find(|(item, _)| item == name)
+                    .and_then(|(_, src)| entry_summary(src).zip(entry_summary(&dest_dir.join(name)))),
+                _ => None,
+            };
+            draw_overwrite_dialog(
+                frame,
+                app.classic_style,
+                conflicts,
+                &dest_dir.display().to_string(),
+                comparison,
+                app.dialog_cancel_focused,
+            );
+        }
         Dialog::TextInput { kind, input } => {
             draw_input_dialog(
                 frame,
@@ -612,6 +632,104 @@ fn draw_confirm_dialog(
     )]);
 
     draw_dialog_frame(frame, classic_style, verb, sections, true);
+}
+
+/// Size and modified time of one side of an overwrite, as the listing shows
+/// them.
+struct EntrySummary {
+    size: String,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn entry_summary(path: &std::path::Path) -> Option<EntrySummary> {
+    let meta = std::fs::metadata(path)
+        .or_else(|_| std::fs::symlink_metadata(path))
+        .ok()?;
+    let size = if meta.is_dir() {
+        "<DIR>".to_string()
+    } else {
+        format_size(meta.len())
+    };
+    Some(EntrySummary {
+        size,
+        modified: meta.modified().ok(),
+    })
+}
+
+/// How many conflicting names an overwrite prompt lists before summing up
+/// the rest, so a big batch doesn't grow the dialog past the screen.
+const OVERWRITE_LIST_LIMIT: usize = 3;
+
+/// Copy/Move onto items that already exist: names what's in the way and,
+/// for a single item, puts both versions' size and date side by side with
+/// the newer one marked, so it's clear what would be replaced.
+fn draw_overwrite_dialog(
+    frame: &mut Frame,
+    classic_style: bool,
+    conflicts: &[String],
+    destination: &str,
+    comparison: Option<(EntrySummary, EntrySummary)>,
+    cancel_focused: bool,
+) {
+    let pal = dialog_palette(classic_style);
+    let text = |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
+
+    let message = match conflicts {
+        [name] => format!("\"{name}\" already exists in"),
+        _ => format!("{} items already exist in", conflicts.len()),
+    };
+    let mut sections = vec![
+        vec![text(message)],
+        vec![DialogLine::Field {
+            content: vec![Span::styled(
+                destination.to_string(),
+                Style::default().bg(pal.field_bg).fg(pal.field_fg),
+            )],
+            fill_bg: pal.field_bg,
+        }],
+    ];
+
+    let details = match comparison {
+        Some((new, existing)) => {
+            let is_newer = |a: &EntrySummary, b: &EntrySummary| {
+                matches!((a.modified, b.modified), (Some(a), Some(b)) if a > b)
+            };
+            let row = |label: &str, entry: &EntrySummary, newer: bool| {
+                text(format!(
+                    "{label} {:>12}  {}{}",
+                    entry.size,
+                    format_modified(entry.modified),
+                    if newer { "  (newer)" } else { "" }
+                ))
+            };
+            vec![
+                row("New:     ", &new, is_newer(&new, &existing)),
+                row("Existing:", &existing, is_newer(&existing, &new)),
+            ]
+        }
+        None => {
+            let mut lines: Vec<DialogLine> = conflicts
+                .iter()
+                .take(OVERWRITE_LIST_LIMIT)
+                .map(|name| text(name.clone()))
+                .collect();
+            if conflicts.len() > OVERWRITE_LIST_LIMIT {
+                lines.push(text(format!(
+                    "…and {} more",
+                    conflicts.len() - OVERWRITE_LIST_LIMIT
+                )));
+            }
+            lines
+        }
+    };
+    sections.push(details);
+
+    sections.push(vec![button_row(
+        &[("Overwrite", !cancel_focused), ("Cancel", cancel_focused)],
+        &pal,
+    )]);
+
+    draw_dialog_frame(frame, classic_style, "Overwrite", sections, true);
 }
 
 fn draw_quit_dialog(frame: &mut Frame, classic_style: bool, cancel_focused: bool) {

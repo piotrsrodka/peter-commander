@@ -27,6 +27,13 @@ fn ensure_not_into_itself(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether two paths name the same entry (comparing a symlink as the link
+/// itself), so callers can tell "copy onto itself" apart from "a different
+/// file is already there".
+pub fn is_same_path(a: &Path, b: &Path) -> bool {
+    matches!((resolve_parent(a), resolve_parent(b)), (Some(a), Some(b)) if a == b)
+}
+
 /// Canonicalizes everything but the last component, so a symlink is
 /// compared as the link itself rather than its target, and a destination
 /// that doesn't exist yet can still be compared.
@@ -51,6 +58,9 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
             let child_dest = dest.join(entry.file_name());
             copy_tree(&entry.path(), &child_dest)?;
         }
+        // After the children, since creating them bumps the directory's
+        // own modified time.
+        preserve_modified(&meta, dest);
     } else {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -59,9 +69,40 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
             copy_symlink(src, dest)?;
         } else {
             fs::copy(src, dest)?;
+            preserve_modified(&meta, dest);
         }
     }
     Ok(())
+}
+
+/// `fs::copy` keeps permissions but stamps the copy with the current time;
+/// carry the source's modified time over instead, like Norton Commander and
+/// `cp -p`, so "which one is newer" still means something after a copy.
+/// Best effort: a filesystem that refuses it shouldn't fail the copy.
+fn preserve_modified(src_meta: &fs::Metadata, dest: &Path) {
+    if let Ok(modified) = src_meta.modified() {
+        let _ = open_for_times(dest).and_then(|file| file.set_modified(modified));
+    }
+}
+
+/// Unix sets times through any handle the owner holds, so a read-only open
+/// works even on a read-only copy. Windows needs explicit write-attributes
+/// access instead (which a read-only file still grants), plus backup
+/// semantics to open a directory at all.
+#[cfg(not(windows))]
+fn open_for_times(path: &Path) -> std::io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+#[cfg(windows)]
+fn open_for_times(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 #[cfg(unix)]
@@ -318,6 +359,82 @@ mod tests {
         copy_recursive(&link, &target.join("link")).unwrap();
 
         assert!(fs::symlink_metadata(target.join("link")).unwrap().file_type().is_symlink());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn set_mtime(path: &Path, secs_ago: u64) -> std::time::SystemTime {
+        let time = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        // Whole seconds, so filesystems with coarse timestamps compare equal.
+        let secs = time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        fs::File::open(path).unwrap().set_modified(time).unwrap();
+        time
+    }
+
+    fn mtime(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn copy_keeps_file_modified_time() {
+        let dir = std::env::temp_dir().join("pc_test_copy_keeps_mtime");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("old.txt");
+        fs::write(&src, "x").unwrap();
+        let original = set_mtime(&src, 30 * 24 * 3600);
+        let dest = dir.join("copy.txt");
+
+        copy_recursive(&src, &dest).unwrap();
+
+        assert_eq!(mtime(&dest), original);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_keeps_directory_modified_time() {
+        let dir = std::env::temp_dir().join("pc_test_copy_keeps_dir_mtime");
+        let _ = fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f.txt"), "x").unwrap();
+        let original = set_mtime(&src, 7 * 24 * 3600);
+        let dest = dir.join("dest");
+
+        copy_recursive(&src, &dest).unwrap();
+
+        assert_eq!(mtime(&dest), original);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_keeps_modified_time_of_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("pc_test_copy_keeps_readonly_mtime");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("ro.txt");
+        fs::write(&src, "x").unwrap();
+        let original = set_mtime(&src, 3600);
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+        let dest = dir.join("ro-copy.txt");
+
+        copy_recursive(&src, &dest).unwrap();
+
+        assert_eq!(mtime(&dest), original);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn same_path_detects_identical_and_distinct_entries() {
+        let dir = std::env::temp_dir().join("pc_test_is_same_path");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), "x").unwrap();
+
+        assert!(is_same_path(&dir.join("a.txt"), &dir.join("sub/../a.txt")));
+        assert!(!is_same_path(&dir.join("a.txt"), &dir.join("sub/a.txt")));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

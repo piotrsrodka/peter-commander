@@ -74,6 +74,15 @@ pub enum Dialog {
         /// every marked item when the active pane has tags.
         items: Vec<(String, PathBuf)>,
     },
+    /// Shown after a Copy/Move confirm when some items already exist in the
+    /// destination, so nothing is replaced without being asked. Carries the
+    /// whole batch so Overwrite can run it unchanged.
+    ConfirmOverwrite {
+        kind: DialogKind,
+        items: Vec<(String, PathBuf)>,
+        /// Names from `items` whose destination already exists.
+        conflicts: Vec<String>,
+    },
     TextInput {
         kind: TextInputKind,
         input: String,
@@ -968,62 +977,27 @@ impl App {
             Dialog::Confirm { kind, items } => {
                 let kind = *kind;
                 let items = items.clone();
-                let src_dir = self.active_pane_ref().cwd.clone();
-                let dest_dir = self.inactive_pane().cwd.clone();
-
-                let mut done = 0usize;
-                let mut errors: Vec<String> = Vec::new();
-                for (name, src) in &items {
-                    let result = match kind {
-                        DialogKind::Delete => fs_ops::delete_recursive(src),
-                        DialogKind::Copy => fs_ops::copy_recursive(src, &dest_dir.join(name)),
-                        DialogKind::Move => fs_ops::move_path(src, &dest_dir.join(name)),
-                    };
-                    match result {
-                        Ok(()) => done += 1,
-                        Err(err) => errors.push(format!("{name}: {err}")),
+                if kind != DialogKind::Delete {
+                    let dest_dir = self.inactive_pane_ref().cwd.clone();
+                    let conflicts = existing_destinations(&items, &dest_dir);
+                    if !conflicts.is_empty() {
+                        self.dialog = Dialog::ConfirmOverwrite {
+                            kind,
+                            items,
+                            conflicts,
+                        };
+                        // Replacing files is destructive, so like Delete
+                        // this defaults to "no".
+                        self.dialog_cancel_focused = true;
+                        return Ok(());
                     }
                 }
-
-                let verb_done = match kind {
-                    DialogKind::Delete => "Deleted",
-                    DialogKind::Copy => "Copied",
-                    DialogKind::Move => "Moved",
-                };
-                if errors.is_empty() {
-                    // A single item logs its full from/to paths (as
-                    // before); a batch would make that unreadably long, so
-                    // it logs a count plus the shared source/destination
-                    // directories instead of nothing at all.
-                    let message = match (kind, items.as_slice()) {
-                        (DialogKind::Delete, [(name, _)]) => format!("Deleted {name}"),
-                        (DialogKind::Delete, _) => {
-                            format!("Deleted {done} items from {}", src_dir.display())
-                        }
-                        (_, [(name, src)]) => {
-                            format!("{verb_done} {} to {}", src.display(), dest_dir.join(name).display())
-                        }
-                        (_, _) => format!(
-                            "{verb_done} {done} items from {} to {}",
-                            src_dir.display(),
-                            dest_dir.display()
-                        ),
-                    };
-                    self.set_status(message);
-                } else {
-                    self.set_error(format!(
-                        "{} failed for {} of {} item(s): {}",
-                        kind.verb(),
-                        errors.len(),
-                        items.len(),
-                        errors.join("; ")
-                    ));
-                }
-
-                self.active_pane().clear_marks();
-                self.dialog = Dialog::None;
-                self.left.reload()?;
-                self.right.reload()?;
+                self.run_file_operation(kind, items)?;
+            }
+            Dialog::ConfirmOverwrite { kind, items, .. } => {
+                let kind = *kind;
+                let items = items.clone();
+                self.run_file_operation(kind, items)?;
             }
             Dialog::Rename { input, src } => {
                 let new_name = input.clone();
@@ -1079,6 +1053,68 @@ impl App {
             }
             Dialog::Settings { .. } | Dialog::None => {}
         }
+        Ok(())
+    }
+
+    /// Runs a confirmed Copy/Move/Delete over every item and reports the
+    /// outcome; shared by the plain confirm and the overwrite prompt.
+    fn run_file_operation(&mut self, kind: DialogKind, items: Vec<(String, PathBuf)>) -> Result<()> {
+        let src_dir = self.active_pane_ref().cwd.clone();
+        let dest_dir = self.inactive_pane().cwd.clone();
+
+        let mut done = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for (name, src) in &items {
+            let result = match kind {
+                DialogKind::Delete => fs_ops::delete_recursive(src),
+                DialogKind::Copy => fs_ops::copy_recursive(src, &dest_dir.join(name)),
+                DialogKind::Move => fs_ops::move_path(src, &dest_dir.join(name)),
+            };
+            match result {
+                Ok(()) => done += 1,
+                Err(err) => errors.push(format!("{name}: {err}")),
+            }
+        }
+
+        let verb_done = match kind {
+            DialogKind::Delete => "Deleted",
+            DialogKind::Copy => "Copied",
+            DialogKind::Move => "Moved",
+        };
+        if errors.is_empty() {
+            // A single item logs its full from/to paths (as
+            // before); a batch would make that unreadably long, so
+            // it logs a count plus the shared source/destination
+            // directories instead of nothing at all.
+            let message = match (kind, items.as_slice()) {
+                (DialogKind::Delete, [(name, _)]) => format!("Deleted {name}"),
+                (DialogKind::Delete, _) => {
+                    format!("Deleted {done} items from {}", src_dir.display())
+                }
+                (_, [(name, src)]) => {
+                    format!("{verb_done} {} to {}", src.display(), dest_dir.join(name).display())
+                }
+                (_, _) => format!(
+                    "{verb_done} {done} items from {} to {}",
+                    src_dir.display(),
+                    dest_dir.display()
+                ),
+            };
+            self.set_status(message);
+        } else {
+            self.set_error(format!(
+                "{} failed for {} of {} item(s): {}",
+                kind.verb(),
+                errors.len(),
+                items.len(),
+                errors.join("; ")
+            ));
+        }
+
+        self.active_pane().clear_marks();
+        self.dialog = Dialog::None;
+        self.left.reload()?;
+        self.right.reload()?;
         Ok(())
     }
 
@@ -1211,9 +1247,55 @@ fn parse_cd_argument(command: &str) -> Option<PathBuf> {
     Some(PathBuf::from(arg))
 }
 
+/// Names of the items whose Copy/Move target in `dest_dir` already exists.
+/// An item that *is* its own target (both panes in the same directory) is
+/// left out: that isn't an overwrite, and `fs_ops` refuses it with its own
+/// message.
+fn existing_destinations(items: &[(String, PathBuf)], dest_dir: &Path) -> Vec<String> {
+    items
+        .iter()
+        .filter(|(name, src)| {
+            let dest = dest_dir.join(name);
+            std::fs::symlink_metadata(&dest).is_ok() && !fs_ops::is_same_path(src, &dest)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_only_items_whose_destination_exists() {
+        let dir = std::env::temp_dir().join("pc_test_existing_destinations");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("dest")).unwrap();
+        for name in ["new.txt", "both.txt"] {
+            std::fs::write(dir.join("src").join(name), "src").unwrap();
+        }
+        std::fs::write(dir.join("dest/both.txt"), "dest").unwrap();
+        let items: Vec<(String, PathBuf)> = ["new.txt", "both.txt"]
+            .iter()
+            .map(|name| (name.to_string(), dir.join("src").join(name)))
+            .collect();
+
+        assert_eq!(existing_destinations(&items, &dir.join("dest")), vec!["both.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copying_onto_itself_is_not_an_overwrite_conflict() {
+        let dir = std::env::temp_dir().join("pc_test_existing_destinations_same");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let items = vec![("a.txt".to_string(), dir.join("a.txt"))];
+
+        assert!(existing_destinations(&items, &dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn parses_bare_cd_as_home() {
