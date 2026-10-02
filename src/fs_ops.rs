@@ -367,7 +367,9 @@ mod tests {
         // Whole seconds, so filesystems with coarse timestamps compare equal.
         let secs = time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-        fs::File::open(path).unwrap().set_modified(time).unwrap();
+        // Same opener as the code under test: a plain File::open can't set
+        // times on Windows, or open a directory there at all.
+        open_for_times(path).unwrap().set_modified(time).unwrap();
         time
     }
 
