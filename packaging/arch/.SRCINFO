@@ -1,6 +1,6 @@
 pkgbase = peter-commander
 	pkgdesc = A dual-pane terminal file manager
-	pkgver = 0.7.0
+	pkgver = 0.8.0
 	pkgrel = 1
 	url = https://github.com/piotrsrodka/peter-commander
 	arch = x86_64
@@ -8,7 +8,7 @@ pkgbase = peter-commander
 	license = MIT
 	makedepends = cargo
 	depends = gcc-libs
-	source = peter-commander-0.7.0.tar.gz::https://github.com/piotrsrodka/peter-commander/archive/refs/tags/v0.7.0.tar.gz
-	sha256sums = fa89a82724c150aa9ef3da0ad51388168009eb2e118c88daf538100e2b9cb27e
+	source = peter-commander-0.8.0.tar.gz::https://github.com/piotrsrodka/peter-commander/archive/refs/tags/v0.8.0.tar.gz
+	sha256sums = dd9b96fc01950c53a6fac4ee891f0a84f7cbeb320e2eaf5108ea1302975529d3
 
 pkgname = peter-commander
