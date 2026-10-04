@@ -59,6 +59,56 @@ pub struct Entry {
     pub is_executable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Extension,
+    Size,
+    Modified,
+}
+
+impl SortKey {
+    /// Size and date read most usefully biggest/newest first (as in Norton
+    /// and Total Commander); name and extension A→Z.
+    fn descending_by_default(self) -> bool {
+        matches!(self, SortKey::Size | SortKey::Modified)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "Name",
+            SortKey::Extension => "Ext",
+            SortKey::Size => "Size",
+            SortKey::Modified => "Date",
+        }
+    }
+}
+
+fn extension_of(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// Only the sort key itself is flipped by `descending`; ties always fall
+/// back to A→Z by name, so e.g. directories (all "equal" under a size sort)
+/// stay alphabetical whichever way sizes run.
+fn compare_entries(a: &Entry, b: &Entry, key: SortKey, descending: bool) -> std::cmp::Ordering {
+    let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+    let primary = match key {
+        SortKey::Name => by_name(),
+        SortKey::Extension => extension_of(&a.name).cmp(&extension_of(&b.name)),
+        // A directory's own metadata length isn't its content size, so
+        // directories stay alphabetical under a size sort.
+        SortKey::Size if a.is_dir && b.is_dir => std::cmp::Ordering::Equal,
+        SortKey::Size => a.size.cmp(&b.size),
+        SortKey::Modified => a.modified.cmp(&b.modified),
+    };
+    let primary = if descending { primary.reverse() } else { primary };
+    primary.then_with(by_name)
+}
+
 #[derive(Debug)]
 pub struct Pane {
     pub cwd: PathBuf,
@@ -71,6 +121,10 @@ pub struct Pane {
     /// F6/F8 act on this whole set when it's non-empty, instead of just the
     /// entry under the cursor. Never contains "..".
     pub marked: HashSet<String>,
+    pub sort_key: SortKey,
+    /// Flips `sort_key`'s natural direction (see
+    /// `SortKey::descending_by_default`).
+    pub sort_reversed: bool,
 }
 
 impl Pane {
@@ -81,6 +135,8 @@ impl Pane {
             selected: 0,
             hide_hidden,
             marked: HashSet::new(),
+            sort_key: SortKey::Name,
+            sort_reversed: false,
         };
         pane.reload()?;
         Ok(pane)
@@ -134,8 +190,10 @@ impl Pane {
                 files.push(item);
             }
         }
-        dirs.sort_by_key(|a| a.name.to_lowercase());
-        files.sort_by_key(|a| a.name.to_lowercase());
+        let key = self.sort_key;
+        let descending = key.descending_by_default() != self.sort_reversed;
+        dirs.sort_by(|a, b| compare_entries(a, b, key, descending));
+        files.sort_by(|a, b| compare_entries(a, b, key, descending));
 
         entries.extend(dirs);
         entries.extend(files);
@@ -149,6 +207,65 @@ impl Pane {
             self.marked.retain(|m| names.contains(m.as_str()));
         }
         Ok(())
+    }
+
+    /// Command > Sort by ...: picking the key already in use flips its
+    /// direction instead, as in Midnight Commander. The cursor stays on the
+    /// same entry rather than the same row.
+    pub fn set_sort(&mut self, key: SortKey) -> Result<()> {
+        if self.sort_key == key {
+            self.sort_reversed = !self.sort_reversed;
+        } else {
+            self.sort_key = key;
+            self.sort_reversed = false;
+        }
+        let selected_name = self.selected_entry().map(|e| e.name.clone());
+        self.reload()?;
+        if let Some(name) = selected_name {
+            self.select_name(&name);
+        }
+        Ok(())
+    }
+
+    /// Moves the cursor onto the entry called `name`, if it's listed.
+    pub fn select_name(&mut self, name: &str) {
+        if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
+            self.selected = idx;
+        }
+    }
+
+    /// Whether the listing is sorted some other way than plain A→Z, so the
+    /// pane title can say how.
+    pub fn sort_indicator(&self) -> Option<String> {
+        if self.sort_key == SortKey::Name && !self.sort_reversed {
+            return None;
+        }
+        let descending = self.sort_key.descending_by_default() != self.sort_reversed;
+        let arrow = if descending { '\u{2193}' } else { '\u{2191}' };
+        Some(format!("{}{arrow}", self.sort_key.label()))
+    }
+
+    /// Quick search: the first entry at or after `start` (wrapping around,
+    /// or going backwards with `forward == false`) whose name contains
+    /// `query`, ignoring case. ".." never matches.
+    pub fn find_match(&self, query: &str, start: usize, forward: bool) -> Option<usize> {
+        let len = self.entries.len();
+        if len == 0 || query.is_empty() {
+            return None;
+        }
+        let query = query.to_lowercase();
+        (0..len)
+            .map(|step| {
+                if forward {
+                    (start + step) % len
+                } else {
+                    (start + len - step % len) % len
+                }
+            })
+            .find(|&idx| {
+                let name = &self.entries[idx].name;
+                name != ".." && name.to_lowercase().contains(&query)
+            })
     }
 
     pub fn selected_entry(&self) -> Option<&Entry> {
@@ -635,5 +752,62 @@ mod tests {
         );
 
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn sort_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("zdir")).unwrap();
+        fs::create_dir_all(dir.join("adir")).unwrap();
+        fs::write(dir.join("b.txt"), "12345").unwrap();
+        fs::write(dir.join("a.rs"), "1").unwrap();
+        fs::write(dir.join("c.md"), "123").unwrap();
+        dir
+    }
+
+    fn names(pane: &Pane) -> Vec<&str> {
+        pane.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn sorts_by_size_biggest_first_and_flips_when_picked_again() {
+        let dir = sort_test_dir("pc_test_sort_size");
+        let mut pane = Pane::new(dir.clone(), false).unwrap();
+        pane.select_name("c.md");
+
+        pane.set_sort(SortKey::Size).unwrap();
+        assert_eq!(names(&pane), ["..", "adir", "zdir", "b.txt", "c.md", "a.rs"]);
+        assert_eq!(pane.selected_entry().unwrap().name, "c.md");
+        assert_eq!(pane.sort_indicator().as_deref(), Some("Size\u{2193}"));
+
+        pane.set_sort(SortKey::Size).unwrap();
+        assert_eq!(names(&pane), ["..", "adir", "zdir", "a.rs", "c.md", "b.txt"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sorts_by_extension_then_name() {
+        let dir = sort_test_dir("pc_test_sort_ext");
+        let mut pane = Pane::new(dir.clone(), false).unwrap();
+        pane.set_sort(SortKey::Extension).unwrap();
+        assert_eq!(names(&pane), ["..", "adir", "zdir", "c.md", "a.rs", "b.txt"]);
+        pane.set_sort(SortKey::Name).unwrap();
+        assert_eq!(names(&pane), ["..", "adir", "zdir", "a.rs", "b.txt", "c.md"]);
+        assert_eq!(pane.sort_indicator(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_match_wraps_skips_dotdot_and_goes_both_ways() {
+        let dir = sort_test_dir("pc_test_find_match");
+        let pane = Pane::new(dir.clone(), false).unwrap();
+        // ["..", "adir", "zdir", "a.rs", "b.txt", "c.md"]
+        assert_eq!(pane.find_match("DIR", 0, true), Some(1));
+        assert_eq!(pane.find_match("dir", 2, true), Some(2));
+        assert_eq!(pane.find_match("dir", 3, true), Some(1));
+        assert_eq!(pane.find_match("dir", 0, false), Some(2));
+        assert_eq!(pane.find_match(".", 0, true), Some(3));
+        assert_eq!(pane.find_match("nope", 0, true), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

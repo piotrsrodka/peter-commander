@@ -17,3 +17,7 @@ dirs = "7.0.0"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 shell-words = "1.1.1"
 signal-hook = "0.4.4"
+trash = "5.2.9"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"

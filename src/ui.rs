@@ -9,6 +9,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{App, Dialog, DialogKind, SettingItem, Side};
+use crate::bulk_rename::Plan;
+use crate::job::Job;
 use crate::logging;
 use crate::menu::{FN_KEYS, MENU_BAR};
 use crate::pane::Pane;
@@ -174,13 +176,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.dialog_cancel_focused,
             );
         }
+        Dialog::ConfirmBulkRename { dir, plan } => {
+            draw_bulk_rename_dialog(
+                frame,
+                app.classic_style,
+                &dir.display().to_string(),
+                plan,
+                app.dialog_cancel_focused,
+            );
+        }
         Dialog::ConfirmQuit => {
-            draw_quit_dialog(frame, app.classic_style, app.dialog_cancel_focused);
+            draw_quit_dialog(
+                frame,
+                app.classic_style,
+                app.job.as_ref(),
+                app.dialog_cancel_focused,
+            );
         }
         Dialog::Settings { selected, .. } => {
             draw_settings_dialog(frame, app, *selected);
         }
         Dialog::None => {}
+    }
+
+    if app.job_visible
+        && let Some(job) = &app.job
+    {
+        draw_job_dialog(frame, app, job);
     }
 
     if app.help_open {
@@ -281,7 +303,8 @@ const HELP_PAGE_1: &[&str] = &[
     "F5        Copy          Copy selection (or marked files) to the other pane",
     "F6        Move          Move selection (or marked files) to the other pane",
     "F7        MkDir         Create a new directory",
-    "F8        Delete        Delete selection or marked files (asks to confirm)",
+    "F8        Delete        Trash (or delete, per Settings) selection/marked files",
+    "Shift+F8  Delete        Permanently delete selection or marked files",
     "F9        Menu          Open the pulldown menu",
     "F10       Quit          Quit PeterCommander (asks to confirm)",
     "",
@@ -311,6 +334,16 @@ const HELP_PAGE_2: &[&str] = &[
     "",
     "F9 > Command > Show Logs shows recent status/error messages —",
     "there's no dedicated status line any more, they're logged instead.",
+    "",
+    "F9 > Command > Quick Search: type to jump to a matching name,",
+    "Up/Down for the previous/next match, Esc or Enter when done.",
+    "F9 > Command > Sort by Name/Extension/Size/Date sorts the active",
+    "pane; picking the same sort again reverses it.",
+    "F9 > File > Bulk Rename edits the marked names in $EDITOR, one per",
+    "line, and asks before renaming (warning about any overwrites).",
+    "",
+    "Copy/Move show a progress window: Esc or [ Background ] lets it",
+    "run while you work; F9 > Command > Background Job shows it again.",
     "",
     "Mouse: scroll the active pane/preview, click the menu bar or an",
     "F-key tile.",
@@ -607,9 +640,11 @@ fn draw_confirm_dialog(
     let pal = dialog_palette(classic_style);
     let verb = kind.verb();
 
-    let message = match destination {
-        Some(_) => format!("{verb} {summary} to"),
-        None => format!("{verb} {summary}?"),
+    let message = match (kind, destination) {
+        (DialogKind::Trash | DialogKind::TrashByCopy, _) => format!("Move {summary} to trash?"),
+        (DialogKind::Delete, _) => format!("Permanently delete {summary}?"),
+        (_, Some(_)) => format!("{verb} {summary} to"),
+        (_, None) => format!("{verb} {summary}?"),
     };
     let mut sections = vec![vec![DialogLine::Text(Line::from(Span::styled(
         message,
@@ -626,8 +661,29 @@ fn draw_confirm_dialog(
         }]);
     }
 
+    let mut primary = verb;
+    if kind == DialogKind::TrashByCopy {
+        primary = "Copy to trash";
+        let warn = |line: &'static str| {
+            DialogLine::Text(Line::from(Span::styled(
+                line,
+                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+            )))
+        };
+        let note = |line: &'static str| {
+            DialogLine::Text(Line::from(Span::styled(line, Style::default().fg(pal.fg))))
+        };
+        sections.push(vec![
+            warn("WARNING: no usable trash on this drive."),
+            note("Everything will be COPIED into your home trash, then"),
+            note("deleted here. Big files take a while; it runs with a"),
+            note("progress window you can send to the background."),
+            note("(Shift+F8 deletes permanently instead.)"),
+        ]);
+    }
+
     sections.push(vec![button_row(
-        &[(verb, !cancel_focused), ("Cancel", cancel_focused)],
+        &[(primary, !cancel_focused), ("Cancel", cancel_focused)],
         &pal,
     )]);
 
@@ -732,19 +788,210 @@ fn draw_overwrite_dialog(
     draw_dialog_frame(frame, classic_style, "Overwrite", sections, true);
 }
 
-fn draw_quit_dialog(frame: &mut Frame, classic_style: bool, cancel_focused: bool) {
+fn draw_quit_dialog(frame: &mut Frame, classic_style: bool, job: Option<&Job>, cancel_focused: bool) {
     let pal = dialog_palette(classic_style);
+    let mut message = vec![DialogLine::Text(Line::from(Span::styled(
+        "Quit PeterCommander?",
+        Style::default().fg(pal.fg),
+    )))];
+    if let Some(job) = job {
+        let warning = if job.kind == DialogKind::TrashByCopy {
+            "A move to trash is running: it will stop after the current item.".to_string()
+        } else {
+            format!("A {} is still running and will be cancelled.", job.kind.verb().to_lowercase())
+        };
+        message.push(DialogLine::Text(Line::from(Span::styled(
+            warning,
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        ))));
+    }
     let sections = vec![
-        vec![DialogLine::Text(Line::from(Span::styled(
-            "Quit PeterCommander?",
-            Style::default().fg(pal.fg),
-        )))],
+        message,
         vec![button_row(
             &[("Quit", !cancel_focused), ("Cancel", cancel_focused)],
             &pal,
         )],
     ];
     draw_dialog_frame(frame, classic_style, "Quit", sections, false);
+}
+
+/// How many `old → new` lines the bulk-rename prompt shows before summing
+/// up the rest.
+const BULK_RENAME_LIST_LIMIT: usize = 5;
+
+/// Bulk Rename confirmation: a sample of the renames and, when some new
+/// names are already taken by files outside the batch, a warning listing
+/// what would be replaced — the primary button then reads "Overwrite".
+fn draw_bulk_rename_dialog(
+    frame: &mut Frame,
+    classic_style: bool,
+    dir: &str,
+    plan: &Plan,
+    cancel_focused: bool,
+) {
+    let pal = dialog_palette(classic_style);
+    let text = |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
+    let bold = |s: String| {
+        DialogLine::Text(Line::from(Span::styled(
+            s,
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        )))
+    };
+    let summarize = |names: Vec<String>, limit: usize| {
+        let total = names.len();
+        let mut lines: Vec<DialogLine> = names.into_iter().take(limit).map(text).collect();
+        if total > limit {
+            lines.push(text(format!("…and {} more", total - limit)));
+        }
+        lines
+    };
+
+    let mut sections = vec![
+        vec![text(format!("Rename {} item(s) in", plan.renames.len()))],
+        vec![DialogLine::Field {
+            content: vec![Span::styled(
+                dir.to_string(),
+                Style::default().bg(pal.field_bg).fg(pal.field_fg),
+            )],
+            fill_bg: pal.field_bg,
+        }],
+        summarize(
+            plan.renames
+                .iter()
+                .map(|(old, new)| format!("{old} \u{2192} {new}"))
+                .collect(),
+            BULK_RENAME_LIST_LIMIT,
+        ),
+    ];
+    if !plan.overwrites.is_empty() {
+        let mut warning = vec![bold(format!(
+            "WARNING: {} existing item(s) will be overwritten:",
+            plan.overwrites.len()
+        ))];
+        warning.extend(summarize(plan.overwrites.clone(), OVERWRITE_LIST_LIMIT));
+        sections.push(warning);
+    }
+    let primary = if plan.overwrites.is_empty() {
+        "Rename"
+    } else {
+        "Overwrite"
+    };
+    sections.push(vec![button_row(
+        &[(primary, !cancel_focused), ("Cancel", cancel_focused)],
+        &pal,
+    )]);
+    draw_dialog_frame(frame, classic_style, "Bulk Rename", sections, true);
+}
+
+/// Width of the progress window's bar, in cells.
+const PROGRESS_BAR_WIDTH: usize = 40;
+
+/// The Copy/Move progress window: which item, which file, a bar with the
+/// percentage and byte counts, and [ Background ] [ Cancel ].
+fn draw_job_dialog(frame: &mut Frame, app: &App, job: &Job) {
+    let classic_style = app.classic_style;
+    let cancel_focused = app.job_cancel_focused;
+    let pal = dialog_palette(classic_style);
+    let text = |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
+    let progress = job.progress();
+    let verb = job.kind.verb();
+    let total_items = job.items.len();
+    let trash = job.kind == DialogKind::TrashByCopy;
+
+    let status = if job.is_cancelling() && trash {
+        // The crate can't be stopped part-way through an item.
+        let then = if app.quit_when_job_done { ", then quitting" } else { "" };
+        format!("Stopping — finishing the current item first{then}…")
+    } else if job.is_cancelling() {
+        "Cancelling…".to_string()
+    } else if progress.scanning {
+        "Counting files…".to_string()
+    } else if trash {
+        format!(
+            "Copying item {} of {total_items} into the trash at",
+            progress.item.max(1)
+        )
+    } else {
+        format!(
+            "{} item {} of {total_items} to",
+            if verb == "Move" { "Moving" } else { "Copying" },
+            progress.item.max(1)
+        )
+    };
+    let elapsed = job.started.elapsed().as_secs();
+    let elapsed = format!("{}:{:02}", elapsed / 60, elapsed % 60);
+    let fraction = job_fraction(&progress);
+    // Floored, so it never claims 100% while anything is left.
+    let filled = (fraction * PROGRESS_BAR_WIDTH as f64) as usize;
+    let bar = format!(
+        "{}{} {:>3}%",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(PROGRESS_BAR_WIDTH - filled),
+        (fraction * 100.0) as u32
+    );
+
+    let sections = vec![
+        vec![text(status)],
+        vec![DialogLine::Field {
+            content: vec![Span::styled(
+                job.dest_dir.display().to_string(),
+                Style::default().bg(pal.field_bg).fg(pal.field_fg),
+            )],
+            fill_bg: pal.field_bg,
+        }],
+        vec![
+            text(fit_name(&progress.current, PROGRESS_BAR_WIDTH + 5).trim_end().to_string()),
+            text(bar),
+            text(format!(
+                "{} of {}   {} of {} files   {elapsed}",
+                human_bytes(progress.bytes_done),
+                human_bytes(progress.bytes_total),
+                progress.files_done,
+                progress.files_total
+            )),
+        ],
+        vec![button_row(
+            &[("Background", !cancel_focused), ("Cancel", cancel_focused)],
+            &pal,
+        )],
+    ];
+    draw_dialog_frame(frame, classic_style, verb, sections, true);
+}
+
+/// How far along a job is, 0.0–1.0: by bytes (an item that can't report
+/// its own progress counting as half done — see `Progress::opaque_bytes`),
+/// falling back to the file count when there are no bytes to speak of
+/// (only empty files/symlinks),
+/// and held just under 100% while any file is still left — so one big file
+/// plus thousands of tiny ones doesn't claim to be done early.
+fn job_fraction(progress: &crate::job::Progress) -> f64 {
+    let ratio = |done: u64, total: u64| (done as f64 / total.max(1) as f64).min(1.0);
+    let fraction = if progress.bytes_total > 0 {
+        ratio(progress.bytes_done + progress.opaque_bytes / 2, progress.bytes_total)
+    } else {
+        ratio(progress.files_done, progress.files_total)
+    };
+    if progress.files_done < progress.files_total {
+        fraction.min(0.99)
+    } else {
+        fraction
+    }
+}
+
+/// Short human-readable size for progress readouts, e.g. "1.5 GB".
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Rename and MkDir/New file: a label line, a highlighted editable-field
@@ -906,6 +1153,31 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
     frame.render_widget(bar, area);
+
+    // A job sent to the background keeps a small readout at the right end
+    // of the menu bar (Command > Background Job brings the window back).
+    if let Some(job) = &app.job
+        && !app.job_visible
+    {
+        let percent = (job_fraction(&job.progress()) * 100.0) as u32;
+        let label = format!(" {} {percent}% ", job.kind.verb());
+        let width = (label.chars().count() as u16).min(area.width);
+        let style = if app.classic_style {
+            Style::default()
+                .fg(classic::MENU_BAR_SELECTED_FG)
+                .bg(classic::MENU_BAR_SELECTED_BG)
+        } else {
+            Style::default().fg(Color::White).bg(Color::Blue)
+        };
+        frame.render_widget(
+            Paragraph::new(label).style(style),
+            Rect {
+                x: area.x + area.width - width,
+                width,
+                ..area
+            },
+        );
+    }
 }
 
 /// A drop-shadow overlay. Two earlier attempts taught what doesn't work
@@ -1188,11 +1460,29 @@ fn draw_command_line(frame: &mut Frame, area: Rect, app: &App) {
     if !app.classic_style {
         spans.push(Span::styled(" ", indent_style));
     }
-    spans.push(Span::styled(
-        format!("{}> ", cwd.display()),
-        Style::default().fg(cwd_fg).add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(&app.command_line, Style::default().fg(typed_text_fg)));
+    if let Some(query) = &app.quick_search {
+        spans.push(Span::styled(
+            "Quick search: ",
+            Style::default().fg(cwd_fg).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(query.as_str(), Style::default().fg(typed_text_fg)));
+        spans.push(Span::styled(
+            "_",
+            Style::default()
+                .fg(typed_text_fg)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ));
+        spans.push(Span::styled(
+            "   (\u{2191}/\u{2193} next match, Esc/Enter done)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        spans.push(Span::styled(
+            format!("{}> ", cwd.display()),
+            Style::default().fg(cwd_fg).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(&app.command_line, Style::default().fg(typed_text_fg)));
+    }
     let line = Line::from(spans);
     let paragraph = if app.classic_style {
         Paragraph::new(line).style(Style::default().bg(classic::PROMPT_BG))
@@ -1368,6 +1658,10 @@ fn draw_pane(
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
+    // Right-aligned so a long path can't push it out of sight.
+    if let Some(sort) = pane.sort_indicator() {
+        block = block.title_top(Line::from(format!("[{sort}]")).right_aligned());
+    }
     if classic_style {
         block = block.style(Style::default().bg(classic::BG));
     }
@@ -1792,5 +2086,25 @@ mod tests {
     fn exact_width_name_is_unchanged() {
         let result = fit_name("1234567890", 10);
         assert_eq!(result, "1234567890");
+    }
+
+    #[test]
+    fn opaque_item_counts_as_half_done_but_never_full() {
+        let progress = crate::job::Progress {
+            bytes_total: 1000,
+            files_total: 1,
+            opaque_bytes: 1000,
+            ..Default::default()
+        };
+        assert_eq!(job_fraction(&progress), 0.5);
+        let two_items = crate::job::Progress {
+            bytes_done: 500,
+            bytes_total: 1000,
+            files_done: 1,
+            files_total: 2,
+            opaque_bytes: 500,
+            ..Default::default()
+        };
+        assert_eq!(job_fraction(&two_items), 0.75);
     }
 }

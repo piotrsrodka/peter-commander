@@ -7,12 +7,20 @@ pub enum Action {
     MkDir,
     NewFile,
     Delete,
+    DeletePermanently,
     View,
     Edit,
     Help,
     Settings,
     ShowTerminal,
     ShowLogs,
+    QuickSearch,
+    SortByName,
+    SortByExtension,
+    SortBySize,
+    SortByDate,
+    BackgroundJob,
+    BulkRename,
     Quit,
 }
 
@@ -26,12 +34,20 @@ impl Action {
             Action::MkDir => "MkDir",
             Action::NewFile => "New File",
             Action::Delete => "Delete",
+            Action::DeletePermanently => "Delete Permanently",
             Action::View => "View",
             Action::Edit => "Edit",
             Action::Help => "Help",
             Action::Settings => "Settings",
             Action::ShowTerminal => "Show Terminal",
             Action::ShowLogs => "Show Logs",
+            Action::QuickSearch => "Quick Search",
+            Action::SortByName => "Sort by Name",
+            Action::SortByExtension => "Sort by Extension",
+            Action::SortBySize => "Sort by Size",
+            Action::SortByDate => "Sort by Date",
+            Action::BackgroundJob => "Background Job",
+            Action::BulkRename => "Bulk Rename",
             Action::Quit => "Quit",
         }
     }
@@ -43,6 +59,7 @@ impl Action {
         match self {
             Action::Open => Some("Enter"),
             Action::NewFile => Some("Shift+F4"),
+            Action::DeletePermanently => Some("Shift+F8"),
             Action::ShowTerminal => Some("Ctrl+O"),
             Action::ShowLogs => Some("Ctrl+L"),
             Action::Settings => Some("Ctrl+S"),
@@ -66,6 +83,7 @@ pub const MENU_BAR: &[MenuCategory] = &[
         items: &[
             Action::Open,
             Action::Rename,
+            Action::BulkRename,
             Action::View,
             Action::Edit,
             Action::NewFile,
@@ -73,6 +91,7 @@ pub const MENU_BAR: &[MenuCategory] = &[
             Action::Move,
             Action::MkDir,
             Action::Delete,
+            Action::DeletePermanently,
         ],
     },
     MenuCategory {
@@ -81,7 +100,17 @@ pub const MENU_BAR: &[MenuCategory] = &[
     },
     MenuCategory {
         title: "Command",
-        items: &[Action::ShowTerminal, Action::ShowLogs, Action::Quit],
+        items: &[
+            Action::ShowTerminal,
+            Action::ShowLogs,
+            Action::QuickSearch,
+            Action::SortByName,
+            Action::SortByExtension,
+            Action::SortBySize,
+            Action::SortByDate,
+            Action::BackgroundJob,
+            Action::Quit,
+        ],
     },
 ];
 

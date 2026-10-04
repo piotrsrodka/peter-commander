@@ -7,10 +7,12 @@ use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
+use crate::bulk_rename::{self, Plan};
 use crate::fs_ops;
+use crate::job::Job;
 use crate::logging;
 use crate::menu::{Action, MENU_BAR};
-use crate::pane::Pane;
+use crate::pane::{Pane, SortKey};
 use crate::preview;
 use crate::state;
 
@@ -23,6 +25,13 @@ pub enum Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogKind {
     Delete,
+    /// Delete, but to the desktop trash/recycle bin instead of for good —
+    /// what F8 does while the "Move to trash" setting is on.
+    Trash,
+    /// Trash where the crate can only do it by *copying* into the home
+    /// trash (see `fs_ops::trash_needs_copy`) — same operation, but the
+    /// confirmation says so first.
+    TrashByCopy,
     Copy,
     Move,
 }
@@ -31,6 +40,7 @@ impl DialogKind {
     pub fn verb(&self) -> &'static str {
         match self {
             DialogKind::Delete => "Delete",
+            DialogKind::Trash | DialogKind::TrashByCopy => "Trash",
             DialogKind::Copy => "Copy",
             DialogKind::Move => "Move",
         }
@@ -91,6 +101,13 @@ pub enum Dialog {
         input: String,
         src: PathBuf,
     },
+    /// Bulk Rename, after the editor closed with a valid edit: shows what
+    /// will change and — defaulting to Cancel — which existing files would
+    /// be replaced, before anything is touched.
+    ConfirmBulkRename {
+        dir: PathBuf,
+        plan: Plan,
+    },
     ConfirmQuit,
     Settings {
         selected: usize,
@@ -109,6 +126,7 @@ pub enum SettingItem {
     ClassicStyle,
     StartLeftInCwd,
     PaneTotals,
+    UseTrash,
 }
 
 impl SettingItem {
@@ -120,6 +138,7 @@ impl SettingItem {
         SettingItem::ClassicStyle,
         SettingItem::StartLeftInCwd,
         SettingItem::PaneTotals,
+        SettingItem::UseTrash,
     ];
 
     /// Label shown on the "off" side of the two-way switch (i.e. when
@@ -133,6 +152,7 @@ impl SettingItem {
             SettingItem::ClassicStyle => "Terminal theme colors",
             SettingItem::StartLeftInCwd => "Restore last session",
             SettingItem::PaneTotals => "Plain panes",
+            SettingItem::UseTrash => "F8 deletes permanently",
         }
     }
 
@@ -147,6 +167,7 @@ impl SettingItem {
             SettingItem::ClassicStyle => "Classic NC colors",
             SettingItem::StartLeftInCwd => "Start in launch dir",
             SettingItem::PaneTotals => "Show file/byte counts",
+            SettingItem::UseTrash => "F8 moves to trash",
         }
     }
 
@@ -161,6 +182,7 @@ impl SettingItem {
             SettingItem::ClassicStyle => "classic_style",
             SettingItem::StartLeftInCwd => "start_left_in_cwd",
             SettingItem::PaneTotals => "pane_totals",
+            SettingItem::UseTrash => "use_trash",
         }
     }
 }
@@ -173,6 +195,13 @@ pub enum ExternalRequest {
     Edit(PathBuf),
     Shell { command: String, cwd: PathBuf },
     RevealTerminal,
+    /// Open `list_file` (the names, one per line) in $EDITOR, then hand
+    /// the result to `App::finish_bulk_rename`.
+    BulkRename {
+        list_file: PathBuf,
+        dir: PathBuf,
+        names: Vec<String>,
+    },
 }
 
 pub struct App {
@@ -206,6 +235,23 @@ pub struct App {
     /// confirmations (`set_status`), only real failures (`set_error`).
     pub error_dialog: Option<String>,
     pub command_line: String,
+    /// While Command > Quick Search is active: what's been typed so far
+    /// (shown in place of the command line), the cursor jumping to the
+    /// first entry whose name contains it.
+    pub quick_search: Option<String>,
+    /// The Copy/Move running on a worker thread, if any (only one at a
+    /// time).
+    pub job: Option<Job>,
+    /// Whether that job's progress window is shown on top; `false` once
+    /// it's been sent to the background.
+    pub job_visible: bool,
+    /// Which button of the progress window has focus: Background (`false`)
+    /// or Cancel (`true`).
+    pub job_cancel_focused: bool,
+    /// Quit was confirmed while a job that can't stop mid-item (a Trash
+    /// that copies) was running: it's been told to cancel, and the app
+    /// quits as soon as it has finished the item it was on.
+    pub quit_when_job_done: bool,
     /// Whether running a command from the command line pauses with
     /// "Press Enter to continue" afterward, or returns straight to the
     /// panels (output can still be seen later via Ctrl+O).
@@ -248,6 +294,9 @@ pub struct App {
     /// counts normally, or a byte-count summary of the marked files while
     /// any are tagged.
     pub pane_totals: bool,
+    /// Whether F8 sends items to the desktop trash (recoverable) instead of
+    /// deleting them for good. Shift+F8 always deletes permanently.
+    pub use_trash: bool,
     /// Height (in text rows) of the preview pane in the last drawn frame,
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
@@ -327,6 +376,10 @@ impl App {
             .get(SettingItem::ClassicStyle.key())
             .copied()
             .unwrap_or(false);
+        let use_trash = saved_settings
+            .get(SettingItem::UseTrash.key())
+            .copied()
+            .unwrap_or(true);
         Ok(App {
             left: Pane::new(left_dir, hide_hidden_files)?,
             right: Pane::new(right_dir, hide_hidden_files)?,
@@ -344,6 +397,11 @@ impl App {
             logs_open: false,
             error_dialog: None,
             command_line: String::new(),
+            quick_search: None,
+            job: None,
+            job_visible: false,
+            job_cancel_focused: false,
+            quit_when_job_done: false,
             wait_after_shell_command,
             quick_view: false,
             preview_focus: false,
@@ -354,6 +412,7 @@ impl App {
             classic_style,
             start_left_in_cwd,
             pane_totals,
+            use_trash,
             preview_visible_lines: 0,
             preview_visible_width: 0,
             pane_visible_lines: 0,
@@ -457,25 +516,31 @@ impl App {
             // Also enabled for executables: Open runs `open_selected`,
             // which already runs them directly (same as pressing Enter).
             Action::Open => entry.is_some_and(|e| e.is_dir || e.is_executable),
-            Action::Rename | Action::Copy | Action::Move | Action::Delete => has_real_selection,
+            Action::Rename
+            | Action::Copy
+            | Action::Move
+            | Action::Delete
+            | Action::DeletePermanently => has_real_selection,
             // View also works on directories (and "..") — quick-view shows
             // a name-only listing for those.
             Action::View => entry.is_some(),
             Action::Edit => selection_is_file,
+            Action::BulkRename => {
+                has_real_selection || !self.active_pane_ref().marked.is_empty()
+            }
+            Action::BackgroundJob => self.job.is_some(),
             Action::MkDir
             | Action::NewFile
+            | Action::QuickSearch
+            | Action::SortByName
+            | Action::SortByExtension
+            | Action::SortBySize
+            | Action::SortByDate
             | Action::Help
             | Action::Settings
             | Action::ShowTerminal
             | Action::ShowLogs
             | Action::Quit => true,
-        }
-    }
-
-    pub fn inactive_pane(&mut self) -> &mut Pane {
-        match self.active {
-            Side::Left => &mut self.right,
-            Side::Right => &mut self.left,
         }
     }
 
@@ -564,7 +629,228 @@ impl App {
     }
 
     pub fn quit(&mut self) {
+        // A copying Trash can be minutes into one big item, and killing it
+        // would leave a half copy in the trash: let it finish that item
+        // with its window showing what's happening, then quit (`poll_job`).
+        if let Some(job) = &self.job
+            && job.kind == DialogKind::TrashByCopy
+        {
+            job.cancel();
+            self.quit_when_job_done = true;
+            self.job_visible = true;
+            return;
+        }
         self.should_quit = true;
+        self.cancel_job_and_wait();
+    }
+
+    /// On the way out: stop a running Copy/Move and wait for its worker, so
+    /// it gets to remove the half-copied file instead of being killed
+    /// mid-write.
+    pub fn cancel_job_and_wait(&mut self) {
+        if let Some(job) = self.job.take() {
+            let verb = job.kind.verb();
+            job.cancel();
+            let outcome = job.join();
+            logging::log_info(&format!(
+                "{verb} cancelled on quit after {} item(s)",
+                outcome.done
+            ));
+        }
+    }
+
+    /// Called every loop iteration: once the worker has finished, reports
+    /// the outcome (an error popup only for real failures) and refreshes
+    /// both panes.
+    pub fn poll_job(&mut self) -> Result<()> {
+        if !self.job.as_ref().is_some_and(Job::is_finished) {
+            return Ok(());
+        }
+        let Some(job) = self.job.take() else {
+            return Ok(());
+        };
+        self.job_visible = false;
+        let kind = job.kind;
+        let items = job.items.clone();
+        let src_dir = job.src_dir.clone();
+        let dest_dir = job.dest_dir.clone();
+        let outcome = job.join();
+        let verb_done = match kind {
+            DialogKind::Move => "Moved",
+            DialogKind::TrashByCopy => "Moved to trash",
+            _ => "Copied",
+        };
+
+        if outcome.cancelled {
+            self.set_status(format!(
+                "{} cancelled after {} of {} item(s)",
+                kind.verb(),
+                outcome.done,
+                items.len()
+            ));
+        } else if outcome.errors.is_empty() {
+            let message = match items.as_slice() {
+                [(name, _)] if kind == DialogKind::TrashByCopy => format!("{verb_done} {name}"),
+                _ if kind == DialogKind::TrashByCopy => {
+                    format!("{verb_done} {} items from {}", outcome.done, src_dir.display())
+                }
+                [(name, src)] => {
+                    format!("{verb_done} {} to {}", src.display(), dest_dir.join(name).display())
+                }
+                _ => format!(
+                    "{verb_done} {} items from {} to {}",
+                    outcome.done,
+                    src_dir.display(),
+                    dest_dir.display()
+                ),
+            };
+            self.set_status(message);
+        } else {
+            let hint = if kind == DialogKind::TrashByCopy {
+                " (Shift+F8 deletes permanently instead)"
+            } else {
+                ""
+            };
+            self.set_error(format!(
+                "{} failed for {} of {} item(s): {}{hint}",
+                kind.verb(),
+                outcome.errors.len(),
+                items.len(),
+                outcome.errors.join("; ")
+            ));
+        }
+        self.left.reload()?;
+        self.right.reload()?;
+        if self.quit_when_job_done {
+            self.should_quit = true;
+        }
+        Ok(())
+    }
+
+    /// Esc, or Enter on [ Background ]: hide the progress window and let
+    /// the job carry on while the panels are usable again.
+    pub fn hide_job(&mut self) {
+        // Waiting to quit: keep showing why nothing is happening yet.
+        if !self.quit_when_job_done {
+            self.job_visible = false;
+        }
+    }
+
+    pub fn toggle_job_focus(&mut self) {
+        self.job_cancel_focused = !self.job_cancel_focused;
+    }
+
+    /// Enter in the progress window: whichever button has focus.
+    pub fn activate_job_button(&mut self) {
+        if !self.job_cancel_focused {
+            self.hide_job();
+        } else if let Some(job) = &self.job {
+            job.cancel();
+        }
+    }
+
+    fn sort_active_pane(&mut self, key: SortKey) {
+        if let Err(err) = self.active_pane().set_sort(key) {
+            self.set_error(format!("Cannot reload pane: {err}"));
+        }
+    }
+
+    /// Quick search: typing a character that no entry matches is ignored
+    /// (as in Midnight Commander), so the query always points somewhere.
+    pub fn quick_search_push(&mut self, c: char) {
+        let Some(query) = &self.quick_search else {
+            return;
+        };
+        let candidate = format!("{query}{c}");
+        let start = self.active_pane_ref().selected;
+        if let Some(idx) = self.active_pane_ref().find_match(&candidate, start, true) {
+            self.active_pane().selected = idx;
+            self.quick_search = Some(candidate);
+        }
+    }
+
+    pub fn quick_search_backspace(&mut self) {
+        if let Some(query) = &mut self.quick_search {
+            query.pop();
+        }
+    }
+
+    /// Up/Down during quick search: the previous/next entry that matches.
+    pub fn quick_search_step(&mut self, forward: bool) {
+        let Some(query) = self.quick_search.clone() else {
+            return;
+        };
+        let pane = self.active_pane_ref();
+        let len = pane.entries.len().max(1);
+        let start = if forward {
+            (pane.selected + 1) % len
+        } else {
+            (pane.selected + len - 1) % len
+        };
+        if let Some(idx) = pane.find_match(&query, start, forward) {
+            self.active_pane().selected = idx;
+        }
+    }
+
+    pub fn end_quick_search(&mut self) {
+        self.quick_search = None;
+    }
+
+    /// File > Bulk Rename: the marked items (or the one under the cursor)
+    /// go one name per line into a temp file that `main` opens in $EDITOR.
+    fn request_bulk_rename(&mut self) {
+        let pane = self.active_pane_ref();
+        let mut names: Vec<String> = pane.marked_items().into_iter().map(|(name, _)| name).collect();
+        if names.is_empty() {
+            match pane.selected_entry() {
+                Some(entry) if entry.name != ".." => names.push(entry.name.clone()),
+                _ => return,
+            }
+        }
+        if names.iter().any(|name| name.contains('\n') || name.contains('\r')) {
+            self.set_error("Bulk rename cannot handle names containing line breaks".to_string());
+            return;
+        }
+        let dir = pane.cwd.clone();
+        let list_file = env::temp_dir().join(format!("pc-bulk-rename-{}.txt", std::process::id()));
+        if let Err(err) = std::fs::write(&list_file, bulk_rename::list_text(&names)) {
+            self.set_error(format!("Bulk rename: cannot write {}: {err}", list_file.display()));
+            return;
+        }
+        self.external_request = Some(ExternalRequest::BulkRename {
+            list_file,
+            dir,
+            names,
+        });
+    }
+
+    /// After the editor closed: validate the edit and, if anything
+    /// changed, ask before renaming. A failed editor (e.g. vim's `:cq`)
+    /// aborts without renaming anything.
+    pub fn finish_bulk_rename(&mut self, list_file: &Path, dir: PathBuf, names: &[String], editor_ok: bool) {
+        let edited = std::fs::read_to_string(list_file);
+        let _ = std::fs::remove_file(list_file);
+        if !editor_ok {
+            self.set_status("Bulk rename aborted".to_string());
+            return;
+        }
+        let edited = match edited {
+            Ok(text) => text,
+            Err(err) => {
+                self.set_error(format!("Bulk rename: cannot read the edited list: {err}"));
+                return;
+            }
+        };
+        match bulk_rename::plan(&dir, names, &edited) {
+            Err(message) => self.set_error(format!("Bulk rename: {message} — nothing was renamed")),
+            Ok(plan) if plan.renames.is_empty() => {
+                self.set_status("Bulk rename: no names changed".to_string());
+            }
+            Ok(plan) => {
+                self.dialog_cancel_focused = !plan.overwrites.is_empty();
+                self.dialog = Dialog::ConfirmBulkRename { dir, plan };
+            }
+        }
     }
 
     pub fn open_menu(&mut self) {
@@ -658,7 +944,17 @@ impl App {
             Action::Rename => self.request_rename(),
             Action::Copy => self.request_copy(),
             Action::Move => self.request_move(),
-            Action::Delete => self.request_delete(),
+            Action::Delete => {
+                let kind = if !self.use_trash {
+                    DialogKind::Delete
+                } else if fs_ops::trash_needs_copy(&self.active_pane_ref().cwd) {
+                    DialogKind::TrashByCopy
+                } else {
+                    DialogKind::Trash
+                };
+                self.request_delete(kind);
+            }
+            Action::DeletePermanently => self.request_delete(DialogKind::Delete),
             Action::MkDir => self.request_mkdir(),
             Action::NewFile => self.request_new_file(),
             Action::View => self.view_selected(),
@@ -669,6 +965,20 @@ impl App {
             }
             Action::ShowTerminal => self.request_reveal_terminal(),
             Action::ShowLogs => self.logs_open = true,
+            Action::QuickSearch => {
+                self.quick_search = Some(String::new());
+            }
+            Action::SortByName => self.sort_active_pane(SortKey::Name),
+            Action::SortByExtension => self.sort_active_pane(SortKey::Extension),
+            Action::SortBySize => self.sort_active_pane(SortKey::Size),
+            Action::SortByDate => self.sort_active_pane(SortKey::Modified),
+            Action::BackgroundJob => {
+                if self.job.is_some() {
+                    self.job_visible = true;
+                    self.job_cancel_focused = false;
+                }
+            }
+            Action::BulkRename => self.request_bulk_rename(),
             Action::Quit => {
                 self.dialog = Dialog::ConfirmQuit;
                 self.dialog_cancel_focused = false;
@@ -702,6 +1012,7 @@ impl App {
             SettingItem::ClassicStyle => self.classic_style,
             SettingItem::StartLeftInCwd => self.start_left_in_cwd,
             SettingItem::PaneTotals => self.pane_totals,
+            SettingItem::UseTrash => self.use_trash,
         }
     }
 
@@ -712,6 +1023,7 @@ impl App {
             SettingItem::ClassicStyle => self.classic_style = value,
             SettingItem::StartLeftInCwd => self.start_left_in_cwd = value,
             SettingItem::PaneTotals => self.pane_totals = value,
+            SettingItem::UseTrash => self.use_trash = value,
             SettingItem::HideHiddenFiles => {
                 self.left.hide_hidden = value;
                 self.right.hide_hidden = value;
@@ -898,6 +1210,12 @@ impl App {
     }
 
     fn request_transfer(&mut self, kind: DialogKind) {
+        if self.job.is_some() {
+            self.set_error(
+                "Another copy/move is still running (Command > Background Job shows it)".to_string(),
+            );
+            return;
+        }
         let pane = self.active_pane();
         let items = pane.marked_items();
         let items = if items.is_empty() {
@@ -951,7 +1269,9 @@ impl App {
         }
     }
 
-    fn request_delete(&mut self) {
+    /// F8 (`Trash` or `Delete`, per the setting) and Shift+F8 (always
+    /// `Delete`).
+    fn request_delete(&mut self, kind: DialogKind) {
         let pane = self.active_pane();
         let items = pane.marked_items();
         let items = if items.is_empty() {
@@ -965,11 +1285,8 @@ impl App {
         } else {
             items
         };
-        self.dialog = Dialog::Confirm {
-            kind: DialogKind::Delete,
-            items,
-        };
-        self.dialog_cancel_focused = !DialogKind::Delete.default_yes();
+        self.dialog = Dialog::Confirm { kind, items };
+        self.dialog_cancel_focused = !kind.default_yes();
     }
 
     pub fn confirm_dialog(&mut self) -> Result<()> {
@@ -977,7 +1294,7 @@ impl App {
             Dialog::Confirm { kind, items } => {
                 let kind = *kind;
                 let items = items.clone();
-                if kind != DialogKind::Delete {
+                if matches!(kind, DialogKind::Copy | DialogKind::Move) {
                     let dest_dir = self.inactive_pane_ref().cwd.clone();
                     let conflicts = existing_destinations(&items, &dest_dir);
                     if !conflicts.is_empty() {
@@ -1056,6 +1373,22 @@ impl App {
                 self.left.reload()?;
                 self.right.reload()?;
             }
+            Dialog::ConfirmBulkRename { dir, plan } => {
+                let (done, errors) = bulk_rename::execute(dir, plan);
+                if errors.is_empty() {
+                    self.set_status(format!("Renamed {done} item(s) in {}", dir.display()));
+                } else {
+                    self.set_error(format!(
+                        "Bulk rename: {done} renamed, {} failed: {}",
+                        errors.len(),
+                        errors.join("; ")
+                    ));
+                }
+                self.active_pane().clear_marks();
+                self.dialog = Dialog::None;
+                self.left.reload()?;
+                self.right.reload()?;
+            }
             Dialog::ConfirmQuit => {
                 self.dialog = Dialog::None;
                 self.quit();
@@ -1065,19 +1398,44 @@ impl App {
         Ok(())
     }
 
-    /// Runs a confirmed Copy/Move/Delete over every item and reports the
-    /// outcome; shared by the plain confirm and the overwrite prompt.
+    /// Runs a confirmed Copy/Move/Delete/Trash; shared by the plain confirm
+    /// and the overwrite prompt. Copy/Move start a background job with its
+    /// progress window on top; Delete/Trash run right here.
     fn run_file_operation(&mut self, kind: DialogKind, items: Vec<(String, PathBuf)>) -> Result<()> {
         let src_dir = self.active_pane_ref().cwd.clone();
-        let dest_dir = self.inactive_pane().cwd.clone();
+        let wants_job = matches!(kind, DialogKind::Copy | DialogKind::Move | DialogKind::TrashByCopy);
+        self.dialog = Dialog::None;
+        if wants_job && self.job.is_some() {
+            self.set_error(
+                "Another operation is still running (Command > Background Job shows it)".to_string(),
+            );
+            return Ok(());
+        }
+        // A job already holds its own list, so the marks can go now.
+        self.active_pane().clear_marks();
 
+        // Copy/Move (and a Trash that has to copy) run on a worker thread
+        // with a progress window on top.
+        if wants_job {
+            let dest_dir = if kind == DialogKind::TrashByCopy {
+                fs_ops::home_trash_dir().unwrap_or_else(|| src_dir.clone())
+            } else {
+                self.inactive_pane_ref().cwd.clone()
+            };
+            self.job = Some(Job::start(kind, items, src_dir, dest_dir));
+            self.job_visible = true;
+            self.job_cancel_focused = false;
+            return Ok(());
+        }
+
+        let trashing = matches!(kind, DialogKind::Trash | DialogKind::TrashByCopy);
         let mut done = 0usize;
         let mut errors: Vec<String> = Vec::new();
         for (name, src) in &items {
-            let result = match kind {
-                DialogKind::Delete => fs_ops::delete_recursive(src),
-                DialogKind::Copy => fs_ops::copy_recursive(src, &dest_dir.join(name)),
-                DialogKind::Move => fs_ops::move_path(src, &dest_dir.join(name)),
+            let result = if trashing {
+                trash::delete(src).map_err(anyhow::Error::from)
+            } else {
+                fs_ops::delete_recursive(src)
             };
             match result {
                 Ok(()) => done += 1,
@@ -1085,34 +1443,27 @@ impl App {
             }
         }
 
-        let verb_done = match kind {
-            DialogKind::Delete => "Deleted",
-            DialogKind::Copy => "Copied",
-            DialogKind::Move => "Moved",
-        };
         if errors.is_empty() {
-            // A single item logs its full from/to paths (as
-            // before); a batch would make that unreadably long, so
-            // it logs a count plus the shared source/destination
-            // directories instead of nothing at all.
-            let message = match (kind, items.as_slice()) {
-                (DialogKind::Delete, [(name, _)]) => format!("Deleted {name}"),
-                (DialogKind::Delete, _) => {
-                    format!("Deleted {done} items from {}", src_dir.display())
-                }
-                (_, [(name, src)]) => {
-                    format!("{verb_done} {} to {}", src.display(), dest_dir.join(name).display())
-                }
-                (_, _) => format!(
-                    "{verb_done} {done} items from {} to {}",
-                    src_dir.display(),
-                    dest_dir.display()
-                ),
+            let verb_done = if trashing {
+                "Moved to trash"
+            } else {
+                "Deleted"
+            };
+            let message = match items.as_slice() {
+                [(name, _)] => format!("{verb_done} {name}"),
+                _ => format!("{verb_done} {done} items from {}", src_dir.display()),
             };
             self.set_status(message);
         } else {
+            // Never fall back to a permanent delete on its own — point at
+            // the explicit way to do that instead.
+            let hint = if trashing {
+                " (Shift+F8 deletes permanently instead)"
+            } else {
+                ""
+            };
             self.set_error(format!(
-                "{} failed for {} of {} item(s): {}",
+                "{} failed for {} of {} item(s): {}{hint}",
                 kind.verb(),
                 errors.len(),
                 items.len(),
@@ -1120,8 +1471,6 @@ impl App {
             ));
         }
 
-        self.active_pane().clear_marks();
-        self.dialog = Dialog::None;
         self.left.reload()?;
         self.right.reload()?;
         Ok(())

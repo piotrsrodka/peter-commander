@@ -1,5 +1,7 @@
 mod app;
+mod bulk_rename;
 mod fs_ops;
+mod job;
 mod logging;
 mod menu;
 mod pane;
@@ -105,7 +107,10 @@ fn run(
 
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
-        if event::poll(Duration::from_millis(200))? {
+        // Redraw more often while a Copy/Move is running, so its progress
+        // bar moves smoothly.
+        let poll_timeout = if app.job.is_some() { 100 } else { 200 };
+        if event::poll(Duration::from_millis(poll_timeout))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key(&mut app, key.code, key.modifiers)?;
@@ -116,6 +121,7 @@ fn run(
         }
         app.sync_preview_scroll();
         app.reap_finished_children();
+        app.poll_job()?;
 
         if let Some(request) = app.external_request.take() {
             run_external(terminal, request, &mut app)?;
@@ -126,6 +132,7 @@ fn run(
         }
     }
 
+    app.cancel_job_and_wait();
     app.save_state();
     Ok(())
 }
@@ -156,24 +163,37 @@ fn run_external(
     match request {
         ExternalRequest::View(path) => {
             let default_pager = if cfg!(windows) { "notepad" } else { "less" };
-            run_pager_or_editor(terminal, "PAGER", default_pager, &path, app)
+            run_pager_or_editor(terminal, "PAGER", default_pager, &path, app).map(|_| ())
         }
         ExternalRequest::Edit(path) => {
-            let default_editor = if cfg!(windows) { "notepad" } else { "vi" };
-            run_pager_or_editor(terminal, "EDITOR", default_editor, &path, app)
+            run_pager_or_editor(terminal, "EDITOR", default_editor(), &path, app).map(|_| ())
+        }
+        ExternalRequest::BulkRename {
+            list_file,
+            dir,
+            names,
+        } => {
+            let editor_ok = run_pager_or_editor(terminal, "EDITOR", default_editor(), &list_file, app)?;
+            app.finish_bulk_rename(&list_file, dir, &names, editor_ok);
+            Ok(())
         }
         ExternalRequest::Shell { command, cwd } => run_shell_command(terminal, &command, &cwd, app),
         ExternalRequest::RevealTerminal => reveal_terminal(terminal, app),
     }
 }
 
+fn default_editor() -> &'static str {
+    if cfg!(windows) { "notepad" } else { "vi" }
+}
+
+/// Returns whether the program ran and exited successfully.
 fn run_pager_or_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     env_var: &str,
     default_program: &str,
     path: &Path,
     app: &mut App,
-) -> Result<()> {
+) -> Result<bool> {
     // $EDITOR/$PAGER may be a full command line (e.g. "omarchy-launch-editor
     // --inline"), not just a bare program name, so parse it like a shell would.
     let command_line = env::var(env_var).unwrap_or_else(|_| default_program.to_string());
@@ -194,6 +214,7 @@ fn run_pager_or_editor(
     set_mouse_capture(app.mouse_capture)?;
     terminal.clear()?;
 
+    let succeeded = matches!(&status, Ok(status) if status.success());
     match status {
         Ok(status) if !status.success() => {
             app.set_error(format!("{program} exited with {status}"));
@@ -206,7 +227,7 @@ fn run_pager_or_editor(
 
     app.left.reload()?;
     app.right.reload()?;
-    Ok(())
+    Ok(succeeded)
 }
 
 /// Runs a shell command line (Norton Commander's built-in command prompt),
@@ -342,6 +363,7 @@ fn side_at(app: &App, column: u16, row: u16) -> Option<app::Side> {
 /// `handle_key` gates those same keyboard shortcuts.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     if app.error_dialog.is_some()
+        || app.job_visible
         || app.help_open
         || app.logs_open
         || app.dialog_is_text_input()
@@ -458,6 +480,18 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         return Ok(());
     }
 
+    // The Copy/Move progress window sits on top of everything until it's
+    // sent to the background (Esc, or its Background button).
+    if app.job_visible {
+        match code {
+            KeyCode::Esc => app.hide_job(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => app.toggle_job_focus(),
+            KeyCode::Enter => app.activate_job_button(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if app.help_open {
         match code {
             KeyCode::Left => app.help_page = 0,
@@ -542,6 +576,34 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         return Ok(());
     }
 
+    if app.quick_search.is_some() {
+        match code {
+            KeyCode::Char(c) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                app.quick_search_push(c);
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                app.quick_search_backspace();
+                return Ok(());
+            }
+            KeyCode::Up => {
+                app.quick_search_step(false);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                app.quick_search_step(true);
+                return Ok(());
+            }
+            KeyCode::Esc | KeyCode::Enter => {
+                app.end_quick_search();
+                return Ok(());
+            }
+            // Anything else ends the search and then does what it normally
+            // does (e.g. F5 copies the entry just found).
+            _ => app.end_quick_search(),
+        }
+    }
+
     match code {
         KeyCode::Tab => {
             if app.quick_view {
@@ -586,6 +648,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         }
         KeyCode::F(4) if modifiers.contains(KeyModifiers::SHIFT) => {
             app.run_action(Action::NewFile)?;
+        }
+        KeyCode::F(8) if modifiers.contains(KeyModifiers::SHIFT) => {
+            app.run_action(Action::DeletePermanently)?;
         }
         KeyCode::F(1) if modifiers.contains(KeyModifiers::ALT) => {
             app.sync_left_to_right_dir()?;
