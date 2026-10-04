@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::pane::SortKey;
+
 #[derive(Debug, Clone)]
 pub struct LastDirs {
     pub left: PathBuf,
@@ -14,6 +16,41 @@ fn config_dir() -> Option<PathBuf> {
 
 fn state_file() -> Option<PathBuf> {
     Some(config_dir()?.join("last_dirs"))
+}
+
+fn sort_file() -> Option<PathBuf> {
+    Some(config_dir()?.join("sort"))
+}
+
+/// Each pane's sort, as `(key, reversed)`.
+pub type PaneSort = (SortKey, bool);
+
+/// The left and right panes' sorts from last session, one `key reversed`
+/// line each (e.g. `size false`). `None` if missing or unreadable.
+pub fn load_sorts() -> Option<(PaneSort, PaneSort)> {
+    parse_sorts(&fs::read_to_string(sort_file()?).ok()?)
+}
+
+fn parse_sorts(contents: &str) -> Option<(PaneSort, PaneSort)> {
+    let parse = |line: &str| {
+        let (key, reversed) = line.split_once(' ')?;
+        Some((SortKey::from_key(key.trim())?, reversed.trim().parse().ok()?))
+    };
+    let mut lines = contents.lines();
+    Some((parse(lines.next()?)?, parse(lines.next()?)?))
+}
+
+pub fn save_sorts(left: PaneSort, right: PaneSort) {
+    let Some(path) = sort_file() else { return };
+    let Some(parent) = path.parent() else { return };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = fs::write(path, format_sorts(left, right));
+}
+
+fn format_sorts(left: PaneSort, right: PaneSort) -> String {
+    format!("{} {}\n{} {}\n", left.0.key(), left.1, right.0.key(), right.1)
 }
 
 fn settings_file() -> Option<PathBuf> {
@@ -93,6 +130,17 @@ fn save_settings_to(path: &Path, pairs: &[(&str, bool)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_trips_sorts_and_rejects_garbage() {
+        let text = format_sorts((SortKey::Size, false), (SortKey::Name, true));
+        assert_eq!(
+            parse_sorts(&text),
+            Some(((SortKey::Size, false), (SortKey::Name, true)))
+        );
+        assert_eq!(parse_sorts("size false\n"), None);
+        assert_eq!(parse_sorts("bogus false\nname true\n"), None);
+    }
 
     #[test]
     fn round_trips_last_dirs() {

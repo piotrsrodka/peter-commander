@@ -19,9 +19,9 @@ Also comes with an optional classic retro Norton Commander color scheme
 - File operations: rename, copy, move, mkdir, new file, delete
 - Delete to the desktop trash (optional, on by default); Shift+F8 deletes permanently
 - Copy/move with a progress bar, cancellable, can be sent to the background
-- Sort by name, extension, size, or date (Command menu)
+- Sort by name, type (extension), size, or date (Command menu), remembered per pane
 - Quick search: jump to a file by typing part of its name (Command menu)
-- Bulk rename in your `$EDITOR`, with a warning before anything is overwritten
+- Rename selected files together in your `$EDITOR`, with a warning before anything is overwritten
 - Respects theme selection in Omarchy
 - Quick preview (F3) for text, directories, and binaries
 - Edit (F4) with your `$EDITOR`

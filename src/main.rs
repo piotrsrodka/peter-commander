@@ -168,7 +168,7 @@ fn run_external(
         ExternalRequest::Edit(path) => {
             run_pager_or_editor(terminal, "EDITOR", default_editor(), &path, app).map(|_| ())
         }
-        ExternalRequest::BulkRename {
+        ExternalRequest::RenameSelected {
             list_file,
             dir,
             names,
@@ -494,8 +494,8 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
 
     if app.help_open {
         match code {
-            KeyCode::Left => app.help_page = 0,
-            KeyCode::Right => app.help_page = 1,
+            KeyCode::Left => app.help_page = app.help_page.saturating_sub(1),
+            KeyCode::Right => app.help_page = (app.help_page + 1).min(ui::HELP_PAGE_COUNT - 1),
             _ => app.help_open = false,
         }
         return Ok(());
@@ -672,6 +672,12 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         }
         KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.run_action(Action::ShowLogs)?;
+        }
+        KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.run_action(Action::QuickSearch)?;
+        }
+        KeyCode::Char('b') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.run_action(Action::ShowProgress)?;
         }
         KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.run_action(Action::Settings)?;

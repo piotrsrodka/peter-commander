@@ -19,9 +19,16 @@ pub enum Action {
     SortByExtension,
     SortBySize,
     SortByDate,
-    BackgroundJob,
-    BulkRename,
+    ShowProgress,
+    RenameSelected,
+    SelectFile,
+    SelectFiles,
+    UnselectFiles,
+    InvertSelection,
     Quit,
+    /// Not an action: a horizontal divider between groups in a pulldown
+    /// menu. Never enabled, so menu navigation steps over it.
+    Separator,
 }
 
 impl Action {
@@ -43,12 +50,17 @@ impl Action {
             Action::ShowLogs => "Show Logs",
             Action::QuickSearch => "Quick Search",
             Action::SortByName => "Sort by Name",
-            Action::SortByExtension => "Sort by Extension",
+            Action::SortByExtension => "Sort by Type",
             Action::SortBySize => "Sort by Size",
             Action::SortByDate => "Sort by Date",
-            Action::BackgroundJob => "Background Job",
-            Action::BulkRename => "Bulk Rename",
+            Action::ShowProgress => "Show Progress",
+            Action::RenameSelected => "Rename Selected",
+            Action::SelectFile => "Select File",
+            Action::SelectFiles => "Select Files",
+            Action::UnselectFiles => "Unselect Files",
+            Action::InvertSelection => "Invert Selection",
             Action::Quit => "Quit",
+            Action::Separator => "",
         }
     }
 
@@ -60,9 +72,12 @@ impl Action {
             Action::Open => Some("Enter"),
             Action::NewFile => Some("Shift+F4"),
             Action::DeletePermanently => Some("Shift+F8"),
+            Action::SelectFile => Some("Insert"),
             Action::ShowTerminal => Some("Ctrl+O"),
             Action::ShowLogs => Some("Ctrl+L"),
             Action::Settings => Some("Ctrl+S"),
+            Action::ShowProgress => Some("Ctrl+B"),
+            Action::QuickSearch => Some("Ctrl+F"),
             other => FN_KEYS
                 .iter()
                 .find(|fn_key| fn_key.action == Some(*other))
@@ -79,19 +94,27 @@ pub struct MenuCategory {
 pub const MENU_BAR: &[MenuCategory] = &[
     MenuCategory {
         title: "File",
-        // Ordered by keybinding (Enter, then F2..F8) to match the F1 help screen.
+        // Ordered by keybinding (Enter, then F2..F8) to match the F1 help
+        // screen, in groups split by separators.
         items: &[
             Action::Open,
             Action::Rename,
-            Action::BulkRename,
+            Action::RenameSelected,
             Action::View,
             Action::Edit,
             Action::NewFile,
+            Action::Separator,
             Action::Copy,
             Action::Move,
             Action::MkDir,
+            Action::Separator,
             Action::Delete,
             Action::DeletePermanently,
+            Action::Separator,
+            Action::SelectFile,
+            Action::SelectFiles,
+            Action::UnselectFiles,
+            Action::InvertSelection,
         ],
     },
     MenuCategory {
@@ -101,14 +124,17 @@ pub const MENU_BAR: &[MenuCategory] = &[
     MenuCategory {
         title: "Command",
         items: &[
-            Action::ShowTerminal,
-            Action::ShowLogs,
             Action::QuickSearch,
+            Action::Separator,
             Action::SortByName,
             Action::SortByExtension,
             Action::SortBySize,
             Action::SortByDate,
-            Action::BackgroundJob,
+            Action::Separator,
+            Action::ShowTerminal,
+            Action::ShowLogs,
+            Action::ShowProgress,
+            Action::Separator,
             Action::Quit,
         ],
     },

@@ -1,7 +1,8 @@
-//! Bulk Rename: the selected names are written one per line to a temp file,
-//! edited in $EDITOR, and the edited lines become the new names. Nothing is
-//! renamed until `plan` has validated the whole edit and the user has
-//! confirmed it — including any existing files the new names would replace.
+//! Rename Selected (a bulk rename): the marked names are written one per
+//! line to a temp file, edited in $EDITOR, and the edited lines become the
+//! new names. Nothing is renamed until `plan` has validated the whole edit
+//! and the user has confirmed it — including any existing files the new
+//! names would replace.
 
 use std::collections::HashSet;
 use std::fs;

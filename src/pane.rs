@@ -74,14 +74,56 @@ impl SortKey {
         matches!(self, SortKey::Size | SortKey::Modified)
     }
 
+    pub const ALL: [SortKey; 4] = [SortKey::Name, SortKey::Extension, SortKey::Size, SortKey::Modified];
+
+    /// Stable identifier for the saved state file, independent of `label`.
+    pub fn key(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Extension => "extension",
+            SortKey::Size => "size",
+            SortKey::Modified => "modified",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<SortKey> {
+        SortKey::ALL.into_iter().find(|sort| sort.key() == key)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             SortKey::Name => "Name",
-            SortKey::Extension => "Ext",
+            SortKey::Extension => "Type",
             SortKey::Size => "Size",
             SortKey::Modified => "Date",
         }
     }
+}
+
+/// Shell-style wildcard match: `*` is any run of characters (including
+/// none), `?` exactly one.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0, 0);
+    // Where the last `*` was, and how much of the name it has swallowed.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((star_p, star_n)) = star {
+            p = star_p + 1;
+            n = star_n + 1;
+            star = Some((star_p, star_n + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 fn extension_of(name: &str) -> String {
@@ -213,18 +255,60 @@ impl Pane {
     /// direction instead, as in Midnight Commander. The cursor stays on the
     /// same entry rather than the same row.
     pub fn set_sort(&mut self, key: SortKey) -> Result<()> {
-        if self.sort_key == key {
-            self.sort_reversed = !self.sort_reversed;
-        } else {
-            self.sort_key = key;
-            self.sort_reversed = false;
-        }
+        let reversed = self.sort_key == key && !self.sort_reversed;
+        self.apply_sort(key, reversed)
+    }
+
+    /// Sorts by exactly `key`/`reversed` (e.g. restoring the last
+    /// session's sort), keeping the cursor on the same entry.
+    pub fn apply_sort(&mut self, key: SortKey, reversed: bool) -> Result<()> {
+        self.sort_key = key;
+        self.sort_reversed = reversed;
         let selected_name = self.selected_entry().map(|e| e.name.clone());
         self.reload()?;
         if let Some(name) = selected_name {
             self.select_name(&name);
         }
         Ok(())
+    }
+
+    /// Select/Unselect Files: marks (or unmarks) every file whose name
+    /// matches any of the space- or comma-separated wildcard patterns
+    /// (`*`, `?`, case-insensitive). Like Norton Commander, only files —
+    /// directories are left as they are. Returns how many changed.
+    pub fn mark_matching(&mut self, patterns: &str, select: bool) -> usize {
+        let patterns: Vec<String> = patterns
+            .split([' ', ','])
+            .filter(|p| !p.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        let mut changed = 0;
+        for entry in self.entries.iter().filter(|e| !e.is_dir) {
+            let name = entry.name.to_lowercase();
+            if !patterns.iter().any(|pattern| wildcard_match(pattern, &name)) {
+                continue;
+            }
+            let did_change = if select {
+                self.marked.insert(entry.name.clone())
+            } else {
+                self.marked.remove(&entry.name)
+            };
+            if did_change {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// Invert Selection: flips the mark on every file (directories, as in
+    /// Norton Commander, are left alone). Returns how many end up marked.
+    pub fn invert_marks(&mut self) -> usize {
+        for entry in self.entries.iter().filter(|e| !e.is_dir) {
+            if !self.marked.remove(&entry.name) {
+                self.marked.insert(entry.name.clone());
+            }
+        }
+        self.marked.len()
     }
 
     /// Moves the cursor onto the entry called `name`, if it's listed.
@@ -234,15 +318,16 @@ impl Pane {
         }
     }
 
-    /// Whether the listing is sorted some other way than plain A→Z, so the
-    /// pane title can say how.
-    pub fn sort_indicator(&self) -> Option<String> {
-        if self.sort_key == SortKey::Name && !self.sort_reversed {
-            return None;
-        }
-        let descending = self.sort_key.descending_by_default() != self.sort_reversed;
-        let arrow = if descending { '\u{2193}' } else { '\u{2191}' };
-        Some(format!("{}{arrow}", self.sort_key.label()))
+    /// Whether the current sort runs high-to-low (Z→A, biggest/newest
+    /// first).
+    pub fn sort_descending(&self) -> bool {
+        self.sort_key.descending_by_default() != self.sort_reversed
+    }
+
+    /// How the listing is sorted, for the pane title — e.g. "Size↓".
+    pub fn sort_indicator(&self) -> String {
+        let arrow = if self.sort_descending() { '\u{2193}' } else { '\u{2191}' };
+        format!("{}{arrow}", self.sort_key.label())
     }
 
     /// Quick search: the first entry at or after `start` (wrapping around,
@@ -778,7 +863,7 @@ mod tests {
         pane.set_sort(SortKey::Size).unwrap();
         assert_eq!(names(&pane), ["..", "adir", "zdir", "b.txt", "c.md", "a.rs"]);
         assert_eq!(pane.selected_entry().unwrap().name, "c.md");
-        assert_eq!(pane.sort_indicator().as_deref(), Some("Size\u{2193}"));
+        assert_eq!(pane.sort_indicator(), "Size\u{2193}");
 
         pane.set_sort(SortKey::Size).unwrap();
         assert_eq!(names(&pane), ["..", "adir", "zdir", "a.rs", "c.md", "b.txt"]);
@@ -793,7 +878,7 @@ mod tests {
         assert_eq!(names(&pane), ["..", "adir", "zdir", "c.md", "a.rs", "b.txt"]);
         pane.set_sort(SortKey::Name).unwrap();
         assert_eq!(names(&pane), ["..", "adir", "zdir", "a.rs", "b.txt", "c.md"]);
-        assert_eq!(pane.sort_indicator(), None);
+        assert_eq!(pane.sort_indicator(), "Name\u{2191}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -808,6 +893,36 @@ mod tests {
         assert_eq!(pane.find_match("dir", 0, false), Some(2));
         assert_eq!(pane.find_match(".", 0, true), Some(3));
         assert_eq!(pane.find_match("nope", 0, true), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wildcards_match_like_a_shell() {
+        assert!(wildcard_match("*", "anything.txt"));
+        assert!(wildcard_match("*.txt", "a.txt"));
+        assert!(!wildcard_match("*.txt", "a.txt.bak"));
+        assert!(wildcard_match("a?c*", "abcdef"));
+        assert!(!wildcard_match("a?c", "ac"));
+        assert!(wildcard_match("*a*b*", "xxaxxbxx"));
+        assert!(wildcard_match("", ""));
+    }
+
+    #[test]
+    fn select_unselect_and_invert_touch_files_only() {
+        let dir = sort_test_dir("pc_test_select_group");
+        let mut pane = Pane::new(dir.clone(), false).unwrap();
+        // files: a.rs, b.txt, c.md; dirs: adir, zdir
+        assert_eq!(pane.mark_matching("*.TXT, *.md", true), 2);
+        let mut marked: Vec<_> = pane.marked.iter().cloned().collect();
+        marked.sort();
+        assert_eq!(marked, ["b.txt", "c.md"]);
+        assert_eq!(pane.mark_matching("*.md", false), 1);
+        assert_eq!(pane.invert_marks(), 2);
+        let mut marked: Vec<_> = pane.marked.iter().cloned().collect();
+        marked.sort();
+        assert_eq!(marked, ["a.rs", "c.md"]);
+        assert_eq!(pane.mark_matching("*", true), 1);
+        assert!(!pane.marked.contains("adir"));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

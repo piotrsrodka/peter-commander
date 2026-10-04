@@ -57,6 +57,8 @@ impl DialogKind {
 pub enum TextInputKind {
     MkDir,
     NewFile,
+    SelectFiles,
+    UnselectFiles,
 }
 
 impl TextInputKind {
@@ -64,6 +66,8 @@ impl TextInputKind {
         match self {
             TextInputKind::MkDir => "New directory",
             TextInputKind::NewFile => "New file",
+            TextInputKind::SelectFiles => "Select",
+            TextInputKind::UnselectFiles => "Unselect",
         }
     }
 
@@ -71,6 +75,8 @@ impl TextInputKind {
         match self {
             TextInputKind::MkDir => "New directory name:",
             TextInputKind::NewFile => "New file name:",
+            TextInputKind::SelectFiles => "Select files matching (e.g. *.jpg *.png):",
+            TextInputKind::UnselectFiles => "Unselect files matching (e.g. *.jpg *.png):",
         }
     }
 }
@@ -101,10 +107,10 @@ pub enum Dialog {
         input: String,
         src: PathBuf,
     },
-    /// Bulk Rename, after the editor closed with a valid edit: shows what
+    /// Rename Selected, after the editor closed with a valid edit: shows what
     /// will change and — defaulting to Cancel — which existing files would
     /// be replaced, before anything is touched.
-    ConfirmBulkRename {
+    ConfirmRenameSelected {
         dir: PathBuf,
         plan: Plan,
     },
@@ -125,8 +131,9 @@ pub enum SettingItem {
     MouseCapture,
     ClassicStyle,
     StartLeftInCwd,
-    PaneTotals,
     UseTrash,
+    ColumnHeaders,
+    PaneTotals,
 }
 
 impl SettingItem {
@@ -137,37 +144,26 @@ impl SettingItem {
         SettingItem::MouseCapture,
         SettingItem::ClassicStyle,
         SettingItem::StartLeftInCwd,
-        SettingItem::PaneTotals,
         SettingItem::UseTrash,
+        SettingItem::ColumnHeaders,
+        SettingItem::PaneTotals,
     ];
 
-    /// Label shown on the "off" side of the two-way switch (i.e. when
-    /// `App::setting_value` is `false`).
-    pub fn left_label(&self) -> &'static str {
+    /// The two sides of this setting's switch, left then right: each
+    /// side's label and the value choosing it sets. Which side holds
+    /// `true` is per setting, so labels can be swapped here freely without
+    /// touching the stored flag's name or meaning.
+    pub fn sides(&self) -> [(&'static str, bool); 2] {
         match self {
-            SettingItem::WaitAfterShellCommand => "Return immediately",
-            SettingItem::HideHiddenFiles => "Show hidden files",
-            SettingItem::InternalPreview => "External pager (F3)",
-            SettingItem::MouseCapture => "Terminal mouse",
-            SettingItem::ClassicStyle => "Terminal theme colors",
-            SettingItem::StartLeftInCwd => "Restore last session",
-            SettingItem::PaneTotals => "Plain panes",
-            SettingItem::UseTrash => "F8 deletes permanently",
-        }
-    }
-
-    /// Label shown on the "on" side of the two-way switch (i.e. when
-    /// `App::setting_value` is `true`).
-    pub fn right_label(&self) -> &'static str {
-        match self {
-            SettingItem::WaitAfterShellCommand => "Wait for Enter",
-            SettingItem::HideHiddenFiles => "Hide hidden files",
-            SettingItem::InternalPreview => "Built-in preview",
-            SettingItem::MouseCapture => "App mouse clicks",
-            SettingItem::ClassicStyle => "Classic NC colors",
-            SettingItem::StartLeftInCwd => "Start in launch dir",
-            SettingItem::PaneTotals => "Show file/byte counts",
-            SettingItem::UseTrash => "F8 moves to trash",
+            SettingItem::WaitAfterShellCommand => [("Return immediately", false), ("Wait for Enter", true)],
+            SettingItem::HideHiddenFiles => [("Show hidden files", false), ("Hide hidden files", true)],
+            SettingItem::InternalPreview => [("External pager (F3)", false), ("Built-in preview", true)],
+            SettingItem::MouseCapture => [("Terminal mouse", false), ("App mouse clicks", true)],
+            SettingItem::ClassicStyle => [("Terminal theme colors", false), ("Classic NC colors", true)],
+            SettingItem::StartLeftInCwd => [("Restore last session", false), ("Start in launch dir", true)],
+            SettingItem::UseTrash => [("F8 deletes permanently", false), ("F8 moves to trash", true)],
+            SettingItem::ColumnHeaders => [("Show column headers", true), ("No headers", false)],
+            SettingItem::PaneTotals => [("Show status bar", true), ("Plain panes", false)],
         }
     }
 
@@ -183,6 +179,7 @@ impl SettingItem {
             SettingItem::StartLeftInCwd => "start_left_in_cwd",
             SettingItem::PaneTotals => "pane_totals",
             SettingItem::UseTrash => "use_trash",
+            SettingItem::ColumnHeaders => "column_headers",
         }
     }
 }
@@ -197,7 +194,7 @@ pub enum ExternalRequest {
     RevealTerminal,
     /// Open `list_file` (the names, one per line) in $EDITOR, then hand
     /// the result to `App::finish_bulk_rename`.
-    BulkRename {
+    RenameSelected {
         list_file: PathBuf,
         dir: PathBuf,
         names: Vec<String>,
@@ -297,6 +294,10 @@ pub struct App {
     /// Whether F8 sends items to the desktop trash (recoverable) instead of
     /// deleting them for good. Shift+F8 always deletes permanently.
     pub use_trash: bool,
+    /// Whether each pane starts with a Name/Size/Date header row (classic
+    /// NC), which then also carries the sort arrow; otherwise the sort is
+    /// shown on the pane's top border.
+    pub column_headers: bool,
     /// Height (in text rows) of the preview pane in the last drawn frame,
     /// so scrolling can stop once the last line reaches the bottom of the
     /// visible area instead of scrolling it away entirely.
@@ -380,7 +381,11 @@ impl App {
             .get(SettingItem::UseTrash.key())
             .copied()
             .unwrap_or(true);
-        Ok(App {
+        let column_headers = saved_settings
+            .get(SettingItem::ColumnHeaders.key())
+            .copied()
+            .unwrap_or(true);
+        let mut app = App {
             left: Pane::new(left_dir, hide_hidden_files)?,
             right: Pane::new(right_dir, hide_hidden_files)?,
             active: Side::Left,
@@ -413,6 +418,7 @@ impl App {
             start_left_in_cwd,
             pane_totals,
             use_trash,
+            column_headers,
             preview_visible_lines: 0,
             preview_visible_width: 0,
             pane_visible_lines: 0,
@@ -425,11 +431,49 @@ impl App {
             menu_bar_tiles: Vec::new(),
             menu_item_tiles: Vec::new(),
             last_scroll_at: None,
-        })
+        };
+        app.restore_sorts();
+        Ok(app)
     }
 
     pub fn save_state(&self) {
         state::save(&self.left.cwd, &self.right.cwd);
+        state::save_sorts(
+            (self.left.sort_key, self.left.sort_reversed),
+            (self.right.sort_key, self.right.sort_reversed),
+        );
+    }
+
+    /// Restores each pane's sort from last session.
+    fn restore_sorts(&mut self) {
+        let Some((left, right)) = state::load_sorts() else {
+            return;
+        };
+        if let Err(err) = self.left.apply_sort(left.0, left.1) {
+            self.set_error(format!("Cannot reload left pane: {err}"));
+        }
+        if let Err(err) = self.right.apply_sort(right.0, right.1) {
+            self.set_error(format!("Cannot reload right pane: {err}"));
+        }
+    }
+
+    /// The menu text for `action`: the Sort item matching the active
+    /// pane's current sort gets its direction arrow appended.
+    pub fn menu_label(&self, action: Action) -> String {
+        let key = match action {
+            Action::SortByName => SortKey::Name,
+            Action::SortByExtension => SortKey::Extension,
+            Action::SortBySize => SortKey::Size,
+            Action::SortByDate => SortKey::Modified,
+            _ => return action.label().to_string(),
+        };
+        let pane = self.active_pane_ref();
+        if pane.sort_key == key {
+            let arrow = if pane.sort_descending() { '\u{2193}' } else { '\u{2191}' };
+            format!("{} {arrow}", action.label())
+        } else {
+            action.label().to_string()
+        }
     }
 
     /// Records an unexpected failure (I/O errors etc.) to the log — for
@@ -520,17 +564,21 @@ impl App {
             | Action::Copy
             | Action::Move
             | Action::Delete
-            | Action::DeletePermanently => has_real_selection,
+            | Action::DeletePermanently
+            | Action::SelectFile => has_real_selection,
             // View also works on directories (and "..") — quick-view shows
             // a name-only listing for those.
             Action::View => entry.is_some(),
             Action::Edit => selection_is_file,
-            Action::BulkRename => {
-                has_real_selection || !self.active_pane_ref().marked.is_empty()
-            }
-            Action::BackgroundJob => self.job.is_some(),
+            // One item is plain F2 Rename; bulk needs at least two marked.
+            Action::RenameSelected => self.active_pane_ref().marked.len() >= 2,
+            Action::ShowProgress => self.job.is_some(),
+            Action::Separator => false,
             Action::MkDir
             | Action::NewFile
+            | Action::SelectFiles
+            | Action::UnselectFiles
+            | Action::InvertSelection
             | Action::QuickSearch
             | Action::SortByName
             | Action::SortByExtension
@@ -796,28 +844,25 @@ impl App {
         self.quick_search = None;
     }
 
-    /// File > Bulk Rename: the marked items (or the one under the cursor)
+    /// File > Rename Selected: the marked items (two or more — one is just F2)
     /// go one name per line into a temp file that `main` opens in $EDITOR.
     fn request_bulk_rename(&mut self) {
         let pane = self.active_pane_ref();
-        let mut names: Vec<String> = pane.marked_items().into_iter().map(|(name, _)| name).collect();
-        if names.is_empty() {
-            match pane.selected_entry() {
-                Some(entry) if entry.name != ".." => names.push(entry.name.clone()),
-                _ => return,
-            }
+        let names: Vec<String> = pane.marked_items().into_iter().map(|(name, _)| name).collect();
+        if names.len() < 2 {
+            return;
         }
         if names.iter().any(|name| name.contains('\n') || name.contains('\r')) {
-            self.set_error("Bulk rename cannot handle names containing line breaks".to_string());
+            self.set_error("Rename selected cannot handle names containing line breaks".to_string());
             return;
         }
         let dir = pane.cwd.clone();
         let list_file = env::temp_dir().join(format!("pc-bulk-rename-{}.txt", std::process::id()));
         if let Err(err) = std::fs::write(&list_file, bulk_rename::list_text(&names)) {
-            self.set_error(format!("Bulk rename: cannot write {}: {err}", list_file.display()));
+            self.set_error(format!("Rename selected: cannot write {}: {err}", list_file.display()));
             return;
         }
-        self.external_request = Some(ExternalRequest::BulkRename {
+        self.external_request = Some(ExternalRequest::RenameSelected {
             list_file,
             dir,
             names,
@@ -831,24 +876,24 @@ impl App {
         let edited = std::fs::read_to_string(list_file);
         let _ = std::fs::remove_file(list_file);
         if !editor_ok {
-            self.set_status("Bulk rename aborted".to_string());
+            self.set_status("Rename selected aborted".to_string());
             return;
         }
         let edited = match edited {
             Ok(text) => text,
             Err(err) => {
-                self.set_error(format!("Bulk rename: cannot read the edited list: {err}"));
+                self.set_error(format!("Rename selected: cannot read the edited list: {err}"));
                 return;
             }
         };
         match bulk_rename::plan(&dir, names, &edited) {
-            Err(message) => self.set_error(format!("Bulk rename: {message} — nothing was renamed")),
+            Err(message) => self.set_error(format!("Rename selected: {message} — nothing was renamed")),
             Ok(plan) if plan.renames.is_empty() => {
-                self.set_status("Bulk rename: no names changed".to_string());
+                self.set_status("Rename selected: no names changed".to_string());
             }
             Ok(plan) => {
                 self.dialog_cancel_focused = !plan.overwrites.is_empty();
-                self.dialog = Dialog::ConfirmBulkRename { dir, plan };
+                self.dialog = Dialog::ConfirmRenameSelected { dir, plan };
             }
         }
     }
@@ -972,13 +1017,21 @@ impl App {
             Action::SortByExtension => self.sort_active_pane(SortKey::Extension),
             Action::SortBySize => self.sort_active_pane(SortKey::Size),
             Action::SortByDate => self.sort_active_pane(SortKey::Modified),
-            Action::BackgroundJob => {
+            Action::ShowProgress => {
                 if self.job.is_some() {
                     self.job_visible = true;
                     self.job_cancel_focused = false;
                 }
             }
-            Action::BulkRename => self.request_bulk_rename(),
+            Action::RenameSelected => self.request_bulk_rename(),
+            Action::Separator => {}
+            Action::SelectFile => self.active_pane().toggle_mark_selected(),
+            Action::SelectFiles => self.request_select_files(TextInputKind::SelectFiles),
+            Action::UnselectFiles => self.request_select_files(TextInputKind::UnselectFiles),
+            Action::InvertSelection => {
+                let marked = self.active_pane().invert_marks();
+                self.set_status(format!("{marked} file(s) selected"));
+            }
             Action::Quit => {
                 self.dialog = Dialog::ConfirmQuit;
                 self.dialog_cancel_focused = false;
@@ -1013,6 +1066,7 @@ impl App {
             SettingItem::StartLeftInCwd => self.start_left_in_cwd,
             SettingItem::PaneTotals => self.pane_totals,
             SettingItem::UseTrash => self.use_trash,
+            SettingItem::ColumnHeaders => self.column_headers,
         }
     }
 
@@ -1024,6 +1078,7 @@ impl App {
             SettingItem::StartLeftInCwd => self.start_left_in_cwd = value,
             SettingItem::PaneTotals => self.pane_totals = value,
             SettingItem::UseTrash => self.use_trash = value,
+            SettingItem::ColumnHeaders => self.column_headers = value,
             SettingItem::HideHiddenFiles => {
                 self.left.hide_hidden = value;
                 self.right.hide_hidden = value;
@@ -1072,18 +1127,22 @@ impl App {
         }
     }
 
-    /// Left/Right arrows: snap the selected switch to its left (`false`) or
-    /// right (`true`) side directly, rather than toggling — pressing the
-    /// arrow for the side that's already active is a no-op.
+    /// Left/Right arrows: snap the selected switch to its left or right
+    /// side directly (whichever value that side stands for, see
+    /// `SettingItem::sides`), rather than toggling — pressing the arrow for
+    /// the side that's already active is a no-op.
     pub fn settings_select_left(&mut self) {
-        if let Dialog::Settings { selected, .. } = &self.dialog {
-            self.set_setting_value(SettingItem::ALL[*selected], false);
-        }
+        self.settings_select_side(0);
     }
 
     pub fn settings_select_right(&mut self) {
+        self.settings_select_side(1);
+    }
+
+    fn settings_select_side(&mut self, side: usize) {
         if let Dialog::Settings { selected, .. } = &self.dialog {
-            self.set_setting_value(SettingItem::ALL[*selected], true);
+            let item = SettingItem::ALL[*selected];
+            self.set_setting_value(item, item.sides()[side].1);
         }
     }
 
@@ -1212,7 +1271,7 @@ impl App {
     fn request_transfer(&mut self, kind: DialogKind) {
         if self.job.is_some() {
             self.set_error(
-                "Another copy/move is still running (Command > Background Job shows it)".to_string(),
+                "Another copy/move is still running (Ctrl+B shows it)".to_string(),
             );
             return;
         }
@@ -1343,6 +1402,16 @@ impl App {
                 self.left.reload()?;
                 self.right.reload()?;
             }
+            Dialog::TextInput { kind, input }
+                if matches!(kind, TextInputKind::SelectFiles | TextInputKind::UnselectFiles) =>
+            {
+                let select = *kind == TextInputKind::SelectFiles;
+                let patterns = input.clone();
+                let changed = self.active_pane().mark_matching(&patterns, select);
+                let verb = if select { "Selected" } else { "Unselected" };
+                self.set_status(format!("{verb} {changed} file(s) matching {patterns}"));
+                self.dialog = Dialog::None;
+            }
             Dialog::TextInput { kind, input } => {
                 let kind = *kind;
                 let name = input.clone();
@@ -1367,19 +1436,20 @@ impl App {
                         }
                         Err(err) => self.set_error(format!("New file failed: {err}")),
                     },
+                    TextInputKind::SelectFiles | TextInputKind::UnselectFiles => {}
                 }
 
                 self.dialog = Dialog::None;
                 self.left.reload()?;
                 self.right.reload()?;
             }
-            Dialog::ConfirmBulkRename { dir, plan } => {
+            Dialog::ConfirmRenameSelected { dir, plan } => {
                 let (done, errors) = bulk_rename::execute(dir, plan);
                 if errors.is_empty() {
                     self.set_status(format!("Renamed {done} item(s) in {}", dir.display()));
                 } else {
                     self.set_error(format!(
-                        "Bulk rename: {done} renamed, {} failed: {}",
+                        "Rename selected: {done} renamed, {} failed: {}",
                         errors.len(),
                         errors.join("; ")
                     ));
@@ -1407,7 +1477,7 @@ impl App {
         self.dialog = Dialog::None;
         if wants_job && self.job.is_some() {
             self.set_error(
-                "Another operation is still running (Command > Background Job shows it)".to_string(),
+                "Another operation is still running (Ctrl+B shows it)".to_string(),
             );
             return Ok(());
         }
@@ -1491,6 +1561,16 @@ impl App {
         self.dialog = Dialog::TextInput {
             kind: TextInputKind::MkDir,
             input: String::new(),
+        };
+        self.dialog_cancel_focused = false;
+    }
+
+    /// File > Select/Unselect Files: asks for wildcard patterns, starting
+    /// from `*` (everything), as in Norton Commander.
+    fn request_select_files(&mut self, kind: TextInputKind) {
+        self.dialog = Dialog::TextInput {
+            kind,
+            input: "*".to_string(),
         };
         self.dialog_cancel_focused = false;
     }
@@ -1623,6 +1703,14 @@ fn existing_destinations(items: &[(String, PathBuf)], dest_dir: &Path) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_setting_switch_has_one_side_per_value() {
+        for item in SettingItem::ALL {
+            let [(_, left), (_, right)] = item.sides();
+            assert_ne!(left, right, "{item:?} needs one side for true and one for false");
+        }
+    }
 
     #[test]
     fn lists_only_items_whose_destination_exists() {

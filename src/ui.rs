@@ -5,15 +5,15 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Widget, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap,
 };
 
 use crate::app::{App, Dialog, DialogKind, SettingItem, Side};
 use crate::bulk_rename::Plan;
 use crate::job::Job;
 use crate::logging;
-use crate::menu::{FN_KEYS, MENU_BAR};
-use crate::pane::Pane;
+use crate::menu::{Action, FN_KEYS, MENU_BAR};
+use crate::pane::{Pane, SortKey};
 use crate::preview::{self, PreviewContent};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -38,7 +38,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // status footer row when that's on (see `draw_pane`), so PgUp/PgDn page
     // by exactly what's actually visible in the file listing.
     let footer_rows = if app.pane_totals { 2 } else { 0 };
-    app.pane_visible_lines = panes[0].height.saturating_sub(2 + footer_rows) as usize;
+    let header_rows = if app.column_headers { 1 } else { 0 };
+    app.pane_visible_lines = panes[0].height.saturating_sub(2 + footer_rows + header_rows) as usize;
     app.left_pane_area = panes[0];
     app.right_pane_area = panes[1];
 
@@ -55,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &mut app.left_list_state,
                     app.classic_style,
                     app.pane_totals,
+                    app.column_headers,
                 );
                 draw_preview_pane(
                     frame,
@@ -84,6 +86,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &mut app.right_list_state,
                     app.classic_style,
                     app.pane_totals,
+                    app.column_headers,
                 );
             }
         }
@@ -96,6 +99,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &mut app.left_list_state,
             app.classic_style,
             app.pane_totals,
+            app.column_headers,
         );
         draw_pane(
             frame,
@@ -105,6 +109,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &mut app.right_list_state,
             app.classic_style,
             app.pane_totals,
+            app.column_headers,
         );
     }
 
@@ -176,8 +181,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.dialog_cancel_focused,
             );
         }
-        Dialog::ConfirmBulkRename { dir, plan } => {
-            draw_bulk_rename_dialog(
+        Dialog::ConfirmRenameSelected { dir, plan } => {
+            draw_rename_selected_dialog(
                 frame,
                 app.classic_style,
                 &dir.display().to_string(),
@@ -206,69 +211,37 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.help_open {
-        draw_help(frame, app.help_page);
+        draw_help(frame, app.classic_style, app.help_page);
     }
 
     if app.logs_open {
-        draw_logs(frame);
+        draw_logs(frame, app.classic_style);
     }
 
     if let Some(message) = &app.error_dialog {
-        draw_error_dialog(frame, message);
+        draw_error_dialog(frame, app.classic_style, message);
     }
 }
 
 /// A blocking "in your face" popup for `App::set_error` — unlike a routine
 /// confirmation, an error demands a keypress to dismiss (any key, handled in
 /// `main.rs`) so it can't be missed the way the log-only status line can.
-fn draw_error_dialog(frame: &mut Frame, message: &str) {
-    let area = frame.area();
-    let inner_width = area.width.saturating_sub(4).clamp(20, 64) as usize;
-    let hint = "Press any key to continue";
-    let wrapped = wrap_message(message, inner_width);
-    let content_width = wrapped
-        .iter()
-        .map(|line| line.len())
-        .max()
-        .unwrap_or(0)
-        .max(hint.len());
-    let width = (content_width as u16 + 4).min(area.width);
-    let height = wrapped.len() as u16 + 4;
-    let dialog_area = Rect {
-        x: (area.width.saturating_sub(width)) / 2,
-        y: (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
-    let block = Block::default()
-        .title(" Error ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    let mut lines: Vec<Line> = wrapped
+/// Same double-bordered box as every other dialog, in the classic red of
+/// Norton Commander's error boxes.
+fn draw_error_dialog(frame: &mut Frame, classic_style: bool, message: &str) {
+    let pal = error_palette(classic_style);
+    let wrap_width = (frame.area().width as usize).saturating_sub(16).clamp(20, 64);
+    let lines = wrap_message(message, wrap_width)
         .into_iter()
         .map(|line| {
-            Line::from(Span::styled(
+            DialogLine::Text(Line::from(Span::styled(
                 line,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ))
+                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+            )))
         })
         .collect();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        hint,
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let paragraph = Paragraph::new(lines).block(block);
-
-    draw_shadow_for(frame, dialog_area);
-    frame.render_widget(Clear, dialog_area);
-    frame.render_widget(paragraph, dialog_area);
+    let sections = vec![lines, vec![button_row(&[("OK", true)], &pal)]];
+    draw_dialog_box(frame, &pal, "Error", sections, 0);
 }
 
 /// Greedy word-wrap to at most `width` columns per line — good enough for
@@ -294,111 +267,105 @@ fn wrap_message(message: &str, width: usize) -> Vec<String> {
     lines
 }
 
-const HELP_PAGE_1: &[&str] = &[
-    "F1        Help          Show this screen",
-    "F2        Rename        Rename selection (move within same dir)",
-    "F3        View          Page selected file with $PAGER",
-    "F4        Edit          Edit selected file with $EDITOR",
-    "Shift+F4  New File      Create a new empty file",
-    "F5        Copy          Copy selection (or marked files) to the other pane",
-    "F6        Move          Move selection (or marked files) to the other pane",
-    "F7        MkDir         Create a new directory",
-    "F8        Delete        Trash (or delete, per Settings) selection/marked files",
-    "Shift+F8  Delete        Permanently delete selection or marked files",
-    "F9        Menu          Open the pulldown menu",
-    "F10       Quit          Quit PeterCommander (asks to confirm)",
-    "",
-    "Alt+F1    Left = Right   Point left pane at right pane's dir",
-    "Alt+F2    Right = Left   Point right pane at left pane's dir",
-    "Alt+F/O/C Menu           Jump to the File/Options/Command menu",
-    "Ctrl+O    Terminal       Reveal the terminal/scrollback under panels",
-    "Ctrl+Q    Quit           Same as F10, in case your terminal eats F10",
-    "Ctrl+L    Show Logs      Same as F9 > Command > Show Logs",
-    "Ctrl+S    Settings       Same as F9 > Options > Settings",
-    "",
-    "Tab       Switch the active pane",
-    "Up/Down   Move the selection",
-    "Home/End  Jump to the top/bottom of the listing",
-    "PgUp/PgDn Move the selection by one screenful",
-    "Insert    Mark/unmark the entry and move down",
+/// The three F1 pages: a title and its lines. Left/Right flip between them.
+const HELP_PAGES: &[(&str, &[&str])] = &[
+    (
+        "Function keys",
+        &[
+            "F1        Help          This screen",
+            "F2        Rename        Rename the selected entry",
+            "F3        View          Quick view (or $PAGER, per Settings)",
+            "F4        Edit          Edit the selected file in $EDITOR",
+            "Shift+F4  New File      Create a new empty file",
+            "F5        Copy          Copy selection/marked to the other pane",
+            "F6        Move          Move selection/marked to the other pane",
+            "F7        MkDir         Create a new directory",
+            "F8        Delete        Move to trash (or delete, per Settings)",
+            "Shift+F8  Delete        Delete permanently",
+            "F9        Menu          Open the pulldown menu",
+            "F10       Quit          Quit PeterCommander",
+        ],
+    ),
+    (
+        "Shortcuts and navigation",
+        &[
+            "Ctrl+F    Quick Search   Jump to a name by typing part of it",
+            "Ctrl+B    Progress       Show a copy/move running in background",
+            "Ctrl+O    Terminal       Reveal the terminal under the panels",
+            "Ctrl+L    Show Logs      Recent status and error messages",
+            "Ctrl+S    Settings       Open the settings",
+            "Ctrl+Q    Quit           Same as F10",
+            "Alt+F1    Left = Right   Point left pane at right pane's dir",
+            "Alt+F2    Right = Left   Point right pane at left pane's dir",
+            "Alt+F/O/C Menu           Open the File/Options/Command menu",
+            "",
+            "Tab       Switch the active pane",
+            "Up/Down   Move the selection",
+            "Home/End  Jump to the top/bottom of the listing",
+            "PgUp/PgDn Move by one screenful",
+            "Insert    Mark/unmark the entry and move down",
+        ],
+    ),
+    (
+        "Tips",
+        &[
+            "Type anywhere to fill the command line; Enter runs it in the",
+            "active pane's directory, or opens the selection if it's empty.",
+            "Esc clears the command line.",
+            "",
+            "Command > Sort by Name/Type/Size/Date sorts the active pane;",
+            "picking the same sort again reverses it. Each pane keeps its",
+            "own sort (shown top right, e.g. [Size\u{2193}]), saved on quit.",
+            "",
+            "File > Rename Selected (two or more marked) edits the names in",
+            "$EDITOR, one per line, and asks before renaming.",
+            "",
+            "Copy/Move show a progress window: Esc or [ Background ] lets it",
+            "run while you work; Ctrl+B shows it again.",
+            "",
+            "Mouse: scroll the active pane/preview, click the menu bar or an",
+            "F-key tile.",
+        ],
+    ),
 ];
 
-const HELP_PAGE_2: &[&str] = &[
-    "Type anywhere to fill the command line below the panes;",
-    "Enter runs it in the active pane's directory, or opens",
-    "the selected entry if the command line is empty.",
-    "Esc clears the command line. Quit with F10 (or F9 > Command > Quit).",
-    "",
-    "F9 > Options > Settings opens the settings screen: Up/Down",
-    "to move, Space to toggle a checkbox, Enter to save, Esc to cancel.",
-    "",
-    "F9 > Command > Show Logs shows recent status/error messages —",
-    "there's no dedicated status line any more, they're logged instead.",
-    "",
-    "F9 > Command > Quick Search: type to jump to a matching name,",
-    "Up/Down for the previous/next match, Esc or Enter when done.",
-    "F9 > Command > Sort by Name/Extension/Size/Date sorts the active",
-    "pane; picking the same sort again reverses it.",
-    "F9 > File > Bulk Rename edits the marked names in $EDITOR, one per",
-    "line, and asks before renaming (warning about any overwrites).",
-    "",
-    "Copy/Move show a progress window: Esc or [ Background ] lets it",
-    "run while you work; F9 > Command > Background Job shows it again.",
-    "",
-    "Mouse: scroll the active pane/preview, click the menu bar or an",
-    "F-key tile.",
-];
+pub const HELP_PAGE_COUNT: usize = HELP_PAGES.len();
 
-const HELP_FOOTER: &str = "Left/Right: switch page   Any other key: close";
+fn draw_help(frame: &mut Frame, classic_style: bool, page: usize) {
+    let pal = dialog_palette(classic_style);
+    let (title, body) = HELP_PAGES[page.min(HELP_PAGES.len() - 1)];
 
-fn draw_help(frame: &mut Frame, page: usize) {
-    let lines_for_page = if page == 0 { HELP_PAGE_1 } else { HELP_PAGE_2 };
-
-    // Sized from both pages combined (not just the one currently shown),
-    // so the window stays the same size when switching pages instead of
-    // resizing around whichever page happens to be shorter.
-    let width = HELP_PAGE_1
+    // Every page gets the same height and width, so flipping pages doesn't
+    // make the box jump around.
+    let rows = HELP_PAGES.iter().map(|(_, lines)| lines.len()).max().unwrap_or(0);
+    let widest = HELP_PAGES
         .iter()
-        .chain(HELP_PAGE_2)
-        .chain([&HELP_FOOTER])
+        .flat_map(|(_, lines)| lines.iter())
         .map(|line| line.chars().count())
         .max()
-        .unwrap_or(20) as u16
-        + 4;
-    let width = width.min(frame.area().width);
-    let content_height = HELP_PAGE_1.len().max(HELP_PAGE_2.len()) as u16;
-    let height = (content_height + 4).min(frame.area().height);
+        .unwrap_or(0);
+    let min_width = (widest + 2 * DIALOG_PAD + 2) as u16 + 2 * OUTER_PAD_X;
 
-    let area = Rect {
-        x: (frame.area().width.saturating_sub(width)) / 2,
-        y: (frame.area().height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
-    let mut lines: Vec<Line> = lines_for_page
+    let mut lines: Vec<DialogLine> = body
         .iter()
-        .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::White))))
+        .map(|line| DialogLine::Text(Line::from(Span::styled(*line, Style::default().fg(pal.fg)))))
         .collect();
-    // Pad the shorter page so the footer lands on the same row on both
-    // pages, not just the box being the same overall size.
-    lines.resize(content_height as usize, Line::from(""));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        HELP_FOOTER,
-        Style::default().fg(Color::DarkGray),
-    )));
+    while lines.len() < rows {
+        lines.push(DialogLine::Text(Line::from("")));
+    }
 
-    let block = Block::default()
-        .title(format!("Help — Keybindings (Page {}/2)", page + 1))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
-        .style(Style::default().bg(Color::Black).fg(Color::White));
+    let page_marks: String = (0..HELP_PAGES.len())
+        .map(|idx| if idx == page { '\u{25cf}' } else { '\u{25cb}' })
+        .map(|mark| format!("{mark} "))
+        .collect();
+    let footer = DialogLine::Centered(Line::from(vec![
+        Span::styled("\u{2190} ", Style::default().fg(pal.fg)),
+        Span::styled(page_marks, Style::default().fg(pal.fg).add_modifier(Modifier::BOLD)),
+        Span::styled("\u{2192}   any other key closes", Style::default().fg(pal.fg)),
+    ]));
 
-    let paragraph = Paragraph::new(lines).block(block);
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(paragraph, area);
+    let title = format!("Help \u{2014} {title} ({}/{})", page + 1, HELP_PAGES.len());
+    draw_dialog_box(frame, &pal, &title, vec![lines, vec![footer]], min_width);
 }
 
 /// Color palette for the big double-bordered dialog frame shared by every
@@ -437,6 +404,31 @@ fn dialog_palette(classic_style: bool) -> DialogPalette {
             field_fg: Color::Black,
             button_default_bg: Color::Cyan,
             button_default_fg: Color::Black,
+        }
+    }
+}
+
+/// Error boxes: the classic white-on-red Norton Commander alert, or — when
+/// following the terminal theme — the usual dialog colors with a red frame.
+fn error_palette(classic_style: bool) -> DialogPalette {
+    let red = Color::Rgb(170, 0, 0);
+    let white = Color::Rgb(255, 255, 255);
+    if classic_style {
+        DialogPalette {
+            bg: red,
+            fg: white,
+            border_fg: white,
+            field_bg: white,
+            field_fg: red,
+            button_default_bg: white,
+            button_default_fg: red,
+        }
+    } else {
+        DialogPalette {
+            border_fg: Color::Red,
+            button_default_bg: Color::Red,
+            button_default_fg: Color::White,
+            ..dialog_palette(false)
         }
     }
 }
@@ -504,7 +496,26 @@ fn draw_dialog_frame(
     sections: Vec<Vec<DialogLine>>,
     min_half_screen: bool,
 ) {
-    let pal = dialog_palette(classic_style);
+    // Never narrower than half the screen, however short the content is —
+    // applied to the full outer footprint, border pad included. Quit opts
+    // out, staying sized to its (short) content instead.
+    let min_width = if min_half_screen {
+        frame.area().width / 2
+    } else {
+        0
+    };
+    draw_dialog_box(frame, &dialog_palette(classic_style), title, sections, min_width);
+}
+
+/// `draw_dialog_frame` with an explicit palette (e.g. the red error box)
+/// and minimum outer width.
+fn draw_dialog_box(
+    frame: &mut Frame,
+    pal: &DialogPalette,
+    title: &str,
+    sections: Vec<Vec<DialogLine>>,
+    min_width: u16,
+) {
 
     let content_width = sections
         .iter()
@@ -514,14 +525,6 @@ fn draw_dialog_frame(
         .unwrap_or(0)
         .max(title.chars().count() + 4);
     let box_width = content_width as u16 + 2 * DIALOG_PAD as u16 + 2;
-    // Never narrower than half the screen, however short the content is —
-    // applied to the full outer footprint, border pad included. Quit opts
-    // out, staying sized to its (short) content instead.
-    let min_width = if min_half_screen {
-        frame.area().width / 2
-    } else {
-        0
-    };
     let total_width = (box_width + 2 * OUTER_PAD_X)
         .max(min_width)
         .min(frame.area().width);
@@ -819,10 +822,10 @@ fn draw_quit_dialog(frame: &mut Frame, classic_style: bool, job: Option<&Job>, c
 /// up the rest.
 const BULK_RENAME_LIST_LIMIT: usize = 5;
 
-/// Bulk Rename confirmation: a sample of the renames and, when some new
+/// Rename Selected confirmation: a sample of the renames and, when some new
 /// names are already taken by files outside the batch, a warning listing
 /// what would be replaced — the primary button then reads "Overwrite".
-fn draw_bulk_rename_dialog(
+fn draw_rename_selected_dialog(
     frame: &mut Frame,
     classic_style: bool,
     dir: &str,
@@ -880,7 +883,7 @@ fn draw_bulk_rename_dialog(
         &[(primary, !cancel_focused), ("Cancel", cancel_focused)],
         &pal,
     )]);
-    draw_dialog_frame(frame, classic_style, "Bulk Rename", sections, true);
+    draw_dialog_frame(frame, classic_style, "Rename Selected", sections, true);
 }
 
 /// Width of the progress window's bar, in cells.
@@ -1035,83 +1038,71 @@ fn draw_input_dialog(
     draw_dialog_frame(frame, classic_style, title, sections, true);
 }
 
-const SETTINGS_HINT: &str = " \u{2190}/\u{2192}/Space: toggle   Enter: save   Esc: cancel";
+const SETTINGS_HINT: &str = "\u{2191}/\u{2193} move   \u{2190}/\u{2192}/Space toggle   Enter save   Esc cancel";
 
 /// Each setting is shown as a two-way switch — "left label [ ]----[x] right
 /// label" — rather than a single generic checkbox, so both what's on and
 /// what's off are named in positive language instead of one hard-to-phrase
 /// boolean. The left column is padded to the widest left label so the
-/// switches themselves line up in a column.
+/// switches themselves line up in a column; the selected row is a full-width
+/// highlighted bar, like the fields in the other dialogs.
 const SWITCH_TRACK: &str = "----";
 
 fn draw_settings_dialog(frame: &mut Frame, app: &App, selected: usize) {
+    let pal = dialog_palette(app.classic_style);
     let left_col_width = SettingItem::ALL
         .iter()
-        .map(|item| item.left_label().chars().count())
+        .map(|item| item.sides()[0].0.chars().count())
         .max()
         .unwrap_or(0);
 
-    let items: Vec<ListItem> = SettingItem::ALL
+    let right_col_width = SettingItem::ALL
         .iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let (left_box, right_box) = if app.setting_value(*item) {
-                ("[ ]", "[x]")
-            } else {
-                ("[x]", "[ ]")
-            };
-            let style = if idx == selected {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Blue)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            ListItem::new(Line::from(Span::styled(
-                format!(
-                    " {:<left_col_width$} {left_box}{SWITCH_TRACK}{right_box} {}",
-                    item.left_label(),
-                    item.right_label(),
-                ),
-                style,
-            )))
-        })
-        .chain(std::iter::once(ListItem::new(Line::from(Span::styled(
-            SETTINGS_HINT,
-            Style::default().fg(Color::DarkGray),
-        )))))
-        .collect();
-
-    let hint_len = SETTINGS_HINT.chars().count();
-    let switch_width = 3 + SWITCH_TRACK.len() + 3; // "[ ]" + track + "[x]"
-    let width = SettingItem::ALL
-        .iter()
-        .map(|item| 1 + left_col_width + 1 + switch_width + 1 + item.right_label().chars().count() + 2)
-        .chain(std::iter::once(hint_len + 2))
+        .map(|item| item.sides()[1].0.chars().count())
         .max()
-        .unwrap_or(20) as u16;
-    // +2 for a 1-column/1-row padding between the border and the content,
-    // on top of the border itself.
-    let width = (width + 2).min(frame.area().width);
-    let height = (SettingItem::ALL.len() as u16 + 3 + 2).min(frame.area().height);
+        .unwrap_or(0);
 
-    let area = Rect {
-        x: (frame.area().width.saturating_sub(width)) / 2,
-        y: (frame.area().height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
+    // Every row is a full-width field — highlighted for the selected one,
+    // dialog-colored otherwise — so all rows measure the same and moving
+    // the selection never resizes the box.
+    let mut rows = vec![DialogLine::Text(Line::from(""))];
+    rows.extend(SettingItem::ALL.iter().enumerate().map(|(idx, item)| {
+        let [(left_label, left_value), (right_label, _)] = item.sides();
+        let (left_box, right_box) = if app.setting_value(*item) == left_value {
+            ("[x]", "[ ]")
+        } else {
+            ("[ ]", "[x]")
+        };
+        let text = format!(
+            " {left_label:<left_col_width$} {left_box}{SWITCH_TRACK}{right_box} {right_label:<right_col_width$} ",
+        );
+        let (style, fill_bg) = if idx == selected {
+            (
+                Style::default()
+                    .bg(pal.field_bg)
+                    .fg(pal.field_fg)
+                    .add_modifier(Modifier::BOLD),
+                pal.field_bg,
+            )
+        } else {
+            (Style::default().bg(pal.bg).fg(pal.fg), pal.bg)
+        };
+        DialogLine::Field {
+            content: vec![Span::styled(text, style)],
+            fill_bg,
+        }
+    }));
+    rows.push(DialogLine::Text(Line::from("")));
 
-    let block = Block::default()
-        .title("Settings")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black).fg(Color::White))
-        .padding(Padding::uniform(1));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(List::new(items).block(block), area);
+    let sections = vec![
+        rows,
+        vec![DialogLine::Centered(Line::from(Span::styled(
+            SETTINGS_HINT,
+            Style::default().fg(pal.fg),
+        )))],
+        vec![button_row(&[("Save", true), ("Cancel", false)], &pal)],
+    ];
+    draw_dialog_frame(frame, app.classic_style, "Settings", sections, false);
 }
 
 fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1155,12 +1146,12 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(bar, area);
 
     // A job sent to the background keeps a small readout at the right end
-    // of the menu bar (Command > Background Job brings the window back).
+    // of the menu bar (Command > Show Progress, or Ctrl+B, brings the window back).
     if let Some(job) = &app.job
         && !app.job_visible
     {
         let percent = (job_fraction(&job.progress()) * 100.0) as u32;
-        let label = format!(" {} {percent}% ", job.kind.verb());
+        let label = format!(" {} {percent}%  Ctrl+B ", job.kind.verb());
         let width = (label.chars().count() as u16).min(area.width);
         let style = if app.classic_style {
             Style::default()
@@ -1256,7 +1247,7 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
         .iter()
         .map(|action| {
             let shortcut_width = action.shortcut().map_or(0, |s| s.len() + 3);
-            action.label().len() + shortcut_width
+            app.menu_label(*action).chars().count() + shortcut_width
         })
         .max()
         .unwrap_or(4);
@@ -1290,6 +1281,12 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
         .iter()
         .enumerate()
         .map(|(idx, action)| {
+            if *action == Action::Separator {
+                return ListItem::new(Line::from(Span::styled(
+                    "\u{2500}".repeat(area.width.saturating_sub(2) as usize),
+                    menu_border_style(app.classic_style),
+                )));
+            }
             let is_selected = idx == app.menu_item;
             let enabled = app.action_enabled(*action);
             let style = match (app.classic_style, is_selected, enabled) {
@@ -1320,12 +1317,13 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
             } else {
                 style
             };
+            let label = app.menu_label(*action);
             let (label_part, shortcut_part) = match action.shortcut() {
                 Some(shortcut) => (
-                    format!("{:<label_width$}", action.label(), label_width = row_text_width - shortcut.len()),
+                    format!("{label:<label_width$}", label_width = row_text_width - shortcut.len()),
                     format!("{shortcut:>shortcut_width$}", shortcut_width = shortcut.len()),
                 ),
-                None => (format!("{:<row_text_width$}", action.label()), String::new()),
+                None => (format!("{label:<row_text_width$}"), String::new()),
             };
             ListItem::new(Line::from(vec![
                 Span::styled(" ", style),
@@ -1351,10 +1349,45 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(List::new(items).block(block), area);
+
+    // Tee each separator into the dropdown's border, like the dividers in
+    // the dialogs.
+    let border_style = menu_border_style(app.classic_style);
+    let buf = frame.buffer_mut();
+    for (idx, action) in category.items.iter().enumerate() {
+        if *action != Action::Separator {
+            continue;
+        }
+        let y = area.y + 1 + idx as u16;
+        if let Some(cell) = buf.cell_mut((area.x, y)) {
+            cell.set_symbol("\u{251c}").set_style(border_style);
+        }
+        if let Some(cell) = buf.cell_mut((area.x + area.width.saturating_sub(1), y)) {
+            cell.set_symbol("\u{2524}").set_style(border_style);
+        }
+    }
 }
 
+/// The pulldown's border (and separator) colors, matching `block` in
+/// `draw_menu_dropdown`.
+fn menu_border_style(classic_style: bool) -> Style {
+    if classic_style {
+        Style::default()
+            .fg(classic::MENU_BORDER_FG)
+            .bg(classic::MENU_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::Gray)
+    }
+}
+
+/// Widths of the date ("20-09-26") and time ("15:57") halves of a
+/// formatted modified time, which `format_modified` joins with one space —
+/// shown as separate Date and Time columns when column headers are on.
+const DATE_PART_WIDTH: usize = 8;
+const TIME_PART_WIDTH: usize = 5;
 /// Width of a formatted date/time like "20-09-26 15:57".
-const DATE_COLUMN_WIDTH: usize = 14;
+const DATE_COLUMN_WIDTH: usize = DATE_PART_WIDTH + 1 + TIME_PART_WIDTH;
 /// Width the size column is right-aligned to.
 const SIZE_COLUMN_WIDTH: usize = 10;
 /// Above this, the size column shows megabytes instead of a raw byte count
@@ -1556,6 +1589,10 @@ mod classic {
 /// cursor row itself, where it overrides the highlight's own fg.
 const MARKED_FG: Color = Color::Rgb(0xFF, 0xFF, 0x50);
 
+/// The pane's sort indicator ("[Size↓]") — the same fixed bright yellow,
+/// so it stands out from the border in either palette.
+const SORT_INDICATOR_FG: Color = MARKED_FG;
+
 fn draw_pane(
     frame: &mut Frame,
     area: Rect,
@@ -1564,6 +1601,7 @@ fn draw_pane(
     list_state: &mut ListState,
     classic_style: bool,
     show_totals: bool,
+    show_headers: bool,
 ) {
     let border_style = if classic_style {
         let fg = if is_active {
@@ -1649,7 +1687,9 @@ fn draw_pane(
                 format_size(entry.size)
             };
             let name = fit_name(&entry.name, name_width);
-            let label = format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date} ");
+            // Padded even when empty (".." has no date), so every row — and
+            // the cursor bar on it — spans the full width.
+            let label = format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date:<DATE_COLUMN_WIDTH$} ");
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
@@ -1658,9 +1698,21 @@ fn draw_pane(
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
-    // Right-aligned so a long path can't push it out of sight.
-    if let Some(sort) = pane.sort_indicator() {
-        block = block.title_top(Line::from(format!("[{sort}]")).right_aligned());
+    // With column headers the sort arrow sits on its column's header;
+    // without, on the border — right-aligned so a long path can't push it
+    // out of sight.
+    if !show_headers {
+        block = block.title_top(
+        Line::from(vec![
+            Span::styled("[", border_style),
+            Span::styled(
+                pane.sort_indicator(),
+                Style::default().fg(SORT_INDICATOR_FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("]", border_style),
+        ])
+        .right_aligned(),
+        );
     }
     if classic_style {
         block = block.style(Style::default().bg(classic::BG));
@@ -1701,7 +1753,13 @@ fn draw_pane(
     // onto the border line itself — that crowded the last listed entry
     // right up against it, unlike the top, where the ".." entry already
     // gives the path title some breathing room below it.
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
+    let header_area = (show_headers && inner.height >= 1).then(|| {
+        let header = Rect { height: 1, ..inner };
+        inner.y += 1;
+        inner.height -= 1;
+        header
+    });
     let footer_rows = if inner.height >= 2 { 2 } else { 0 };
     let (list_area, show_footer) = match &status_text {
         Some(_) if footer_rows > 0 => (
@@ -1715,6 +1773,9 @@ fn draw_pane(
     };
 
     frame.render_widget(block, area);
+    if let Some(header_area) = header_area {
+        frame.render_widget(Paragraph::new(column_header_line(pane, name_width)), header_area);
+    }
 
     // The cursor row's highlight is already baked into its `ListItem`
     // style above (so a marked entry can keep its own fg there), so `List`
@@ -1777,6 +1838,93 @@ fn draw_pane(
             cell.set_symbol("┤").set_style(border_style);
         }
     }
+
+    if show_headers {
+        draw_column_separators(frame, area, list_area, header_area, name_width, border_style);
+    }
+}
+
+/// The full-view NC look that goes with the column headers: vertical lines
+/// in the spaces between Name, Size, Date and Time, from the header row down to
+/// the bottom, teed into the top border (`┬`) and into the status divider
+/// or bottom border (`┴`). Drawn over the already-rendered rows, keeping
+/// each cell's colors (the cursor bar runs through them, as in NC).
+fn draw_column_separators(
+    frame: &mut Frame,
+    area: Rect,
+    list_area: Rect,
+    header_area: Option<Rect>,
+    name_width: usize,
+    border_style: Style,
+) {
+    let top = header_area.map_or(list_area.y, |header| header.y);
+    // The row just below the list: the status divider, or the bottom border
+    // when there's no status line — `┴` either way.
+    let bottom = list_area.y + list_area.height;
+    let border_fg = border_style.fg.unwrap_or(Color::Reset);
+    let right_edge = area.x + area.width.saturating_sub(1);
+    let columns = [
+        list_area.x + name_width as u16,
+        list_area.x + (name_width + 1 + SIZE_COLUMN_WIDTH) as u16,
+        list_area.x + (name_width + 1 + SIZE_COLUMN_WIDTH + 1 + DATE_PART_WIDTH) as u16,
+    ];
+
+    let buf = frame.buffer_mut();
+    for x in columns.into_iter().filter(|&x| x < right_edge) {
+        for y in top..bottom {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol("│").set_fg(border_fg);
+            }
+        }
+        // Only where the border is plain line, so a long path title on the
+        // top border is never cut into.
+        if let Some(cell) = buf.cell_mut((x, area.y))
+            && cell.symbol() == "─"
+        {
+            cell.set_symbol("┬");
+        }
+        if let Some(cell) = buf.cell_mut((x, bottom))
+            && cell.symbol() == "─"
+        {
+            cell.set_symbol("┴");
+        }
+    }
+}
+
+/// The classic NC header row: "Name", "Size", "Date" and "Time" in yellow,
+/// each centered over its column (same widths as the rows below), the
+/// sorted column followed by the sort arrow — sorting by type marks the Name
+/// column, since the extension is part of the name, and sorting by date
+/// (date and time together) marks Date.
+fn column_header_line(pane: &Pane, name_width: usize) -> Line<'static> {
+    let sorted_column = match pane.sort_key {
+        SortKey::Name | SortKey::Extension => 0,
+        SortKey::Size => 1,
+        SortKey::Modified => 2,
+    };
+    let columns = [
+        ("Name", name_width),
+        ("Size", SIZE_COLUMN_WIDTH),
+        ("Date", DATE_PART_WIDTH),
+        ("Time", TIME_PART_WIDTH),
+    ];
+    let mut spans = Vec::new();
+    for (idx, (label, width)) in columns.into_iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let text = if idx == sorted_column {
+            let arrow = if pane.sort_descending() { '\u{2193}' } else { '\u{2191}' };
+            format!("{} {arrow}", pane.sort_key.label())
+        } else {
+            label.to_string()
+        };
+        spans.push(Span::styled(
+            format!("{text:^width$}"),
+            Style::default().fg(SORT_INDICATOR_FG),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Quick-view: renders a live preview of `source`'s selected entry, in
@@ -1870,43 +2018,37 @@ fn draw_preview_pane(
 /// Command > Show Logs: reads the tail of the log file fresh each draw
 /// (simple, and the file is small enough that this is cheap) and shows as
 /// many of the most recent lines as fit.
-fn draw_logs(frame: &mut Frame) {
-    let width = frame.area().width.saturating_sub(4).max(20);
-    let height = frame.area().height.saturating_sub(4).max(3);
-    let area = Rect {
-        x: (frame.area().width.saturating_sub(width)) / 2,
-        y: (frame.area().height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
-    let visible_rows = height.saturating_sub(2) as usize; // minus the block's borders
+/// Command > Show Logs: the tail of the log file in a big dialog box.
+fn draw_logs(frame: &mut Frame, classic_style: bool) {
+    let pal = dialog_palette(classic_style);
+    // Outer padding, border, the divider and the footer row — plus the
+    // menu bar and F-key bar, which stay visible around it.
+    let visible_rows = frame
+        .area()
+        .height
+        .saturating_sub(2 * OUTER_PAD_Y + 2 + 2 + 2) as usize;
     let all_lines = std::fs::read_to_string(logging::log_path()).unwrap_or_default();
-    let mut lines: Vec<&str> = all_lines.lines().collect();
-    let total = lines.len();
-    if total > visible_rows {
-        lines = lines.split_off(total - visible_rows);
-    }
-    let shown: Vec<Line> = if lines.is_empty() {
-        vec![Line::from(Span::styled(
+    let lines: Vec<&str> = all_lines.lines().collect();
+    let shown = &lines[lines.len().saturating_sub(visible_rows.max(1))..];
+
+    let body: Vec<DialogLine> = if shown.is_empty() {
+        vec![DialogLine::Text(Line::from(Span::styled(
             "(no log entries yet)",
-            Style::default().fg(Color::DarkGray),
-        ))]
+            Style::default().fg(pal.fg),
+        )))]
     } else {
-        lines
+        shown
             .iter()
-            .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::White))))
+            .map(|line| DialogLine::Text(Line::from(Span::styled(*line, Style::default().fg(pal.fg)))))
             .collect()
     };
-
-    let block = Block::default()
-        .title(format!("Logs — last {} lines — press any key to close", shown.len()))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(shown).block(block), area);
+    let footer = DialogLine::Centered(Line::from(Span::styled(
+        format!("Any key closes   (full log: {})", logging::log_path().display()),
+        Style::default().fg(pal.fg),
+    )));
+    let title = format!("Logs \u{2014} last {} lines", shown.len());
+    let min_width = frame.area().width.saturating_sub(4);
+    draw_dialog_box(frame, &pal, &title, vec![body, vec![footer]], min_width);
 }
 
 fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
