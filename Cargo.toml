@@ -9,6 +9,8 @@ repository = "https://github.com/piotrsrodka/peter-commander"
 readme = "README.md"
 keywords = ["file-manager", "tui", "terminal", "norton-commander"]
 categories = ["command-line-utilities", "filesystem"]
+# Only what `cargo install` needs; screenshots, packaging and CI stay on GitHub.
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]
 anyhow = "1.0.104"

@@ -6,12 +6,12 @@ A dual-pane, keyboard-driven terminal file manager in the tradition of
 Norton Commander. Built for Omarchy in Rust with Ratatui https://ratatui.rs.
 Should work on any Linux, macOS, or Windows.
 
-![Peter Commander](docs/ethereal.png)
+![Peter Commander](https://raw.githubusercontent.com/piotrsrodka/peter-commander/master/docs/ethereal.png)
 
 Also comes with an optional classic retro Norton Commander color scheme
 (Options > Settings):
 
-![Peter Commander in classic Norton Commander colors](docs/nc.jpeg)
+![Peter Commander in classic Norton Commander colors](https://raw.githubusercontent.com/piotrsrodka/peter-commander/master/docs/nc.jpeg)
 
 ## Features
 
