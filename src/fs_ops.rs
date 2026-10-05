@@ -183,7 +183,12 @@ const COPY_CHUNK: u64 = 8 * 1024 * 1024;
 /// only once `dest` has actually been opened for writing: if the source
 /// can't be read or an existing `dest` can't be replaced, `dest` is left
 /// untouched, exactly like `fs::copy`.
-fn copy_file_monitored(src: &Path, dest: &Path, meta: &fs::Metadata, monitor: Monitor) -> Result<()> {
+fn copy_file_monitored(
+    src: &Path,
+    dest: &Path,
+    meta: &fs::Metadata,
+    monitor: Monitor,
+) -> Result<()> {
     monitor.check_cancelled()?;
     let mut reader = fs::File::open(src)?;
     let mut writer = fs::File::create(dest)?;
@@ -412,12 +417,16 @@ fn unescape_mount_field(field: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(field.len());
     let mut i = 0;
     while i < field.len() {
-        let octal = field.get(i + 1..i + 4).filter(|digits| {
-            field[i] == b'\\' && digits.iter().all(|d| (b'0'..=b'7').contains(d))
-        });
+        let octal = field
+            .get(i + 1..i + 4)
+            .filter(|digits| field[i] == b'\\' && digits.iter().all(|d| (b'0'..=b'7').contains(d)));
         match octal {
             Some(digits) => {
-                out.push(digits.iter().fold(0u8, |acc, d| acc.wrapping_mul(8) + (d - b'0')));
+                out.push(
+                    digits
+                        .iter()
+                        .fold(0u8, |acc, d| acc.wrapping_mul(8) + (d - b'0')),
+                );
                 i += 4;
             }
             None => {
@@ -636,7 +645,12 @@ mod tests {
         copy_recursive(&src, &dest).unwrap();
 
         let copied = dest.join("up");
-        assert!(fs::symlink_metadata(&copied).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_link(&copied).unwrap(), Path::new(".."));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -670,14 +684,22 @@ mod tests {
 
         copy_recursive(&link, &target.join("link")).unwrap();
 
-        assert!(fs::symlink_metadata(target.join("link")).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(target.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
     fn set_mtime(path: &Path, secs_ago: u64) -> std::time::SystemTime {
         let time = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
         // Whole seconds, so filesystems with coarse timestamps compare equal.
-        let secs = time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let secs = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
         // Same opener as the code under test: a plain File::open can't set
         // times on Windows, or open a directory there at all.
@@ -777,7 +799,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("readme.txt"), "x").unwrap();
 
-        assert!(!rename_target_taken(&dir.join("readme.txt"), &dir.join("README.TXT")));
+        assert!(!rename_target_taken(
+            &dir.join("readme.txt"),
+            &dir.join("README.TXT")
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -788,7 +813,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("pipe");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
         assert!(made.success());
 
         // Without the guard this blocks forever waiting for a writer.
@@ -841,11 +869,17 @@ mod tests {
         assert_eq!(files.load(std::sync::atomic::Ordering::Relaxed), 2);
 
         assert_eq!(copied.load(std::sync::atomic::Ordering::Relaxed), 1234);
-        assert_eq!(fs::read(dir.join("dest/sub/b.txt")).unwrap(), vec![b'y'; 234]);
+        assert_eq!(
+            fs::read(dir.join("dest/sub/b.txt")).unwrap(),
+            vec![b'y'; 234]
+        );
         assert_eq!(mtime(&dir.join("dest/a.txt")), expected);
         assert_eq!(
             tree_size(&dir.join("src"), &cancel).unwrap(),
-            TreeSize { bytes: 1234, files: 2 }
+            TreeSize {
+                bytes: 1234,
+                files: 2
+            }
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -907,7 +941,10 @@ mod tests {
             on_file_done: None,
         };
         copy_recursive_with(&dir.join("run.sh"), &dir.join("copy.sh"), monitor).unwrap();
-        let mode = fs::metadata(dir.join("copy.sh")).unwrap().permissions().mode();
+        let mode = fs::metadata(dir.join("copy.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o755);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -923,7 +960,10 @@ mod tests {
         fs::write(dir.join("dest.txt"), "old").unwrap();
         fs::set_permissions(dir.join("dest.txt"), fs::Permissions::from_mode(0o444)).unwrap();
         // Root ignores file modes, so this only means something as a user.
-        let read_only_enforced = fs::OpenOptions::new().write(true).open(dir.join("dest.txt")).is_err();
+        let read_only_enforced = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("dest.txt"))
+            .is_err();
 
         let monitor = Monitor {
             cancel: None,
@@ -935,7 +975,9 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("dest.txt")).unwrap(), "old");
 
         if read_only_enforced {
-            assert!(copy_recursive_with(&dir.join("src.txt"), &dir.join("dest.txt"), monitor).is_err());
+            assert!(
+                copy_recursive_with(&dir.join("src.txt"), &dir.join("dest.txt"), monitor).is_err()
+            );
             assert_eq!(fs::read_to_string(dir.join("dest.txt")).unwrap(), "old");
         }
         fs::set_permissions(dir.join("dest.txt"), fs::Permissions::from_mode(0o644)).unwrap();
@@ -947,11 +989,24 @@ mod tests {
     fn mount_fields_are_unescaped_and_longest_mount_wins() {
         assert_eq!(unescape_mount_field(b"/mnt/my\\040disk"), b"/mnt/my disk");
         assert_eq!(unescape_mount_field(b"/plain\\x"), b"/plain\\x");
-        let mounts = vec![PathBuf::from("/"), PathBuf::from("/home"), PathBuf::from("/home/me/usb")];
-        assert_eq!(mount_topdir(Path::new("/home/me/usb/a"), &mounts), Path::new("/home/me/usb"));
-        assert_eq!(mount_topdir(Path::new("/home/me/x"), &mounts), Path::new("/home"));
+        let mounts = vec![
+            PathBuf::from("/"),
+            PathBuf::from("/home"),
+            PathBuf::from("/home/me/usb"),
+        ];
+        assert_eq!(
+            mount_topdir(Path::new("/home/me/usb/a"), &mounts),
+            Path::new("/home/me/usb")
+        );
+        assert_eq!(
+            mount_topdir(Path::new("/home/me/x"), &mounts),
+            Path::new("/home")
+        );
         assert_eq!(mount_topdir(Path::new("/opt"), &mounts), Path::new("/"));
-        assert_eq!(mount_topdir(Path::new("/homework"), &mounts), Path::new("/"));
+        assert_eq!(
+            mount_topdir(Path::new("/homework"), &mounts),
+            Path::new("/")
+        );
     }
 
     #[cfg(target_os = "linux")]

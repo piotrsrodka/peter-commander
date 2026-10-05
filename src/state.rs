@@ -34,7 +34,10 @@ pub fn load_sorts() -> Option<(PaneSort, PaneSort)> {
 fn parse_sorts(contents: &str) -> Option<(PaneSort, PaneSort)> {
     let parse = |line: &str| {
         let (key, reversed) = line.split_once(' ')?;
-        Some((SortKey::from_key(key.trim())?, reversed.trim().parse().ok()?))
+        Some((
+            SortKey::from_key(key.trim())?,
+            reversed.trim().parse().ok()?,
+        ))
     };
     let mut lines = contents.lines();
     Some((parse(lines.next()?)?, parse(lines.next()?)?))
@@ -50,7 +53,13 @@ pub fn save_sorts(left: PaneSort, right: PaneSort) {
 }
 
 fn format_sorts(left: PaneSort, right: PaneSort) -> String {
-    format!("{} {}\n{} {}\n", left.0.key(), left.1, right.0.key(), right.1)
+    format!(
+        "{} {}\n{} {}\n",
+        left.0.key(),
+        left.1,
+        right.0.key(),
+        right.1
+    )
 }
 
 fn settings_file() -> Option<PathBuf> {

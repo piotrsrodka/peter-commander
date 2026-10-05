@@ -105,7 +105,10 @@ pub fn plan(dir: &Path, old_names: &[String], edited: &str) -> Result<Plan, Stri
         })
         .map(|(_, new)| new.clone())
         .collect();
-    Ok(Plan { renames, overwrites })
+    Ok(Plan {
+        renames,
+        overwrites,
+    })
 }
 
 /// Performs a confirmed plan in two phases — every item to a temporary name
@@ -153,7 +156,9 @@ pub fn execute(dir: &Path, plan: &Plan) -> (usize, Vec<String>) {
 /// in which case it stays under its temporary name rather than replacing
 /// anything, and the message says where it is.
 fn restore(dir: &Path, temp: &str, old: &str, message: String) -> String {
-    if fs::symlink_metadata(dir.join(old)).is_err() && fs::rename(dir.join(temp), dir.join(old)).is_ok() {
+    if fs::symlink_metadata(dir.join(old)).is_err()
+        && fs::rename(dir.join(temp), dir.join(old)).is_ok()
+    {
         message
     } else {
         format!("{message} (left as \"{temp}\")")

@@ -19,12 +19,7 @@ fn is_executable_file(_path: &Path, metadata: &fs::Metadata) -> bool {
 fn is_executable_file(path: &Path, _metadata: &fs::Metadata) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| {
-            matches!(
-                ext.to_lowercase().as_str(),
-                "exe" | "bat" | "cmd" | "com"
-            )
-        })
+        .is_some_and(|ext| matches!(ext.to_lowercase().as_str(), "exe" | "bat" | "cmd" | "com"))
 }
 
 /// Whether "hide hidden files" should skip this entry. Unix hides by
@@ -74,7 +69,12 @@ impl SortKey {
         matches!(self, SortKey::Size | SortKey::Modified)
     }
 
-    pub const ALL: [SortKey; 4] = [SortKey::Name, SortKey::Extension, SortKey::Size, SortKey::Modified];
+    pub const ALL: [SortKey; 4] = [
+        SortKey::Name,
+        SortKey::Extension,
+        SortKey::Size,
+        SortKey::Modified,
+    ];
 
     /// Stable identifier for the saved state file, independent of `label`.
     pub fn key(self) -> &'static str {
@@ -147,7 +147,11 @@ fn compare_entries(a: &Entry, b: &Entry, key: SortKey, descending: bool) -> std:
         SortKey::Size => a.size.cmp(&b.size),
         SortKey::Modified => a.modified.cmp(&b.modified),
     };
-    let primary = if descending { primary.reverse() } else { primary };
+    let primary = if descending {
+        primary.reverse()
+    } else {
+        primary
+    };
     primary.then_with(by_name)
 }
 
@@ -285,7 +289,10 @@ impl Pane {
         let mut changed = 0;
         for entry in self.entries.iter().filter(|e| !e.is_dir) {
             let name = entry.name.to_lowercase();
-            if !patterns.iter().any(|pattern| wildcard_match(pattern, &name)) {
+            if !patterns
+                .iter()
+                .any(|pattern| wildcard_match(pattern, &name))
+            {
                 continue;
             }
             let did_change = if select {
@@ -326,7 +333,11 @@ impl Pane {
 
     /// How the listing is sorted, for the pane title — e.g. "Size↓".
     pub fn sort_indicator(&self) -> String {
-        let arrow = if self.sort_descending() { '\u{2193}' } else { '\u{2191}' };
+        let arrow = if self.sort_descending() {
+            '\u{2193}'
+        } else {
+            '\u{2191}'
+        };
         format!("{}{arrow}", self.sort_key.label())
     }
 
@@ -496,7 +507,11 @@ impl Pane {
     /// reloaded entries, selects it instead of defaulting to the top. Used
     /// when navigating up so the cursor lands back on the folder just left,
     /// instead of resetting to the top of the parent listing.
-    fn set_cwd_selecting(&mut self, new_path: PathBuf, select_name: Option<&str>) -> Result<Option<String>> {
+    fn set_cwd_selecting(
+        &mut self,
+        new_path: PathBuf,
+        select_name: Option<&str>,
+    ) -> Result<Option<String>> {
         let previous_cwd = self.cwd.clone();
         let previous_selected = self.selected;
         // Marks belong to the listing they were made in — carrying them by
@@ -680,7 +695,10 @@ mod tests {
 
         let result = pane.change_dir(&base).unwrap();
         assert!(result.is_none());
-        assert_eq!(pane.cwd, strip_verbatim_prefix(base.canonicalize().unwrap()));
+        assert_eq!(
+            pane.cwd,
+            strip_verbatim_prefix(base.canonicalize().unwrap())
+        );
 
         fs::remove_dir_all(&base).unwrap();
     }
@@ -734,10 +752,7 @@ mod tests {
         // the two files sorted by name.
         pane.selected = 0;
         pane.toggle_mark_selected();
-        assert!(
-            pane.marked.is_empty(),
-            "\"..\" must never be markable"
-        );
+        assert!(pane.marked.is_empty(), "\"..\" must never be markable");
         assert_eq!(
             pane.selected, 1,
             "but the cursor still steps down over it, like any other entry"
@@ -861,12 +876,18 @@ mod tests {
         pane.select_name("c.md");
 
         pane.set_sort(SortKey::Size).unwrap();
-        assert_eq!(names(&pane), ["..", "adir", "zdir", "b.txt", "c.md", "a.rs"]);
+        assert_eq!(
+            names(&pane),
+            ["..", "adir", "zdir", "b.txt", "c.md", "a.rs"]
+        );
         assert_eq!(pane.selected_entry().unwrap().name, "c.md");
         assert_eq!(pane.sort_indicator(), "Size\u{2193}");
 
         pane.set_sort(SortKey::Size).unwrap();
-        assert_eq!(names(&pane), ["..", "adir", "zdir", "a.rs", "c.md", "b.txt"]);
+        assert_eq!(
+            names(&pane),
+            ["..", "adir", "zdir", "a.rs", "c.md", "b.txt"]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -875,9 +896,15 @@ mod tests {
         let dir = sort_test_dir("pc_test_sort_ext");
         let mut pane = Pane::new(dir.clone(), false).unwrap();
         pane.set_sort(SortKey::Extension).unwrap();
-        assert_eq!(names(&pane), ["..", "adir", "zdir", "c.md", "a.rs", "b.txt"]);
+        assert_eq!(
+            names(&pane),
+            ["..", "adir", "zdir", "c.md", "a.rs", "b.txt"]
+        );
         pane.set_sort(SortKey::Name).unwrap();
-        assert_eq!(names(&pane), ["..", "adir", "zdir", "a.rs", "b.txt", "c.md"]);
+        assert_eq!(
+            names(&pane),
+            ["..", "adir", "zdir", "a.rs", "b.txt", "c.md"]
+        );
         assert_eq!(pane.sort_indicator(), "Name\u{2191}");
         fs::remove_dir_all(&dir).unwrap();
     }

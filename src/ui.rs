@@ -39,7 +39,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // by exactly what's actually visible in the file listing.
     let footer_rows = if app.pane_totals { 2 } else { 0 };
     let header_rows = if app.column_headers { 1 } else { 0 };
-    app.pane_visible_lines = panes[0].height.saturating_sub(2 + footer_rows + header_rows) as usize;
+    app.pane_visible_lines = panes[0]
+        .height
+        .saturating_sub(2 + footer_rows + header_rows) as usize;
     app.left_pane_area = panes[0];
     app.right_pane_area = panes[1];
 
@@ -145,7 +147,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 [name] => items
                     .iter()
                     .find(|(item, _)| item == name)
-                    .and_then(|(_, src)| entry_summary(src).zip(entry_summary(&dest_dir.join(name)))),
+                    .and_then(|(_, src)| {
+                        entry_summary(src).zip(entry_summary(&dest_dir.join(name)))
+                    }),
                 _ => None,
             };
             draw_overwrite_dialog(
@@ -230,7 +234,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// Norton Commander's error boxes.
 fn draw_error_dialog(frame: &mut Frame, classic_style: bool, message: &str) {
     let pal = error_palette(classic_style);
-    let wrap_width = (frame.area().width as usize).saturating_sub(16).clamp(20, 64);
+    let wrap_width = (frame.area().width as usize)
+        .saturating_sub(16)
+        .clamp(20, 64);
     let lines = wrap_message(message, wrap_width)
         .into_iter()
         .map(|line| {
@@ -337,7 +343,11 @@ fn draw_help(frame: &mut Frame, classic_style: bool, page: usize) {
 
     // Every page gets the same height and width, so flipping pages doesn't
     // make the box jump around.
-    let rows = HELP_PAGES.iter().map(|(_, lines)| lines.len()).max().unwrap_or(0);
+    let rows = HELP_PAGES
+        .iter()
+        .map(|(_, lines)| lines.len())
+        .max()
+        .unwrap_or(0);
     let widest = HELP_PAGES
         .iter()
         .flat_map(|(_, lines)| lines.iter())
@@ -360,8 +370,14 @@ fn draw_help(frame: &mut Frame, classic_style: bool, page: usize) {
         .collect();
     let footer = DialogLine::Centered(Line::from(vec![
         Span::styled("\u{2190} ", Style::default().fg(pal.fg)),
-        Span::styled(page_marks, Style::default().fg(pal.fg).add_modifier(Modifier::BOLD)),
-        Span::styled("\u{2192}   any other key closes", Style::default().fg(pal.fg)),
+        Span::styled(
+            page_marks,
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2192}   any other key closes",
+            Style::default().fg(pal.fg),
+        ),
     ]));
 
     let title = format!("Help \u{2014} {title} ({}/{})", page + 1, HELP_PAGES.len());
@@ -439,7 +455,10 @@ fn error_palette(classic_style: bool) -> DialogPalette {
 /// `Text`/`Centered` are rendered as-is (`Centered` for the button row).
 enum DialogLine<'a> {
     Text(Line<'a>),
-    Field { content: Vec<Span<'a>>, fill_bg: Color },
+    Field {
+        content: Vec<Span<'a>>,
+        fill_bg: Color,
+    },
     Centered(Line<'a>),
 }
 
@@ -504,7 +523,13 @@ fn draw_dialog_frame(
     } else {
         0
     };
-    draw_dialog_box(frame, &dialog_palette(classic_style), title, sections, min_width);
+    draw_dialog_box(
+        frame,
+        &dialog_palette(classic_style),
+        title,
+        sections,
+        min_width,
+    );
 }
 
 /// `draw_dialog_frame` with an explicit palette (e.g. the red error box)
@@ -516,7 +541,6 @@ fn draw_dialog_box(
     sections: Vec<Vec<DialogLine>>,
     min_width: u16,
 ) {
-
     let content_width = sections
         .iter()
         .flat_map(|section| section.iter())
@@ -586,8 +610,10 @@ fn draw_dialog_box(
                 DialogLine::Centered(line) => line.centered(),
                 DialogLine::Field { content, fill_bg } => {
                     let content_width: usize = content.iter().map(Span::width).sum();
-                    let mut spans =
-                        vec![Span::styled(" ".repeat(DIALOG_PAD), Style::default().bg(pal.bg))];
+                    let mut spans = vec![Span::styled(
+                        " ".repeat(DIALOG_PAD),
+                        Style::default().bg(pal.bg),
+                    )];
                     spans.extend(content);
                     let used = DIALOG_PAD + content_width;
                     let bar_end = inner_width.saturating_sub(DIALOG_PAD);
@@ -731,7 +757,8 @@ fn draw_overwrite_dialog(
     cancel_focused: bool,
 ) {
     let pal = dialog_palette(classic_style);
-    let text = |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
+    let text =
+        |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
 
     let message = match conflicts {
         [name] => format!("\"{name}\" already exists in"),
@@ -750,9 +777,7 @@ fn draw_overwrite_dialog(
 
     let details = match comparison {
         Some((new, existing)) => {
-            let is_newer = |a: &EntrySummary, b: &EntrySummary| {
-                matches!((a.modified, b.modified), (Some(a), Some(b)) if a > b)
-            };
+            let is_newer = |a: &EntrySummary, b: &EntrySummary| matches!((a.modified, b.modified), (Some(a), Some(b)) if a > b);
             let row = |label: &str, entry: &EntrySummary, newer: bool| {
                 text(format!(
                     "{label} {:>12}  {}{}",
@@ -791,7 +816,12 @@ fn draw_overwrite_dialog(
     draw_dialog_frame(frame, classic_style, "Overwrite", sections, true);
 }
 
-fn draw_quit_dialog(frame: &mut Frame, classic_style: bool, job: Option<&Job>, cancel_focused: bool) {
+fn draw_quit_dialog(
+    frame: &mut Frame,
+    classic_style: bool,
+    job: Option<&Job>,
+    cancel_focused: bool,
+) {
     let pal = dialog_palette(classic_style);
     let mut message = vec![DialogLine::Text(Line::from(Span::styled(
         "Quit PeterCommander?",
@@ -801,7 +831,10 @@ fn draw_quit_dialog(frame: &mut Frame, classic_style: bool, job: Option<&Job>, c
         let warning = if job.kind == DialogKind::TrashByCopy {
             "A move to trash is running: it will stop after the current item.".to_string()
         } else {
-            format!("A {} is still running and will be cancelled.", job.kind.verb().to_lowercase())
+            format!(
+                "A {} is still running and will be cancelled.",
+                job.kind.verb().to_lowercase()
+            )
         };
         message.push(DialogLine::Text(Line::from(Span::styled(
             warning,
@@ -833,7 +866,8 @@ fn draw_rename_selected_dialog(
     cancel_focused: bool,
 ) {
     let pal = dialog_palette(classic_style);
-    let text = |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
+    let text =
+        |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
     let bold = |s: String| {
         DialogLine::Text(Line::from(Span::styled(
             s,
@@ -895,7 +929,8 @@ fn draw_job_dialog(frame: &mut Frame, app: &App, job: &Job) {
     let classic_style = app.classic_style;
     let cancel_focused = app.job_cancel_focused;
     let pal = dialog_palette(classic_style);
-    let text = |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
+    let text =
+        |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
     let progress = job.progress();
     let verb = job.kind.verb();
     let total_items = job.items.len();
@@ -903,7 +938,11 @@ fn draw_job_dialog(frame: &mut Frame, app: &App, job: &Job) {
 
     let status = if job.is_cancelling() && trash {
         // The crate can't be stopped part-way through an item.
-        let then = if app.quit_when_job_done { ", then quitting" } else { "" };
+        let then = if app.quit_when_job_done {
+            ", then quitting"
+        } else {
+            ""
+        };
         format!("Stopping — finishing the current item first{then}…")
     } else if job.is_cancelling() {
         "Cancelling…".to_string()
@@ -943,7 +982,11 @@ fn draw_job_dialog(frame: &mut Frame, app: &App, job: &Job) {
             fill_bg: pal.field_bg,
         }],
         vec![
-            text(fit_name(&progress.current, PROGRESS_BAR_WIDTH + 5).trim_end().to_string()),
+            text(
+                fit_name(&progress.current, PROGRESS_BAR_WIDTH + 5)
+                    .trim_end()
+                    .to_string(),
+            ),
             text(bar),
             text(format!(
                 "{} of {}   {} of {} files   {elapsed}",
@@ -970,7 +1013,10 @@ fn draw_job_dialog(frame: &mut Frame, app: &App, job: &Job) {
 fn job_fraction(progress: &crate::job::Progress) -> f64 {
     let ratio = |done: u64, total: u64| (done as f64 / total.max(1) as f64).min(1.0);
     let fraction = if progress.bytes_total > 0 {
-        ratio(progress.bytes_done + progress.opaque_bytes / 2, progress.bytes_total)
+        ratio(
+            progress.bytes_done + progress.opaque_bytes / 2,
+            progress.bytes_total,
+        )
     } else {
         ratio(progress.files_done, progress.files_total)
     };
@@ -1038,7 +1084,8 @@ fn draw_input_dialog(
     draw_dialog_frame(frame, classic_style, title, sections, true);
 }
 
-const SETTINGS_HINT: &str = "\u{2191}/\u{2193} move   \u{2190}/\u{2192}/Space toggle   Enter save   Esc cancel";
+const SETTINGS_HINT: &str =
+    "\u{2191}/\u{2193} move   \u{2190}/\u{2192}/Space toggle   Enter save   Esc cancel";
 
 /// Each setting is shown as a two-way switch — "left label [ ]----[x] right
 /// label" — rather than a single generic checkbox, so both what's on and
@@ -1117,7 +1164,9 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
                 .fg(classic::MENU_BAR_SELECTED_FG)
                 .bg(classic::MENU_BAR_SELECTED_BG)
                 .add_modifier(Modifier::BOLD),
-            (true, false) => Style::default().fg(classic::MENU_BAR_FG).bg(classic::MENU_BAR_BG),
+            (true, false) => Style::default()
+                .fg(classic::MENU_BAR_FG)
+                .bg(classic::MENU_BAR_BG),
             (false, true) => Style::default()
                 .fg(Color::White)
                 .bg(Color::Blue)
@@ -1294,12 +1343,12 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
                     .fg(classic::MENU_SELECTED_ITEM_FG)
                     .bg(classic::MENU_SELECTED_ITEM_BG)
                     .add_modifier(Modifier::BOLD),
-                (true, false, true) => {
-                    Style::default().fg(classic::MENU_ITEM_FG).bg(classic::MENU_BG)
-                }
-                (true, false, false) => {
-                    Style::default().fg(classic::MENU_DISABLED_FG).bg(classic::MENU_BG)
-                }
+                (true, false, true) => Style::default()
+                    .fg(classic::MENU_ITEM_FG)
+                    .bg(classic::MENU_BG),
+                (true, false, false) => Style::default()
+                    .fg(classic::MENU_DISABLED_FG)
+                    .bg(classic::MENU_BG),
                 (false, true, true) => Style::default()
                     .fg(Color::White)
                     .bg(Color::Blue)
@@ -1313,15 +1362,23 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
             // row — a selected/highlighted row is one uniform reverse-video
             // color for the whole line, same as everywhere else.
             let shortcut_style = if app.classic_style && !is_selected && enabled {
-                Style::default().fg(Color::Rgb(255, 255, 255)).bg(classic::MENU_BG)
+                Style::default()
+                    .fg(Color::Rgb(255, 255, 255))
+                    .bg(classic::MENU_BG)
             } else {
                 style
             };
             let label = app.menu_label(*action);
             let (label_part, shortcut_part) = match action.shortcut() {
                 Some(shortcut) => (
-                    format!("{label:<label_width$}", label_width = row_text_width - shortcut.len()),
-                    format!("{shortcut:>shortcut_width$}", shortcut_width = shortcut.len()),
+                    format!(
+                        "{label:<label_width$}",
+                        label_width = row_text_width - shortcut.len()
+                    ),
+                    format!(
+                        "{shortcut:>shortcut_width$}",
+                        shortcut_width = shortcut.len()
+                    ),
                 ),
                 None => (format!("{label:<row_text_width$}"), String::new()),
             };
@@ -1337,8 +1394,16 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
     let block = if app.classic_style {
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(classic::MENU_BORDER_FG).add_modifier(Modifier::BOLD))
-            .style(Style::default().bg(classic::MENU_BG).fg(classic::MENU_ITEM_FG))
+            .border_style(
+                Style::default()
+                    .fg(classic::MENU_BORDER_FG)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .style(
+                Style::default()
+                    .bg(classic::MENU_BG)
+                    .fg(classic::MENU_ITEM_FG),
+            )
     } else {
         Block::default()
             .borders(Borders::ALL)
@@ -1498,7 +1563,10 @@ fn draw_command_line(frame: &mut Frame, area: Rect, app: &App) {
             "Quick search: ",
             Style::default().fg(cwd_fg).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(query.as_str(), Style::default().fg(typed_text_fg)));
+        spans.push(Span::styled(
+            query.as_str(),
+            Style::default().fg(typed_text_fg),
+        ));
         spans.push(Span::styled(
             "_",
             Style::default()
@@ -1514,7 +1582,10 @@ fn draw_command_line(frame: &mut Frame, area: Rect, app: &App) {
             format!("{}> ", cwd.display()),
             Style::default().fg(cwd_fg).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(&app.command_line, Style::default().fg(typed_text_fg)));
+        spans.push(Span::styled(
+            &app.command_line,
+            Style::default().fg(typed_text_fg),
+        ));
     }
     let line = Line::from(spans);
     let paragraph = if app.classic_style {
@@ -1636,12 +1707,20 @@ fn draw_pane(
             let fg = if is_marked {
                 MARKED_FG
             } else if entry.is_dir {
-                if classic_style { classic::DIR_FG } else { Color::Cyan }
+                if classic_style {
+                    classic::DIR_FG
+                } else {
+                    Color::Cyan
+                }
             } else if entry.is_executable {
                 // Classic mode treats executables exactly like directories
                 // (same white, bold) rather than a distinct green — the
                 // size/date columns already tell them apart.
-                if classic_style { classic::DIR_FG } else { Color::Green }
+                if classic_style {
+                    classic::DIR_FG
+                } else {
+                    Color::Green
+                }
             } else if classic_style {
                 classic::FILE_FG
             } else {
@@ -1660,7 +1739,11 @@ fn draw_pane(
             // instead of being swallowed by the highlight's own fg when
             // it's also under the cursor.
             let style = if is_active && idx == pane.selected {
-                let bg = if classic_style { classic::HIGHLIGHT_BG } else { Color::Blue };
+                let bg = if classic_style {
+                    classic::HIGHLIGHT_BG
+                } else {
+                    Color::Blue
+                };
                 let cursor_fg = if is_marked {
                     fg
                 } else if classic_style {
@@ -1682,14 +1765,19 @@ fn draw_pane(
 
             let date = format_modified(entry.modified);
             let size_label = if entry.is_dir {
-                if classic_style { "<DIR>".to_string() } else { String::new() }
+                if classic_style {
+                    "<DIR>".to_string()
+                } else {
+                    String::new()
+                }
             } else {
                 format_size(entry.size)
             };
             let name = fit_name(&entry.name, name_width);
             // Padded even when empty (".." has no date), so every row — and
             // the cursor bar on it — spans the full width.
-            let label = format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date:<DATE_COLUMN_WIDTH$} ");
+            let label =
+                format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date:<DATE_COLUMN_WIDTH$} ");
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
@@ -1703,15 +1791,17 @@ fn draw_pane(
     // out of sight.
     if !show_headers {
         block = block.title_top(
-        Line::from(vec![
-            Span::styled("[", border_style),
-            Span::styled(
-                pane.sort_indicator(),
-                Style::default().fg(SORT_INDICATOR_FG).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("]", border_style),
-        ])
-        .right_aligned(),
+            Line::from(vec![
+                Span::styled("[", border_style),
+                Span::styled(
+                    pane.sort_indicator(),
+                    Style::default()
+                        .fg(SORT_INDICATOR_FG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("]", border_style),
+            ])
+            .right_aligned(),
         );
     }
     if classic_style {
@@ -1733,7 +1823,11 @@ fn draw_pane(
         None => match pane.selected_entry() {
             Some(entry) if entry.name != ".." => {
                 let size = if entry.is_dir {
-                    if classic_style { "<DIR>".to_string() } else { String::new() }
+                    if classic_style {
+                        "<DIR>".to_string()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     format_size(entry.size)
                 };
@@ -1774,7 +1868,10 @@ fn draw_pane(
 
     frame.render_widget(block, area);
     if let Some(header_area) = header_area {
-        frame.render_widget(Paragraph::new(column_header_line(pane, name_width)), header_area);
+        frame.render_widget(
+            Paragraph::new(column_header_line(pane, name_width)),
+            header_area,
+        );
     }
 
     // The cursor row's highlight is already baked into its `ListItem`
@@ -1840,7 +1937,14 @@ fn draw_pane(
     }
 
     if show_headers {
-        draw_column_separators(frame, area, list_area, header_area, name_width, border_style);
+        draw_column_separators(
+            frame,
+            area,
+            list_area,
+            header_area,
+            name_width,
+            border_style,
+        );
     }
 }
 
@@ -1914,7 +2018,11 @@ fn column_header_line(pane: &Pane, name_width: usize) -> Line<'static> {
             spans.push(Span::raw(" "));
         }
         let text = if idx == sorted_column {
-            let arrow = if pane.sort_descending() { '\u{2193}' } else { '\u{2191}' };
+            let arrow = if pane.sort_descending() {
+                '\u{2193}'
+            } else {
+                '\u{2191}'
+            };
             format!("{} {arrow}", pane.sort_key.label())
         } else {
             label.to_string()
@@ -1966,8 +2074,7 @@ fn draw_preview_pane(
         .borders(Borders::ALL)
         .border_style(border_style);
     if classic_style {
-        block = block
-            .style(Style::default().bg(classic::BG).fg(classic::FILE_FG));
+        block = block.style(Style::default().bg(classic::BG).fg(classic::FILE_FG));
     }
 
     // For everything except Text, the scroll offset is applied by
@@ -1984,7 +2091,11 @@ fn draw_preview_pane(
             .skip(scroll)
             .map(|entry| {
                 let style = if entry.is_dir {
-                    let fg = if classic_style { classic::DIR_FG } else { Color::Cyan };
+                    let fg = if classic_style {
+                        classic::DIR_FG
+                    } else {
+                        Color::Cyan
+                    };
                     Style::default().fg(fg).add_modifier(Modifier::BOLD)
                 } else if classic_style {
                     Style::default().fg(classic::FILE_FG)
@@ -2039,11 +2150,16 @@ fn draw_logs(frame: &mut Frame, classic_style: bool) {
     } else {
         shown
             .iter()
-            .map(|line| DialogLine::Text(Line::from(Span::styled(*line, Style::default().fg(pal.fg)))))
+            .map(|line| {
+                DialogLine::Text(Line::from(Span::styled(*line, Style::default().fg(pal.fg))))
+            })
             .collect()
     };
     let footer = DialogLine::Centered(Line::from(Span::styled(
-        format!("Any key closes   (full log: {})", logging::log_path().display()),
+        format!(
+            "Any key closes   (full log: {})",
+            logging::log_path().display()
+        ),
         Style::default().fg(pal.fg),
     )));
     let title = format!("Logs \u{2014} last {} lines", shown.len());
@@ -2121,7 +2237,10 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
         };
         spans.push(Span::styled(
             fn_key.key,
-            Style::default().fg(num_fg).bg(num_bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(num_fg)
+                .bg(num_bg)
+                .add_modifier(Modifier::BOLD),
         ));
         let label_width = tile_widths[idx].saturating_sub(fn_key.key.len() as u16) as usize;
         spans.push(Span::styled(

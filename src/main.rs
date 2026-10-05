@@ -173,7 +173,8 @@ fn run_external(
             dir,
             names,
         } => {
-            let editor_ok = run_pager_or_editor(terminal, "EDITOR", default_editor(), &list_file, app)?;
+            let editor_ok =
+                run_pager_or_editor(terminal, "EDITOR", default_editor(), &list_file, app)?;
             app.finish_bulk_rename(&list_file, dir, &names, editor_ok);
             Ok(())
         }
@@ -245,7 +246,10 @@ fn run_shell_command(
             "/C",
         )
     } else {
-        (env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()), "-c")
+        (
+            env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            "-c",
+        )
     };
     let wait = app.wait_after_shell_command;
 
@@ -410,7 +414,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
                 }
             }
         }
-        MouseEventKind::Down(MouseButton::Left) => handle_mouse_click(app, mouse.column, mouse.row)?,
+        MouseEventKind::Down(MouseButton::Left) => {
+            handle_mouse_click(app, mouse.column, mouse.row)?
+        }
         _ => {}
     }
     Ok(())
@@ -578,7 +584,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
 
     if app.quick_search.is_some() {
         match code {
-            KeyCode::Char(c) if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            KeyCode::Char(c)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 app.quick_search_push(c);
                 return Ok(());
             }

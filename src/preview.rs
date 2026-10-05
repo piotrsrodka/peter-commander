@@ -133,11 +133,10 @@ fn list_dir(path: &Path, hide_hidden: bool) -> std::io::Result<Vec<DirEntryPrevi
         .into_iter()
         .map(|name| DirEntryPreview { name, is_dir: true })
         .collect();
-    entries.extend(
-        files
-            .into_iter()
-            .map(|name| DirEntryPreview { name, is_dir: false }),
-    );
+    entries.extend(files.into_iter().map(|name| DirEntryPreview {
+        name,
+        is_dir: false,
+    }));
     Ok(entries)
 }
 

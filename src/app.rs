@@ -155,13 +155,28 @@ impl SettingItem {
     /// touching the stored flag's name or meaning.
     pub fn sides(&self) -> [(&'static str, bool); 2] {
         match self {
-            SettingItem::WaitAfterShellCommand => [("Return immediately", false), ("Wait for Enter", true)],
-            SettingItem::HideHiddenFiles => [("Show hidden files", false), ("Hide hidden files", true)],
-            SettingItem::InternalPreview => [("External pager (F3)", false), ("Built-in preview", true)],
+            SettingItem::WaitAfterShellCommand => {
+                [("Return immediately", false), ("Wait for Enter", true)]
+            }
+            SettingItem::HideHiddenFiles => {
+                [("Show hidden files", false), ("Hide hidden files", true)]
+            }
+            SettingItem::InternalPreview => {
+                [("External pager (F3)", false), ("Built-in preview", true)]
+            }
             SettingItem::MouseCapture => [("Terminal mouse", false), ("App mouse clicks", true)],
-            SettingItem::ClassicStyle => [("Terminal theme colors", false), ("Classic NC colors", true)],
-            SettingItem::StartLeftInCwd => [("Restore last session", false), ("Start in launch dir", true)],
-            SettingItem::UseTrash => [("F8 deletes permanently", false), ("F8 moves to trash", true)],
+            SettingItem::ClassicStyle => [
+                ("Terminal theme colors", false),
+                ("Classic NC colors", true),
+            ],
+            SettingItem::StartLeftInCwd => [
+                ("Restore last session", false),
+                ("Start in launch dir", true),
+            ],
+            SettingItem::UseTrash => [
+                ("F8 deletes permanently", false),
+                ("F8 moves to trash", true),
+            ],
             SettingItem::ColumnHeaders => [("Show column headers", true), ("No headers", false)],
             SettingItem::PaneTotals => [("Show status bar", true), ("Plain panes", false)],
         }
@@ -190,7 +205,10 @@ impl SettingItem {
 pub enum ExternalRequest {
     View(PathBuf),
     Edit(PathBuf),
-    Shell { command: String, cwd: PathBuf },
+    Shell {
+        command: String,
+        cwd: PathBuf,
+    },
     RevealTerminal,
     /// Open `list_file` (the names, one per line) in $EDITOR, then hand
     /// the result to `App::finish_bulk_rename`.
@@ -469,7 +487,11 @@ impl App {
         };
         let pane = self.active_pane_ref();
         if pane.sort_key == key {
-            let arrow = if pane.sort_descending() { '\u{2193}' } else { '\u{2191}' };
+            let arrow = if pane.sort_descending() {
+                '\u{2193}'
+            } else {
+                '\u{2191}'
+            };
             format!("{} {arrow}", action.label())
         } else {
             action.label().to_string()
@@ -740,10 +762,18 @@ impl App {
             let message = match items.as_slice() {
                 [(name, _)] if kind == DialogKind::TrashByCopy => format!("{verb_done} {name}"),
                 _ if kind == DialogKind::TrashByCopy => {
-                    format!("{verb_done} {} items from {}", outcome.done, src_dir.display())
+                    format!(
+                        "{verb_done} {} items from {}",
+                        outcome.done,
+                        src_dir.display()
+                    )
                 }
                 [(name, src)] => {
-                    format!("{verb_done} {} to {}", src.display(), dest_dir.join(name).display())
+                    format!(
+                        "{verb_done} {} to {}",
+                        src.display(),
+                        dest_dir.join(name).display()
+                    )
                 }
                 _ => format!(
                     "{verb_done} {} items from {} to {}",
@@ -848,18 +878,30 @@ impl App {
     /// go one name per line into a temp file that `main` opens in $EDITOR.
     fn request_bulk_rename(&mut self) {
         let pane = self.active_pane_ref();
-        let names: Vec<String> = pane.marked_items().into_iter().map(|(name, _)| name).collect();
+        let names: Vec<String> = pane
+            .marked_items()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         if names.len() < 2 {
             return;
         }
-        if names.iter().any(|name| name.contains('\n') || name.contains('\r')) {
-            self.set_error("Rename selected cannot handle names containing line breaks".to_string());
+        if names
+            .iter()
+            .any(|name| name.contains('\n') || name.contains('\r'))
+        {
+            self.set_error(
+                "Rename selected cannot handle names containing line breaks".to_string(),
+            );
             return;
         }
         let dir = pane.cwd.clone();
         let list_file = env::temp_dir().join(format!("pc-bulk-rename-{}.txt", std::process::id()));
         if let Err(err) = std::fs::write(&list_file, bulk_rename::list_text(&names)) {
-            self.set_error(format!("Rename selected: cannot write {}: {err}", list_file.display()));
+            self.set_error(format!(
+                "Rename selected: cannot write {}: {err}",
+                list_file.display()
+            ));
             return;
         }
         self.external_request = Some(ExternalRequest::RenameSelected {
@@ -872,7 +914,13 @@ impl App {
     /// After the editor closed: validate the edit and, if anything
     /// changed, ask before renaming. A failed editor (e.g. vim's `:cq`)
     /// aborts without renaming anything.
-    pub fn finish_bulk_rename(&mut self, list_file: &Path, dir: PathBuf, names: &[String], editor_ok: bool) {
+    pub fn finish_bulk_rename(
+        &mut self,
+        list_file: &Path,
+        dir: PathBuf,
+        names: &[String],
+        editor_ok: bool,
+    ) {
         let edited = std::fs::read_to_string(list_file);
         let _ = std::fs::remove_file(list_file);
         if !editor_ok {
@@ -882,12 +930,16 @@ impl App {
         let edited = match edited {
             Ok(text) => text,
             Err(err) => {
-                self.set_error(format!("Rename selected: cannot read the edited list: {err}"));
+                self.set_error(format!(
+                    "Rename selected: cannot read the edited list: {err}"
+                ));
                 return;
             }
         };
         match bulk_rename::plan(&dir, names, &edited) {
-            Err(message) => self.set_error(format!("Rename selected: {message} — nothing was renamed")),
+            Err(message) => {
+                self.set_error(format!("Rename selected: {message} — nothing was renamed"))
+            }
             Ok(plan) if plan.renames.is_empty() => {
                 self.set_status("Rename selected: no names changed".to_string());
             }
@@ -1270,9 +1322,7 @@ impl App {
 
     fn request_transfer(&mut self, kind: DialogKind) {
         if self.job.is_some() {
-            self.set_error(
-                "Another copy/move is still running (Ctrl+B shows it)".to_string(),
-            );
+            self.set_error("Another copy/move is still running (Ctrl+B shows it)".to_string());
             return;
         }
         let pane = self.active_pane();
@@ -1403,7 +1453,10 @@ impl App {
                 self.right.reload()?;
             }
             Dialog::TextInput { kind, input }
-                if matches!(kind, TextInputKind::SelectFiles | TextInputKind::UnselectFiles) =>
+                if matches!(
+                    kind,
+                    TextInputKind::SelectFiles | TextInputKind::UnselectFiles
+                ) =>
             {
                 let select = *kind == TextInputKind::SelectFiles;
                 let patterns = input.clone();
@@ -1471,14 +1524,19 @@ impl App {
     /// Runs a confirmed Copy/Move/Delete/Trash; shared by the plain confirm
     /// and the overwrite prompt. Copy/Move start a background job with its
     /// progress window on top; Delete/Trash run right here.
-    fn run_file_operation(&mut self, kind: DialogKind, items: Vec<(String, PathBuf)>) -> Result<()> {
+    fn run_file_operation(
+        &mut self,
+        kind: DialogKind,
+        items: Vec<(String, PathBuf)>,
+    ) -> Result<()> {
         let src_dir = self.active_pane_ref().cwd.clone();
-        let wants_job = matches!(kind, DialogKind::Copy | DialogKind::Move | DialogKind::TrashByCopy);
+        let wants_job = matches!(
+            kind,
+            DialogKind::Copy | DialogKind::Move | DialogKind::TrashByCopy
+        );
         self.dialog = Dialog::None;
         if wants_job && self.job.is_some() {
-            self.set_error(
-                "Another operation is still running (Ctrl+B shows it)".to_string(),
-            );
+            self.set_error("Another operation is still running (Ctrl+B shows it)".to_string());
             return Ok(());
         }
         // A job already holds its own list, so the marks can go now.
@@ -1708,7 +1766,10 @@ mod tests {
     fn every_setting_switch_has_one_side_per_value() {
         for item in SettingItem::ALL {
             let [(_, left), (_, right)] = item.sides();
-            assert_ne!(left, right, "{item:?} needs one side for true and one for false");
+            assert_ne!(
+                left, right,
+                "{item:?} needs one side for true and one for false"
+            );
         }
     }
 
@@ -1727,7 +1788,10 @@ mod tests {
             .map(|name| (name.to_string(), dir.join("src").join(name)))
             .collect();
 
-        assert_eq!(existing_destinations(&items, &dir.join("dest")), vec!["both.txt"]);
+        assert_eq!(
+            existing_destinations(&items, &dir.join("dest")),
+            vec!["both.txt"]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

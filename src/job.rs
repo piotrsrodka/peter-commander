@@ -52,7 +52,12 @@ impl Job {
     /// Starts copying/moving `items` into `dest_dir` right away. `kind`
     /// must be Copy, Move or TrashByCopy (for which `dest_dir` is only
     /// shown, the crate picks the trash itself).
-    pub fn start(kind: DialogKind, items: Vec<(String, PathBuf)>, src_dir: PathBuf, dest_dir: PathBuf) -> Job {
+    pub fn start(
+        kind: DialogKind,
+        items: Vec<(String, PathBuf)>,
+        src_dir: PathBuf,
+        dest_dir: PathBuf,
+    ) -> Job {
         let progress = Arc::new(Mutex::new(Progress {
             scanning: true,
             ..Progress::default()
@@ -230,10 +235,21 @@ mod tests {
             ("sub".to_string(), dir.join("src/sub")),
         ];
 
-        let job = Job::start(DialogKind::Copy, items.clone(), dir.join("src"), dir.join("dest"));
+        let job = Job::start(
+            DialogKind::Copy,
+            items.clone(),
+            dir.join("src"),
+            dir.join("dest"),
+        );
         let outcome = wait(job);
-        assert_eq!((outcome.done, outcome.errors.len(), outcome.cancelled), (2, 0, false));
-        assert_eq!(fs::read_to_string(dir.join("dest/sub/b.txt")).unwrap(), "bb");
+        assert_eq!(
+            (outcome.done, outcome.errors.len(), outcome.cancelled),
+            (2, 0, false)
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("dest/sub/b.txt")).unwrap(),
+            "bb"
+        );
         assert!(dir.join("src/a.txt").exists());
 
         fs::remove_dir_all(dir.join("dest")).unwrap();
