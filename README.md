@@ -31,6 +31,20 @@ Also comes with an optional classic retro Norton Commander color scheme
 - Ctrl+O shows previous command output
 - Configurable settings: hidden files, F3 preview mode, trash
 
+## Usage
+
+```sh
+peter-commander                    # current dir, or last session (see Settings)
+peter-commander ~/projects         # left pane in ~/projects
+peter-commander ~/projects ~/tmp   # left and right pane
+peter-commander --version          # also -v, -V, -version
+peter-commander --help
+```
+
+A directory given on the command line wins over where that pane would
+otherwise start (including the "Restore last session" setting). With the
+`pc` alias from the install script, `pc ~/projects` works the same.
+
 ## Installing
 
 Already have Rust? This works on Linux, macOS, and Windows:

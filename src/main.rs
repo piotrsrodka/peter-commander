@@ -11,7 +11,7 @@ mod ui;
 
 use std::env;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +32,7 @@ use ratatui::layout::Position;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 
-use app::{App, Dialog, ExternalRequest, SettingItem};
+use app::{App, Dialog, ExternalRequest, SettingItem, StartDirs};
 use menu::{Action, FN_KEYS, MENU_BAR};
 
 fn restore_terminal() {
@@ -41,7 +41,122 @@ fn restore_terminal() {
     let _ = io::stdout().execute(LeaveAlternateScreen);
 }
 
+/// What the command line asks for, before any terminal setup.
+#[derive(Debug, PartialEq, Eq)]
+enum CliRequest {
+    /// Start the UI, optionally in the given left/right pane directories
+    /// (as typed; checked by `resolve_dir` once parsing is done).
+    Run {
+        left: Option<String>,
+        right: Option<String>,
+    },
+    Version,
+    Help,
+    /// A usage mistake, reported with the usage text and exit code 2.
+    Invalid(String),
+}
+
+/// `-V`/`-v`/`--version`/`-version` and `-h`/`--help` win wherever they
+/// appear; otherwise up to two directories, for the left and right pane.
+/// A bare `version` is a directory name like any other, so `pc version`
+/// opens it.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> CliRequest {
+    let mut dirs = Vec::new();
+    let mut invalid = None;
+    for arg in args {
+        match arg.as_str() {
+            "-V" | "-v" | "--version" | "-version" => return CliRequest::Version,
+            "-h" | "--help" => return CliRequest::Help,
+            option if option.len() > 1 && option.starts_with('-') => {
+                invalid.get_or_insert(format!("unknown option '{option}'"));
+            }
+            _ => dirs.push(arg),
+        }
+    }
+    if let Some(message) = invalid {
+        return CliRequest::Invalid(message);
+    }
+    if dirs.len() > 2 {
+        return CliRequest::Invalid(format!(
+            "too many directories: expected at most 2 (left and right pane), got {}",
+            dirs.len()
+        ));
+    }
+    let mut dirs = dirs.into_iter();
+    CliRequest::Run {
+        left: dirs.next(),
+        right: dirs.next(),
+    }
+}
+
+/// Turns a directory argument into an absolute path, or says why it can't
+/// be opened — checked before the terminal switches to the UI, so the
+/// message lands in the shell the user typed the command in.
+fn resolve_dir(arg: &str) -> std::result::Result<PathBuf, String> {
+    let path = Path::new(arg);
+    let resolved = path
+        .canonicalize()
+        .map_err(|err| format!("cannot open '{arg}': {err}"))?;
+    if !resolved.is_dir() {
+        return Err(format!("'{arg}' is not a directory"));
+    }
+    Ok(resolved)
+}
+
+fn version_text() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+fn usage_text() -> String {
+    let name = env!("CARGO_PKG_NAME");
+    format!(
+        "{}\n{}\n\n\
+         Usage:\n  \
+         {name}                      Start with the panes as usual (below)\n  \
+         {name} LEFT_DIR             Open the left pane in LEFT_DIR\n  \
+         {name} LEFT_DIR RIGHT_DIR   Open the left and right pane\n  \
+         {name} -h, --help           Print this help\n  \
+         {name} -V, -v, --version    Print the version (-version works too)\n\n\
+         As usual, the left pane starts in the current directory, or\n\
+         where you left it with \"Restore last session\" (Options > Settings);\n\
+         the right pane starts where you left it. First run: both in the\n\
+         current directory.\n",
+        version_text(),
+        env!("CARGO_PKG_DESCRIPTION"),
+    )
+}
+
 fn main() -> Result<()> {
+    let start_dirs = match parse_args(env::args().skip(1)) {
+        CliRequest::Run { left, right } => {
+            let resolve = |arg: Option<String>| arg.as_deref().map(resolve_dir).transpose();
+            match resolve(left).and_then(|left| {
+                Ok(StartDirs {
+                    left,
+                    right: resolve(right)?,
+                })
+            }) {
+                Ok(dirs) => dirs,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        CliRequest::Version => {
+            println!("{}", version_text());
+            return Ok(());
+        }
+        CliRequest::Help => {
+            print!("{}", usage_text());
+            return Ok(());
+        }
+        CliRequest::Invalid(message) => {
+            eprint!("error: {message}\n\n{}", usage_text());
+            std::process::exit(2);
+        }
+    };
+
     let default_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
@@ -77,7 +192,12 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal::new")?;
 
-    let result = run(&mut terminal, &should_exit, mouse_capture_enabled);
+    let result = run(
+        &mut terminal,
+        &should_exit,
+        mouse_capture_enabled,
+        start_dirs,
+    );
 
     restore_terminal();
 
@@ -92,8 +212,9 @@ fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     should_exit: &AtomicBool,
     mouse_capture_enabled: bool,
+    start_dirs: StartDirs,
 ) -> Result<()> {
-    let mut app = App::new()?;
+    let mut app = App::with_start_dirs(start_dirs)?;
     // Tracks what's actually been sent to the terminal, so a change to the
     // live "Capture mouse" setting (toggled in the Settings dialog) can be
     // applied the moment it happens, not just at the next TUI suspend.
@@ -370,6 +491,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
         || app.job_visible
         || app.help_open
         || app.logs_open
+        || app.about_open
         || app.dialog_is_text_input()
         || app.dialog_is_settings()
         || !matches!(app.dialog, Dialog::None)
@@ -509,6 +631,11 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
 
     if app.logs_open {
         app.logs_open = false;
+        return Ok(());
+    }
+
+    if app.about_open {
+        app.about_open = false;
         return Ok(());
     }
 
@@ -711,4 +838,98 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn run(left: Option<&str>, right: Option<&str>) -> CliRequest {
+        CliRequest::Run {
+            left: left.map(String::from),
+            right: right.map(String::from),
+        }
+    }
+
+    #[test]
+    fn no_arguments_starts_the_ui() {
+        assert_eq!(parse_args(args(&[])), run(None, None));
+    }
+
+    #[test]
+    fn version_and_help_flags_are_recognised() {
+        for flag in ["-V", "-v", "--version", "-version"] {
+            assert_eq!(parse_args(args(&[flag])), CliRequest::Version, "{flag}");
+        }
+        assert_eq!(parse_args(args(&["-h"])), CliRequest::Help);
+        assert_eq!(parse_args(args(&["--help"])), CliRequest::Help);
+    }
+
+    #[test]
+    fn flags_win_over_directories() {
+        assert_eq!(parse_args(args(&["~/a", "-v"])), CliRequest::Version);
+        assert_eq!(parse_args(args(&["--nope", "-h"])), CliRequest::Help);
+    }
+
+    #[test]
+    fn bare_version_is_a_directory() {
+        assert_eq!(parse_args(args(&["version"])), run(Some("version"), None));
+    }
+
+    #[test]
+    fn up_to_two_directories_fill_left_then_right() {
+        assert_eq!(parse_args(args(&["."])), run(Some("."), None));
+        assert_eq!(parse_args(args(&["a", "b"])), run(Some("a"), Some("b")));
+        assert!(matches!(
+            parse_args(args(&["a", "b", "c"])),
+            CliRequest::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_options_are_rejected() {
+        assert_eq!(
+            parse_args(args(&["-x"])),
+            CliRequest::Invalid("unknown option '-x'".into())
+        );
+        // A lone "-" isn't an option; it's treated as a (nonexistent) dir.
+        assert_eq!(parse_args(args(&["-"])), run(Some("-"), None));
+    }
+
+    #[test]
+    fn resolve_dir_accepts_directories_only() {
+        let tmp = std::env::temp_dir().join(format!("pc-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        assert_eq!(
+            resolve_dir(tmp.to_str().unwrap()),
+            Ok(tmp.canonicalize().unwrap())
+        );
+        assert!(
+            resolve_dir(file.to_str().unwrap())
+                .unwrap_err()
+                .contains("is not a directory")
+        );
+        assert!(
+            resolve_dir(tmp.join("missing").to_str().unwrap())
+                .unwrap_err()
+                .starts_with("cannot open")
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn version_text_matches_the_package() {
+        assert_eq!(
+            version_text(),
+            format!("peter-commander {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }

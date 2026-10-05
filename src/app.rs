@@ -237,12 +237,16 @@ pub struct App {
     pub dialog_cancel_focused: bool,
     pub external_request: Option<ExternalRequest>,
     pub help_open: bool,
-    /// Which of the two help screen pages is shown (0 or 1) — Left/Right
-    /// switch between them while help is open.
+    /// Which F1 help page is shown (an index into `ui::HELP_PAGES`, below
+    /// `ui::HELP_PAGE_COUNT`) — Left/Right flip between them while help is
+    /// open.
     pub help_page: usize,
     /// Command > Show Logs: a full-screen view of the recent contents of
     /// the error/status log file, closed by any key like help.
     pub logs_open: bool,
+    /// Command > About: program name, version and author, closed by any
+    /// key like help.
+    pub about_open: bool,
     /// A blocking "in your face" popup for the most recent error (e.g.
     /// "Access is denied" entering a locked directory) — unlike
     /// `status_message`, which only reaches the log file, this demands a
@@ -358,8 +362,22 @@ pub struct App {
     last_scroll_at: Option<Instant>,
 }
 
+/// Directories named on the command line (`pc LEFT [RIGHT]`), already
+/// checked and absolute. Each one overrides where that pane would otherwise
+/// start.
+#[derive(Debug, Default)]
+pub struct StartDirs {
+    pub left: Option<PathBuf>,
+    pub right: Option<PathBuf>,
+}
+
 impl App {
+    #[cfg(test)]
     pub fn new() -> Result<Self> {
+        Self::with_start_dirs(StartDirs::default())
+    }
+
+    pub fn with_start_dirs(start_dirs: StartDirs) -> Result<Self> {
         let cwd = env::current_dir()?;
         let saved_settings = state::load_settings();
         let start_left_in_cwd = saved_settings
@@ -375,6 +393,10 @@ impl App {
             Some(last) => (last.left, last.right),
             None => (cwd.clone(), cwd),
         };
+        // An explicitly named directory beats both the launch dir and the
+        // "Restore last session" setting.
+        let left_dir = start_dirs.left.unwrap_or(left_dir);
+        let right_dir = start_dirs.right.unwrap_or(right_dir);
         let wait_after_shell_command = saved_settings
             .get(SettingItem::WaitAfterShellCommand.key())
             .copied()
@@ -418,6 +440,7 @@ impl App {
             help_open: false,
             help_page: 0,
             logs_open: false,
+            about_open: false,
             error_dialog: None,
             command_line: String::new(),
             quick_search: None,
@@ -608,6 +631,7 @@ impl App {
             | Action::SortByDate
             | Action::Help
             | Action::Settings
+            | Action::About
             | Action::ShowTerminal
             | Action::ShowLogs
             | Action::Quit => true,
@@ -1062,6 +1086,7 @@ impl App {
             }
             Action::ShowTerminal => self.request_reveal_terminal(),
             Action::ShowLogs => self.logs_open = true,
+            Action::About => self.about_open = true,
             Action::QuickSearch => {
                 self.quick_search = Some(String::new());
             }

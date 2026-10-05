@@ -37,8 +37,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // -2 for the pane's own top/bottom border, and 2 more for the divider +
     // status footer row when that's on (see `draw_pane`), so PgUp/PgDn page
     // by exactly what's actually visible in the file listing.
-    let footer_rows = if app.pane_totals { 2 } else { 0 };
-    let header_rows = if app.column_headers { 1 } else { 0 };
+    let look = PaneLook::of(app);
+    let footer_rows = if look.show_totals { 2 } else { 0 };
+    let header_rows = if look.show_headers { 1 } else { 0 };
     app.pane_visible_lines = panes[0]
         .height
         .saturating_sub(2 + footer_rows + header_rows) as usize;
@@ -56,9 +57,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &app.left,
                     !app.preview_focus,
                     &mut app.left_list_state,
-                    app.classic_style,
-                    app.pane_totals,
-                    app.column_headers,
+                    look,
                 );
                 draw_preview_pane(
                     frame,
@@ -86,9 +85,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &app.right,
                     !app.preview_focus,
                     &mut app.right_list_state,
-                    app.classic_style,
-                    app.pane_totals,
-                    app.column_headers,
+                    look,
                 );
             }
         }
@@ -99,9 +96,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &app.left,
             app.active == Side::Left,
             &mut app.left_list_state,
-            app.classic_style,
-            app.pane_totals,
-            app.column_headers,
+            look,
         );
         draw_pane(
             frame,
@@ -109,9 +104,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &app.right,
             app.active == Side::Right,
             &mut app.right_list_state,
-            app.classic_style,
-            app.pane_totals,
-            app.column_headers,
+            look,
         );
     }
 
@@ -222,6 +215,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_logs(frame, app.classic_style);
     }
 
+    if app.about_open {
+        draw_about(frame, app.classic_style);
+    }
+
     if let Some(message) = &app.error_dialog {
         draw_error_dialog(frame, app.classic_style, message);
     }
@@ -273,7 +270,7 @@ fn wrap_message(message: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The three F1 pages: a title and its lines. Left/Right flip between them.
+/// The F1 help pages: a title and its lines. Left/Right flip between them.
 const HELP_PAGES: &[(&str, &[&str])] = &[
     (
         "Function keys",
@@ -289,7 +286,7 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
             "F8        Delete        Move to trash (or delete, per Settings)",
             "Shift+F8  Delete        Delete permanently",
             "F9        Menu          Open the pulldown menu",
-            "F10       Quit          Quit PeterCommander",
+            "F10       Quit          Quit Peter Commander",
         ],
     ),
     (
@@ -339,7 +336,7 @@ pub const HELP_PAGE_COUNT: usize = HELP_PAGES.len();
 
 fn draw_help(frame: &mut Frame, classic_style: bool, page: usize) {
     let pal = dialog_palette(classic_style);
-    let (title, body) = HELP_PAGES[page.min(HELP_PAGES.len() - 1)];
+    let (_, body) = HELP_PAGES[page.min(HELP_PAGES.len() - 1)];
 
     // Every page gets the same height and width, so flipping pages doesn't
     // make the box jump around.
@@ -348,10 +345,12 @@ fn draw_help(frame: &mut Frame, classic_style: bool, page: usize) {
         .map(|(_, lines)| lines.len())
         .max()
         .unwrap_or(0);
+    // The titles count too, so a long page title can't widen just its page.
     let widest = HELP_PAGES
         .iter()
         .flat_map(|(_, lines)| lines.iter())
         .map(|line| line.chars().count())
+        .chain((0..HELP_PAGES.len()).map(|idx| help_title(idx).chars().count() + 4))
         .max()
         .unwrap_or(0);
     let min_width = (widest + 2 * DIALOG_PAD + 2) as u16 + 2 * OUTER_PAD_X;
@@ -380,8 +379,25 @@ fn draw_help(frame: &mut Frame, classic_style: bool, page: usize) {
         ),
     ]));
 
-    let title = format!("Help \u{2014} {title} ({}/{})", page + 1, HELP_PAGES.len());
-    draw_dialog_box(frame, &pal, &title, vec![lines, vec![footer]], min_width);
+    // The program and version head every page, above the page's own lines.
+    let heading = DialogLine::Centered(Line::from(Span::styled(
+        format!("{PROGRAM_NAME} {}", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+    )));
+
+    draw_dialog_box(
+        frame,
+        &pal,
+        &help_title(page),
+        vec![vec![heading], lines, vec![footer]],
+        min_width,
+    );
+}
+
+/// The F1 box title for `page`, e.g. "Help — Tips (3/3)".
+fn help_title(page: usize) -> String {
+    let (title, _) = HELP_PAGES[page.min(HELP_PAGES.len() - 1)];
+    format!("Help \u{2014} {title} ({}/{})", page + 1, HELP_PAGES.len())
 }
 
 /// Color palette for the big double-bordered dialog frame shared by every
@@ -824,7 +840,7 @@ fn draw_quit_dialog(
 ) {
     let pal = dialog_palette(classic_style);
     let mut message = vec![DialogLine::Text(Line::from(Span::styled(
-        "Quit PeterCommander?",
+        "Quit Peter Commander?",
         Style::default().fg(pal.fg),
     )))];
     if let Some(job) = job {
@@ -1664,16 +1680,40 @@ const MARKED_FG: Color = Color::Rgb(0xFF, 0xFF, 0x50);
 /// so it stands out from the border in either palette.
 const SORT_INDICATOR_FG: Color = MARKED_FG;
 
+/// How file panes look: the user's display settings that both panes share,
+/// read from `App` once per frame.
+#[derive(Clone, Copy)]
+struct PaneLook {
+    classic_style: bool,
+    /// The file/dir count (or marked-files summary) on the bottom border.
+    show_totals: bool,
+    /// The Name/Size/Date/Time column headers.
+    show_headers: bool,
+}
+
+impl PaneLook {
+    fn of(app: &App) -> Self {
+        Self {
+            classic_style: app.classic_style,
+            show_totals: app.pane_totals,
+            show_headers: app.column_headers,
+        }
+    }
+}
+
 fn draw_pane(
     frame: &mut Frame,
     area: Rect,
     pane: &Pane,
     is_active: bool,
     list_state: &mut ListState,
-    classic_style: bool,
-    show_totals: bool,
-    show_headers: bool,
+    look: PaneLook,
 ) {
+    let PaneLook {
+        classic_style,
+        show_totals,
+        show_headers,
+    } = look;
     let border_style = if classic_style {
         let fg = if is_active {
             classic::ACTIVE_BORDER_FG
@@ -2167,6 +2207,58 @@ fn draw_logs(frame: &mut Frame, classic_style: bool) {
     draw_dialog_box(frame, &pal, &title, vec![body, vec![footer]], min_width);
 }
 
+const PROGRAM_NAME: &str = "Peter Commander";
+
+/// The first year in the copyright line — the same one LICENSE carries.
+const COPYRIGHT_YEAR: u16 = 2026;
+
+/// Author names from `CARGO_PKG_AUTHORS` (`Name <email>`, several joined
+/// by `:`), without the emails.
+fn author_names() -> String {
+    env!("CARGO_PKG_AUTHORS")
+        .split(':')
+        .map(|author| author.split(" <").next().unwrap_or(author).trim())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Command > About: name, version, author, license and repository, all
+/// taken from Cargo.toml so they can't drift from the packaged release.
+fn draw_about(frame: &mut Frame, classic_style: bool) {
+    let pal = dialog_palette(classic_style);
+    let centered = |s: String, bold: bool| {
+        let style = if bold {
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal.fg)
+        };
+        DialogLine::Centered(Line::from(Span::styled(s, style)))
+    };
+    let repository = env!("CARGO_PKG_REPOSITORY");
+    let sections = vec![
+        vec![
+            centered(
+                format!("{PROGRAM_NAME} {}", env!("CARGO_PKG_VERSION")),
+                true,
+            ),
+            centered(env!("CARGO_PKG_DESCRIPTION").to_string(), false),
+        ],
+        vec![
+            centered(format!("\u{a9} {COPYRIGHT_YEAR} {}", author_names()), false),
+            centered(format!("{} License", env!("CARGO_PKG_LICENSE")), false),
+            centered(
+                repository
+                    .strip_prefix("https://")
+                    .unwrap_or(repository)
+                    .to_string(),
+                false,
+            ),
+        ],
+        vec![button_row(&[("OK", true)], &pal)],
+    ];
+    draw_dialog_frame(frame, classic_style, "About", sections, false);
+}
+
 fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     // Same reasoning as draw_command_line: the 1-column indent and the
     // gaps between tiles are real painted spaces (styled with the row's
@@ -2341,6 +2433,72 @@ mod tests {
         // Non-classic mode: the cell underneath is a named/Reset color, so
         // the shadow falls back to a flat dark gray fill.
         assert_eq!(cell.bg, Color::Rgb(30, 30, 30));
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let area = buf.area;
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn author_names_drop_the_email() {
+        let names = author_names();
+        assert!(names.contains("Piotr \u{15a}r\u{f3}dka"), "{names}");
+        assert!(!names.contains('<'), "{names}");
+    }
+
+    #[test]
+    fn about_dialog_shows_version_and_author_in_both_styles() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for classic_style in [false, true] {
+            let mut app = App::new().unwrap();
+            app.classic_style = classic_style;
+            app.about_open = true;
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+
+            for expected in [
+                format!("{PROGRAM_NAME} {}", env!("CARGO_PKG_VERSION")),
+                author_names(),
+                "MIT License".to_string(),
+                "[ OK ]".to_string(),
+            ] {
+                assert!(text.contains(&expected), "missing {expected:?}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_box_keeps_its_place_on_every_page() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new().unwrap();
+        app.help_open = true;
+        let corners: Vec<usize> = (0..HELP_PAGE_COUNT)
+            .map(|page| {
+                app.help_page = page;
+                let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let text = buffer_text(terminal.backend().buffer());
+                let row = text.lines().find(|l| l.contains("Help \u{2014}")).unwrap();
+                row.chars().position(|c| c == '\u{2554}').unwrap()
+            })
+            .collect();
+        assert!(corners.windows(2).all(|w| w[0] == w[1]), "{corners:?}");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 name = "peter-commander"
 version = "0.9.0"
 edition = "2024"
+authors = ["Piotr Śródka <piotr.srodka@hey.com>"]
 description = "A terminal file manager"
 license = "MIT"
 repository = "https://github.com/piotrsrodka/peter-commander"

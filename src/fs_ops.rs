@@ -19,6 +19,10 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
+/// Progress callback: the file being copied and how many more bytes of it
+/// were just written.
+pub type ProgressFn<'a> = dyn Fn(&Path, u64) + Sync + 'a;
+
 /// Optional hooks a background Copy/Move threads through the copy so it can
 /// show progress and be cancelled. The default (no hooks) copies each file
 /// with a single `fs::copy`, exactly as before.
@@ -27,7 +31,7 @@ pub struct Monitor<'a> {
     pub cancel: Option<&'a AtomicBool>,
     /// Called with the file being copied and how many more bytes of it
     /// were just written.
-    pub on_progress: Option<&'a (dyn Fn(&Path, u64) + Sync)>,
+    pub on_progress: Option<&'a ProgressFn<'a>>,
     /// Called once each file (or symlink) has been copied in full.
     pub on_file_done: Option<&'a (dyn Fn() + Sync)>,
 }
@@ -332,8 +336,9 @@ pub fn tree_size(path: &Path, cancel: &AtomicBool) -> Result<TreeSize> {
 /// - `dir` under the same mount point as the home trash → home trash;
 /// - otherwise the per-volume trash (`$topdir/.Trash/$uid`, or
 ///   `$topdir/.Trash-$uid`, created if missing) → that, falling back to the
-///   home trash when it can't be created (permission denied);
-/// and whichever trash it lands on, a rename onto another filesystem (a
+///   home trash when it can't be created (permission denied).
+///
+/// And whichever trash it lands on, a rename onto another filesystem (a
 /// different `st_dev` — which includes another btrfs subvolume under the
 /// same mount) fails, so the crate copies instead. Best effort: `false`
 /// whenever it can't tell. Only Linux is checked; macOS and Windows hand
