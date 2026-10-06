@@ -1804,12 +1804,10 @@ fn draw_pane(
             };
 
             let date = format_modified(entry.modified);
-            let size_label = if entry.is_dir {
-                if classic_style {
-                    "<DIR>".to_string()
-                } else {
-                    String::new()
-                }
+            let size_label = if entry.name == ".." {
+                String::new()
+            } else if entry.is_dir {
+                "<DIR>".to_string()
             } else {
                 format_size(entry.size)
             };
@@ -1863,11 +1861,7 @@ fn draw_pane(
         None => match pane.selected_entry() {
             Some(entry) if entry.name != ".." => {
                 let size = if entry.is_dir {
-                    if classic_style {
-                        "<DIR>".to_string()
-                    } else {
-                        String::new()
-                    }
+                    "<DIR>".to_string()
                 } else {
                     format_size(entry.size)
                 };
