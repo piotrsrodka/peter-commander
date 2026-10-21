@@ -7,6 +7,8 @@ mod menu;
 mod pane;
 mod preview;
 mod state;
+#[cfg(target_os = "linux")]
+mod tty_image;
 mod ui;
 
 use std::env;
@@ -301,6 +303,83 @@ fn run_external(
         }
         ExternalRequest::Shell { command, cwd } => run_shell_command(terminal, &command, &cwd, app),
         ExternalRequest::RevealTerminal => reveal_terminal(terminal, app),
+        #[cfg(target_os = "linux")]
+        ExternalRequest::ShowImage(path) => show_tty_image(terminal, &path, app),
+    }
+}
+
+/// Shows an image full-screen on the tty (see `tty_image`) until Esc, `q`
+/// or Ctrl+C, also across switches to other consoles and back. Left/Right
+/// step through the other images in the active pane, in its listing order,
+/// moving its cursor along so Esc lands on the last one shown. The TUI stays in raw mode, so keys still arrive as crossterm
+/// events; it only needs a full redraw once the console is back.
+#[cfg(target_os = "linux")]
+fn show_tty_image(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    path: &Path,
+    app: &mut App,
+) -> Result<()> {
+    let shown = tty_image::decode(path).and_then(|picture| {
+        let mut screen = tty_image::Screen::open()?;
+        screen.draw(&picture);
+        Ok(screen)
+    });
+    let mut screen = match shown {
+        Ok(screen) => screen,
+        Err(err) => {
+            app.set_error(format!("Cannot show image: {err:#}"));
+            return Ok(());
+        }
+    };
+    loop {
+        // Console switches wait for us, so answer them before anything else.
+        if let Err(err) = screen.follow_console_switches() {
+            app.set_error(format!("Image viewer closed: {err:#}"));
+            break;
+        }
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let forward = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => break,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+            KeyCode::Right => true,
+            KeyCode::Left => false,
+            _ => continue,
+        };
+        // Files that fail to decode are skipped over.
+        let pane = app.active_pane();
+        for idx in neighbor_images(&pane.entries, pane.selected, forward) {
+            if let Ok(picture) = tty_image::decode(&pane.cwd.join(&pane.entries[idx].name)) {
+                screen.draw(&picture);
+                pane.selected = idx;
+                break;
+            }
+        }
+    }
+    drop(screen);
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Indices of the image files after (or before) `from` in `entries`,
+/// nearest first, without wrapping around.
+#[cfg(target_os = "linux")]
+fn neighbor_images(entries: &[pane::Entry], from: usize, forward: bool) -> Vec<usize> {
+    let is_image = |&idx: &usize| {
+        let entry: &pane::Entry = &entries[idx];
+        !entry.is_dir && tty_image::is_image(&entry.name)
+    };
+    if forward {
+        (from + 1..entries.len()).filter(is_image).collect()
+    } else {
+        (0..from).rev().filter(is_image).collect()
     }
 }
 
@@ -843,6 +922,30 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn neighbor_images_skip_dirs_and_other_files() {
+        let entry = |name: &str, is_dir: bool| pane::Entry {
+            name: name.to_string(),
+            is_dir,
+            size: 0,
+            modified: None,
+            is_executable: false,
+        };
+        let entries = [
+            entry("..", true),
+            entry("a.jpg", false),
+            entry("dir.png", true),
+            entry("b.txt", false),
+            entry("c.PNG", false),
+            entry("d.webp", false),
+        ];
+        assert_eq!(neighbor_images(&entries, 1, true), [4, 5]);
+        assert_eq!(neighbor_images(&entries, 4, false), [1]);
+        assert!(neighbor_images(&entries, 5, true).is_empty());
+        assert!(neighbor_images(&entries, 1, false).is_empty());
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

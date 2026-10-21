@@ -27,6 +27,7 @@ Also comes with an optional classic retro Norton Commander color scheme
 - Edit (F4) with your `$EDITOR`
 - Runs executable scripts and binaries directly
 - Opens images, PDFs, audio, video, and HTML in your system's default app
+- On a bare Linux console (tty), shows images full-screen itself (←/→ next image, Esc to return)
 - Built-in command-line prompt, with `cd` support
 - Ctrl+O shows previous command output
 - Configurable settings: hidden files, F3 preview mode, trash

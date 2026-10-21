@@ -210,6 +210,10 @@ pub enum ExternalRequest {
         cwd: PathBuf,
     },
     RevealTerminal,
+    /// Show an image full-screen on the Linux console, where `xdg-open`
+    /// has no desktop to open it in.
+    #[cfg(target_os = "linux")]
+    ShowImage(PathBuf),
     /// Open `list_file` (the names, one per line) in $EDITOR, then hand
     /// the result to `App::finish_bulk_rename`.
     RenameSelected {
@@ -1248,8 +1252,9 @@ impl App {
     /// the command line (`./name`, or just `name` on Windows, which has no
     /// such convention); for a known media file (image, PDF, audio, video,
     /// HTML), hands it to the desktop's default viewer (`xdg-open`, `open`
-    /// on macOS, or Explorer on Windows). Anything else does nothing, same
-    /// as before.
+    /// on macOS, or Explorer on Windows) — except an image on a bare Linux
+    /// console, which PC shows itself (`tty_image`), as there's no desktop
+    /// there. Anything else does nothing, same as before.
     pub fn open_selected(&mut self) -> Result<()> {
         let pane = self.active_pane_ref();
         if let Some(entry) = pane.selected_entry()
@@ -1264,6 +1269,17 @@ impl App {
                 command,
                 cwd: pane.cwd.clone(),
             });
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(entry) = pane.selected_entry()
+            && !entry.is_dir
+            && crate::tty_image::is_image(&entry.name)
+            && crate::tty_image::on_console()
+            && let Some(path) = pane.selected_path()
+        {
+            self.external_request = Some(ExternalRequest::ShowImage(path));
             return Ok(());
         }
 
