@@ -13,8 +13,9 @@ use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use image::RgbImage;
 use signal_hook::SigId;
 
@@ -23,10 +24,7 @@ use signal_hook::SigId;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
 
 pub fn is_image(name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+    crate::app::has_extension(name, IMAGE_EXTENSIONS)
 }
 
 /// Whether PC is running straight on a kernel virtual console (`/dev/tty3`
@@ -51,19 +49,26 @@ pub struct Screen {
     connector_id: u32,
     /// What the console had on the CRTC, put back on leaving.
     console_crtc: DrmModeCrtc,
-    /// Our framebuffer on the same CRTC, set again on coming back.
+    /// Our front buffer on the same CRTC, set again on coming back.
     picture_crtc: DrmModeCrtc,
     /// Whether our picture is on the monitor right now, i.e. this console
     /// is the active one.
     on_screen: bool,
-    fb_id: u32,
-    handle: u32,
-    map: *mut u8,
-    size: usize,
+    /// Back on this console, but the program we switched to hasn't let go
+    /// of the display yet: until when to keep asking for it.
+    reacquire_until: Option<Instant>,
+    /// Two buffers, so a new picture is drawn out of sight and then shown
+    /// whole, instead of being painted line by line on screen.
+    buffers: [DumbBuffer; 2],
+    /// The one of `buffers` in `picture_crtc`.
+    front: usize,
     width: usize,
     height: usize,
-    pitch: usize,
 }
+
+/// How long to wait, after coming back to this console, for the program
+/// on the other one (a compositor, via logind) to drop the display.
+const REACQUIRE_WAIT: Duration = Duration::from_secs(3);
 
 /// Decodes an image file. Done before touching the screen, so an
 /// unreadable file never blanks the console.
@@ -94,15 +99,183 @@ impl Screen {
             ..Default::default()
         };
         ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &mut console_crtc, "GETCRTC")?;
+        let console_mode = (console_crtc.mode_valid != 0).then_some(console_crtc.mode);
+        let modes = mode_choices(console_mode, output.mode);
 
-        // A "dumb buffer": plain pixels in memory the kernel can scan out, no
-        // GPU rendering involved. Registered as a framebuffer, then mapped so
-        // it can be written like an ordinary array. On an early error, closing
-        // the card frees them.
-        let mode = output.mode;
+        // Big enough for every mode we may end up in; a mode smaller than
+        // the buffer just shows its top-left part. On an early error,
+        // closing the card frees them.
+        let width = modes.iter().map(|m| m.hdisplay).max().unwrap_or(0);
+        let height = modes.iter().map(|m| m.vdisplay).max().unwrap_or(0);
+        let buffers = [
+            DumbBuffer::create(fd, width.into(), height.into())?,
+            DumbBuffer::create(fd, width.into(), height.into())?,
+        ];
+
+        let mut screen = Screen {
+            card,
+            vt,
+            connector_id: output.connector_id,
+            console_crtc,
+            // The actual mode setting: this CRTC, in this mode, scanning out
+            // this framebuffer (to this connector, added by `set_crtc`).
+            picture_crtc: DrmModeCrtc {
+                crtc_id: output.crtc_id,
+                fb_id: buffers[0].fb_id,
+                mode_valid: 1,
+                ..Default::default()
+            },
+            on_screen: false,
+            reacquire_until: None,
+            buffers,
+            front: 0,
+            width: 0,
+            height: 0,
+        };
+        let mut result = Ok(());
+        for mode in modes {
+            screen.picture_crtc.mode = mode;
+            result = screen.set_crtc(screen.picture_crtc);
+            if result.is_ok() {
+                screen.width = mode.hdisplay.into();
+                screen.height = mode.vdisplay.into();
+                screen.on_screen = true;
+                break;
+            }
+        }
+        result.map(|()| screen)
+    }
+
+    /// Replaces the picture with `picture`, fit and centered on black:
+    /// drawn into the back buffer, which then becomes the front one.
+    pub fn draw(&mut self, picture: &RgbImage) -> Result<()> {
+        let back = 1 - self.front;
+        let buffer = &self.buffers[back];
+        let pixels = unsafe { std::slice::from_raw_parts_mut(buffer.map, buffer.size) };
+        draw_fit(picture, pixels, self.width, self.height, buffer.pitch);
+        self.front = back;
+        self.picture_crtc.fb_id = buffer.fb_id;
+        // Same mode, so no modeset: KMS just scans out the other buffer
+        // from the next frame on. Off screen, it's shown on coming back.
+        if self.on_screen {
+            self.set_crtc(self.picture_crtc)?;
+        }
+        Ok(())
+    }
+
+    /// Answers the kernel's console-switch requests (Ctrl+Alt+Fn) — call
+    /// this often, as the switch waits for it. Leaving: the display is
+    /// released and the switch allowed.
+    /// Coming back: the display is taken again and the picture, still in
+    /// its buffer, put back — retried for a while, as the program on the
+    /// console we come from may let go of the display only after the
+    /// switch. An error means the display couldn't be taken back (someone
+    /// else holds it); the picture is then gone.
+    pub fn follow_console_switches(&mut self) -> Result<()> {
+        let fd = self.card.as_raw_fd();
+        if self.vt.release.swap(false, Ordering::Relaxed) {
+            // The picture stays up until the console we switch to sets its
+            // own (the kernel for a text one, a compositor for its own);
+            // putting the console's buffer back first would flash PC's
+            // screen in between.
+            self.on_screen = false;
+            // Still waiting to get the display back means we don't hold it.
+            if self.reacquire_until.take().is_none() {
+                unsafe { libc::ioctl(fd, DRM_IOCTL_DROP_MASTER) };
+            }
+            unsafe { libc::ioctl(libc::STDIN_FILENO, VT_RELDISP, 1 as libc::c_ulong) };
+        }
+        if self.vt.acquire.swap(false, Ordering::Relaxed) {
+            unsafe {
+                libc::ioctl(libc::STDIN_FILENO, VT_RELDISP, VT_ACKACQ as libc::c_ulong);
+            }
+            self.reacquire_until = Some(Instant::now() + REACQUIRE_WAIT);
+        }
+        if let Some(deadline) = self.reacquire_until {
+            if unsafe { libc::ioctl(fd, DRM_IOCTL_SET_MASTER) } < 0 {
+                let err = io::Error::last_os_error();
+                // Another master still there: EBUSY, or EINVAL on older kernels.
+                let held = matches!(err.raw_os_error(), Some(libc::EBUSY | libc::EINVAL));
+                if held && Instant::now() < deadline {
+                    return Ok(());
+                }
+                self.reacquire_until = None;
+                return Err(err).context("taking the screen back");
+            }
+            self.reacquire_until = None;
+            self.set_crtc(self.picture_crtc)?;
+            self.on_screen = true;
+        }
+        Ok(())
+    }
+
+    /// SETCRTC with `crtc` driving our one connector — or none, for a
+    /// CRTC the console had switched off.
+    fn set_crtc(&self, mut crtc: DrmModeCrtc) -> Result<()> {
+        if crtc.mode_valid != 0 {
+            crtc.set_connectors_ptr = &self.connector_id as *const u32 as u64;
+            crtc.count_connectors = 1;
+        }
+        ioctl(
+            self.card.as_raw_fd(),
+            DRM_IOCTL_MODE_SETCRTC,
+            &mut crtc,
+            "SETCRTC",
+        )
+    }
+}
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        if self.on_screen {
+            let _ = self.set_crtc(self.console_crtc);
+        }
+        let fd = self.card.as_raw_fd();
+        for buffer in &mut self.buffers {
+            buffer.free(fd);
+        }
+        // Closing the card drops master, so the console can draw again.
+    }
+}
+
+/// The modes to try, best first. The console's own mode when it has the
+/// monitor's preferred size: no modeset, so the monitor doesn't blink.
+/// A console set smaller (`video=` on the kernel command line, say) would
+/// make a blurry picture, so then the preferred mode, falling back to the
+/// console's if the CRTC won't take it.
+fn mode_choices(
+    console: Option<DrmModeModeinfo>,
+    preferred: DrmModeModeinfo,
+) -> Vec<DrmModeModeinfo> {
+    match console {
+        None => vec![preferred],
+        Some(console)
+            if (console.hdisplay, console.vdisplay) == (preferred.hdisplay, preferred.vdisplay) =>
+        {
+            vec![console]
+        }
+        Some(console) => vec![preferred, console],
+    }
+}
+
+/// A "dumb buffer": plain pixels in memory the kernel can scan out, no GPU
+/// rendering involved. Registered as a framebuffer, then mapped so it can
+/// be written like an ordinary array. Freed by `free`, or by closing the
+/// card.
+struct DumbBuffer {
+    handle: u32,
+    fb_id: u32,
+    map: *mut u8,
+    size: usize,
+    pitch: usize,
+}
+
+impl DumbBuffer {
+    /// A black `width`×`height` buffer.
+    fn create(fd: i32, width: u32, height: u32) -> Result<DumbBuffer> {
         let mut dumb = DrmModeCreateDumb {
-            width: mode.hdisplay.into(),
-            height: mode.vdisplay.into(),
+            width,
+            height,
             bpp: 32,
             ..Default::default()
         };
@@ -137,92 +310,16 @@ impl Screen {
             return Err(io::Error::last_os_error()).context("mmap");
         }
         unsafe { ptr::write_bytes(map as *mut u8, 0, size) };
-
-        let mut screen = Screen {
-            card,
-            vt,
-            connector_id: output.connector_id,
-            console_crtc,
-            // The actual mode setting: this CRTC, in this mode, scanning out
-            // this framebuffer (to this connector, added by `set_crtc`).
-            picture_crtc: DrmModeCrtc {
-                crtc_id: output.crtc_id,
-                fb_id: fb.fb_id,
-                mode_valid: 1,
-                mode,
-                ..Default::default()
-            },
-            on_screen: false,
-            fb_id: fb.fb_id,
+        Ok(DumbBuffer {
             handle: dumb.handle,
+            fb_id: fb.fb_id,
             map: map as *mut u8,
             size,
-            width: dumb.width as usize,
-            height: dumb.height as usize,
             pitch: dumb.pitch as usize,
-        };
-        screen.set_crtc(screen.picture_crtc)?;
-        screen.on_screen = true;
-        Ok(screen)
+        })
     }
 
-    /// Replaces the picture with `picture`, fit and centered on black. The
-    /// buffer is the one being scanned out, so the change shows at once.
-    pub fn draw(&mut self, picture: &RgbImage) {
-        let pixels = unsafe { std::slice::from_raw_parts_mut(self.map, self.size) };
-        draw_fit(picture, pixels, self.width, self.height, self.pitch);
-    }
-
-    /// Answers the kernel's console-switch requests (Ctrl+Alt+Fn) — call
-    /// this often, as the switch waits for it. Leaving: the console's
-    /// buffer goes back, the display is released and the switch allowed.
-    /// Coming back: the display is taken again and the picture, still in
-    /// its buffer, put back. An error means the display couldn't be taken
-    /// back (someone else holds it); the picture is then gone.
-    pub fn follow_console_switches(&mut self) -> Result<()> {
-        let fd = self.card.as_raw_fd();
-        if self.vt.release.swap(false, Ordering::Relaxed) {
-            if self.on_screen {
-                let _ = self.set_crtc(self.console_crtc);
-                self.on_screen = false;
-            }
-            unsafe {
-                libc::ioctl(fd, DRM_IOCTL_DROP_MASTER);
-                libc::ioctl(libc::STDIN_FILENO, VT_RELDISP, 1 as libc::c_ulong);
-            }
-        }
-        if self.vt.acquire.swap(false, Ordering::Relaxed) {
-            unsafe {
-                libc::ioctl(libc::STDIN_FILENO, VT_RELDISP, VT_ACKACQ as libc::c_ulong);
-            }
-            if unsafe { libc::ioctl(fd, DRM_IOCTL_SET_MASTER) } < 0 {
-                return Err(io::Error::last_os_error()).context("taking the screen back");
-            }
-            self.set_crtc(self.picture_crtc)?;
-            self.on_screen = true;
-        }
-        Ok(())
-    }
-
-    /// SETCRTC with `crtc` driving our one connector.
-    fn set_crtc(&self, mut crtc: DrmModeCrtc) -> Result<()> {
-        crtc.set_connectors_ptr = &self.connector_id as *const u32 as u64;
-        crtc.count_connectors = 1;
-        ioctl(
-            self.card.as_raw_fd(),
-            DRM_IOCTL_MODE_SETCRTC,
-            &mut crtc,
-            "SETCRTC",
-        )
-    }
-}
-
-impl Drop for Screen {
-    fn drop(&mut self) {
-        if self.on_screen {
-            let _ = self.set_crtc(self.console_crtc);
-        }
-        let fd = self.card.as_raw_fd();
+    fn free(&mut self, fd: i32) {
         unsafe {
             libc::munmap(self.map as *mut libc::c_void, self.size);
             libc::ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut self.fb_id as *mut u32);
@@ -231,7 +328,6 @@ impl Drop for Screen {
             };
             libc::ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut destroy as *mut _);
         }
-        // Closing the card drops master, so the console can draw again.
     }
 }
 
@@ -299,31 +395,38 @@ impl Drop for VtSwitch {
     }
 }
 
-/// A connected monitor: its preferred mode and the CRTC currently driving it.
+/// A connected monitor: its preferred mode and the CRTC to drive it with.
 struct Output {
     connector_id: u32,
     crtc_id: u32,
     mode: DrmModeModeinfo,
+    /// Whether the console is showing on it right now.
+    lit: bool,
 }
 
-/// The first `/dev/dri/cardN` with a monitor plugged in. Card numbers vary
-/// (a firmware framebuffer can hold card0 early in boot), so try them all.
+/// The first `/dev/dri/cardN` showing the console on a monitor, or else
+/// the first with one plugged in. Card numbers vary (a firmware
+/// framebuffer can hold card0 early in boot), so try them all.
 fn find_output() -> Result<(File, Output)> {
+    let mut dark = None;
     for n in 0..16 {
         let path = format!("/dev/dri/card{n}");
         let Ok(card) = OpenOptions::new().read(true).write(true).open(&path) else {
             continue;
         };
         // A render-only or virtual card may refuse KMS queries; skip it.
-        if let Ok(Some(output)) = connected_output(&card) {
-            return Ok((card, output));
+        match connected_output(&card) {
+            Ok(Some(output)) if output.lit => return Ok((card, output)),
+            Ok(Some(output)) if dark.is_none() => dark = Some((card, output)),
+            _ => {}
         }
     }
-    bail!("no graphics card with a connected monitor in /dev/dri")
+    dark.context("no graphics card with a connected monitor in /dev/dri")
 }
 
 /// Every DRM query is asked twice: first for the counts, then again with
-/// arrays of that size for the kernel to fill.
+/// arrays of that size for the kernel to fill. A monitor the console shows
+/// on wins; failing that, a dark one with a free CRTC that can drive it.
 fn connected_output(card: &File) -> Result<Option<Output>> {
     let fd = card.as_raw_fd();
     let mut res = DrmModeCardRes::default();
@@ -342,6 +445,7 @@ fn connected_output(card: &File) -> Result<Option<Output>> {
     connectors.truncate(res.count_connectors as usize);
     crtcs.truncate(res.count_crtcs as usize);
 
+    let mut dark = None;
     for &connector_id in &connectors {
         let mut conn = DrmModeGetConnector {
             connector_id,
@@ -352,14 +456,18 @@ fn connected_output(card: &File) -> Result<Option<Output>> {
             continue;
         }
         let mut modes = vec![DrmModeModeinfo::default(); conn.count_modes as usize];
+        let mut encoders = vec![0u32; conn.count_encoders as usize];
         conn = DrmModeGetConnector {
             connector_id,
             modes_ptr: modes.as_mut_ptr() as u64,
             count_modes: conn.count_modes,
+            encoders_ptr: encoders.as_mut_ptr() as u64,
+            count_encoders: conn.count_encoders,
             ..Default::default()
         };
         ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut conn, "GETCONNECTOR")?;
         modes.truncate(conn.count_modes as usize);
+        encoders.truncate(conn.count_encoders as usize);
         let Some(&mode) = modes
             .iter()
             .find(|mode| mode.type_ & DRM_MODE_TYPE_PREFERRED != 0)
@@ -369,47 +477,93 @@ fn connected_output(card: &File) -> Result<Option<Output>> {
         };
 
         // The CRTC the console is using for this monitor, reached through
-        // its encoder; any CRTC will do if the monitor is currently dark.
-        let mut enc = DrmModeGetEncoder {
-            encoder_id: conn.encoder_id,
-            ..Default::default()
-        };
-        let crtc_id = if conn.encoder_id != 0
-            && ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &mut enc, "GETENCODER").is_ok()
+        // its current encoder.
+        if let Some(enc) = get_encoder(fd, conn.encoder_id)
             && enc.crtc_id != 0
         {
-            enc.crtc_id
-        } else if let Some(&crtc_id) = crtcs.first() {
-            crtc_id
-        } else {
+            return Ok(Some(Output {
+                connector_id,
+                crtc_id: enc.crtc_id,
+                mode,
+                lit: true,
+            }));
+        }
+        if dark.is_some() {
             continue;
+        }
+        // `possible_crtcs` is a bitmask over positions in `crtcs`.
+        let possible = encoders
+            .iter()
+            .filter_map(|&id| get_encoder(fd, id))
+            .fold(0, |mask, enc| mask | enc.possible_crtcs);
+        let free = |crtc_id| {
+            let mut crtc = DrmModeCrtc {
+                crtc_id,
+                ..Default::default()
+            };
+            ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &mut crtc, "GETCRTC").is_ok() && crtc.mode_valid == 0
         };
-        return Ok(Some(Output {
-            connector_id,
-            crtc_id,
-            mode,
-        }));
+        if let Some(crtc_id) = pick_crtc(possible, &crtcs, free) {
+            dark = Some(Output {
+                connector_id,
+                crtc_id,
+                mode,
+                lit: false,
+            });
+        }
     }
-    Ok(None)
+    Ok(dark)
+}
+
+fn get_encoder(fd: i32, encoder_id: u32) -> Option<DrmModeGetEncoder> {
+    let mut enc = DrmModeGetEncoder {
+        encoder_id,
+        ..Default::default()
+    };
+    (encoder_id != 0 && ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &mut enc, "GETENCODER").is_ok())
+        .then_some(enc)
+}
+
+/// The first CRTC in `possible` (a bitmask over positions in `crtcs`) that
+/// is `free` — not one driving another monitor, which would go dark.
+fn pick_crtc(possible: u32, crtcs: &[u32], free: impl Fn(u32) -> bool) -> Option<u32> {
+    crtcs
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i < 32 && possible & (1 << i) != 0)
+        .map(|(_, &id)| id)
+        .find(|&id| free(id))
 }
 
 /// Scales `picture` (nearest neighbor) to fit `width`×`height` keeping its
 /// proportions, centered on black. `screen` is XRGB8888: each pixel is a
 /// little-endian u32, i.e. bytes B, G, R, unused.
+/// `screen` still holds an older picture, so the bars around this one are
+/// cleared too.
 fn draw_fit(picture: &RgbImage, screen: &mut [u8], width: usize, height: usize, pitch: usize) {
-    screen.fill(0);
     let (pw, ph) = (picture.width() as usize, picture.height() as usize);
-    if pw == 0 || ph == 0 {
-        return;
-    }
-    let (dw, dh) = fit(pw, ph, width, height);
+    let (dw, dh) = if pw == 0 || ph == 0 {
+        (0, 0)
+    } else {
+        fit(pw, ph, width, height)
+    };
     let (ox, oy) = ((width - dw) / 2, (height - dh) / 2);
-    for y in 0..dh {
-        let row = &mut screen[(oy + y) * pitch + ox * 4..][..dw * 4];
-        let sy = (y * ph / dh) as u32;
-        for (x, out) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let [r, g, b] = picture.get_pixel((x * pw / dw) as u32, sy).0;
-            *out = [b, g, r, 0];
+    let src = picture.as_raw();
+    // Byte offset in a source row for each screen column.
+    let src_x: Vec<usize> = (0..dw).map(|x| x * pw / dw * 3).collect();
+    for y in 0..height {
+        let row = &mut screen[y * pitch..][..width * 4];
+        if !(oy..oy + dh).contains(&y) {
+            row.fill(0);
+            continue;
+        }
+        let (left, rest) = row.split_at_mut(ox * 4);
+        let (middle, right) = rest.split_at_mut(dw * 4);
+        left.fill(0);
+        right.fill(0);
+        let src_row = &src[(y - oy) * ph / dh * pw * 3..][..pw * 3];
+        for (out, &sx) in middle.as_chunks_mut::<4>().0.iter_mut().zip(&src_x) {
+            *out = [src_row[sx + 2], src_row[sx + 1], src_row[sx], 0];
         }
     }
 }
@@ -649,6 +803,42 @@ mod tests {
     }
 
     #[test]
+    fn mode_choices_avoid_modeset_and_blur() {
+        let mode = |w: u16, h: u16, refresh: u32| DrmModeModeinfo {
+            hdisplay: w,
+            vdisplay: h,
+            vrefresh: refresh,
+            ..Default::default()
+        };
+        let sizes = |modes: Vec<DrmModeModeinfo>| {
+            modes
+                .iter()
+                .map(|m| (m.hdisplay, m.vdisplay, m.vrefresh))
+                .collect::<Vec<_>>()
+        };
+        let preferred = mode(2560, 1440, 144);
+        // Same size: the console's mode as it is, refresh rate included.
+        assert_eq!(
+            sizes(mode_choices(Some(mode(2560, 1440, 60)), preferred)),
+            [(2560, 1440, 60)]
+        );
+        assert_eq!(
+            sizes(mode_choices(Some(mode(1280, 720, 60)), preferred)),
+            [(2560, 1440, 144), (1280, 720, 60)]
+        );
+        assert_eq!(sizes(mode_choices(None, preferred)), [(2560, 1440, 144)]);
+    }
+
+    #[test]
+    fn pick_crtc_takes_a_free_possible_one() {
+        let crtcs = [40, 41, 42];
+        assert_eq!(pick_crtc(0b110, &crtcs, |_| true), Some(41));
+        assert_eq!(pick_crtc(0b110, &crtcs, |id| id != 41), Some(42));
+        assert_eq!(pick_crtc(0b001, &crtcs, |id| id != 40), None);
+        assert_eq!(pick_crtc(0, &crtcs, |_| true), None);
+    }
+
+    #[test]
     fn fit_keeps_proportions() {
         assert_eq!(fit(5009, 3404, 2560, 1440), (2118, 1440));
         assert_eq!(fit(4000, 1000, 2560, 1440), (2560, 640));
@@ -668,19 +858,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn draw_fit_scales_and_clears_bars_above_and_below() {
+        // A 2×1 picture (red, blue) on a 4×4 screen: rows 1–2, two pixels
+        // per source pixel; rows 0 and 3 are bars over the old content.
+        let mut picture = RgbImage::new(2, 1);
+        picture.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        picture.put_pixel(1, 0, image::Rgb([0, 0, 255]));
+        let mut screen = vec![0xff; 16 * 4];
+        draw_fit(&picture, &mut screen, 4, 4, 16);
+        let red = [0, 0, 255, 0];
+        let blue = [255, 0, 0, 0];
+        assert_eq!(screen[..16], [0; 16]);
+        for y in 1..3 {
+            assert_eq!(screen[y * 16..][..16], [red, red, blue, blue].concat());
+        }
+        assert_eq!(screen[48..], [0; 16]);
+    }
+
     /// Reads the real card without touching the screen (no master needed).
     /// Run by hand: `cargo test tty_image -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn probe_real_card() {
-        let (_, output) = find_output().unwrap();
+        let (card, output) = find_output().unwrap();
+        let show = |m: &DrmModeModeinfo| format!("{}x{}@{}", m.hdisplay, m.vdisplay, m.vrefresh);
         println!(
-            "connector {} crtc {} {}x{}@{}",
+            "connector {} crtc {} lit {} preferred {}",
             output.connector_id,
             output.crtc_id,
-            output.mode.hdisplay,
-            output.mode.vdisplay,
-            output.mode.vrefresh
+            output.lit,
+            show(&output.mode)
+        );
+        let mut crtc = DrmModeCrtc {
+            crtc_id: output.crtc_id,
+            ..Default::default()
+        };
+        ioctl(
+            card.as_raw_fd(),
+            DRM_IOCTL_MODE_GETCRTC,
+            &mut crtc,
+            "GETCRTC",
+        )
+        .unwrap();
+        let console = (crtc.mode_valid != 0).then_some(crtc.mode);
+        println!(
+            "now on the crtc: {}; viewer would try: {}",
+            console.as_ref().map_or("off".to_string(), show),
+            mode_choices(console, output.mode)
+                .iter()
+                .map(show)
+                .collect::<Vec<_>>()
+                .join(", then ")
         );
     }
 }

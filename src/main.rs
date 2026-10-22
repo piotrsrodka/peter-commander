@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -247,7 +249,7 @@ fn run(
         app.poll_job()?;
 
         if let Some(request) = app.external_request.take() {
-            run_external(terminal, request, &mut app)?;
+            run_external(terminal, request, &mut app, should_exit)?;
             // The suspend/resume path below re-applies mouse capture to
             // match `app.mouse_capture` on its own; keep this in sync so
             // the check above doesn't redundantly re-toggle it.
@@ -282,6 +284,7 @@ fn run_external(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     request: ExternalRequest,
     app: &mut App,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] should_exit: &AtomicBool,
 ) -> Result<()> {
     match request {
         ExternalRequest::View(path) => {
@@ -304,24 +307,26 @@ fn run_external(
         ExternalRequest::Shell { command, cwd } => run_shell_command(terminal, &command, &cwd, app),
         ExternalRequest::RevealTerminal => reveal_terminal(terminal, app),
         #[cfg(target_os = "linux")]
-        ExternalRequest::ShowImage(path) => show_tty_image(terminal, &path, app),
+        ExternalRequest::ShowImage(path) => show_tty_image(terminal, &path, app, should_exit),
     }
 }
 
-/// Shows an image full-screen on the tty (see `tty_image`) until Esc, `q`
-/// or Ctrl+C, also across switches to other consoles and back. Left/Right
-/// step through the other images in the active pane, in its listing order,
-/// moving its cursor along so Esc lands on the last one shown. The TUI stays in raw mode, so keys still arrive as crossterm
+/// Shows an image full-screen on the tty (see `tty_image`) until Esc, `q`,
+/// Ctrl+C or a termination signal, also across switches to other consoles
+/// and back. Left/Right step through the other images in the active pane,
+/// in its listing order, moving its cursor along so Esc lands on the last
+/// one shown. The TUI stays in raw mode, so keys still arrive as crossterm
 /// events; it only needs a full redraw once the console is back.
 #[cfg(target_os = "linux")]
 fn show_tty_image(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     path: &Path,
     app: &mut App,
+    should_exit: &AtomicBool,
 ) -> Result<()> {
     let shown = tty_image::decode(path).and_then(|picture| {
         let mut screen = tty_image::Screen::open()?;
-        screen.draw(&picture);
+        screen.draw(&picture)?;
         Ok(screen)
     });
     let mut screen = match shown {
@@ -331,55 +336,94 @@ fn show_tty_image(
             return Ok(());
         }
     };
-    loop {
+    // The next picture, decoded on another thread so console switches and
+    // Esc are still answered meanwhile: its index, the direction (to go on
+    // past a file that fails to decode) and where the result arrives.
+    let mut decoding: Option<Decoding> = None;
+    let closed: Result<()> = loop {
+        if should_exit.load(Ordering::Relaxed) {
+            break Ok(());
+        }
         // Console switches wait for us, so answer them before anything else.
         if let Err(err) = screen.follow_console_switches() {
-            app.set_error(format!("Image viewer closed: {err:#}"));
-            break;
+            break Err(err);
         }
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
+        if let Some((idx, forward, rx)) = &decoding {
+            let (idx, forward) = (*idx, *forward);
+            match rx.try_recv() {
+                Ok(Ok(picture)) => {
+                    decoding = None;
+                    if let Err(err) = screen.draw(&picture) {
+                        break Err(err);
+                    }
+                    app.active_pane().selected = idx;
+                }
+                Ok(Err(_)) => {
+                    let pane = app.active_pane();
+                    decoding = next_image(&pane.entries, idx, forward)
+                        .map(|next| decode_in_background(pane, next, forward));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => decoding = None,
+            }
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let timeout = if decoding.is_some() { 30 } else { 100 };
+        let key = match event::poll(Duration::from_millis(timeout))
+            .and_then(|ready| ready.then(event::read).transpose())
+        {
+            Ok(Some(Event::Key(key))) if key.kind == KeyEventKind::Press => key,
+            Ok(_) => continue,
+            Err(err) => break Err(err.into()),
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
         let forward = match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => break,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+            KeyCode::Esc | KeyCode::Char('q') => break Ok(()),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
             KeyCode::Right => true,
             KeyCode::Left => false,
             _ => continue,
         };
-        // Files that fail to decode are skipped over.
-        let pane = app.active_pane();
-        for idx in neighbor_images(&pane.entries, pane.selected, forward) {
-            if let Ok(picture) = tty_image::decode(&pane.cwd.join(&pane.entries[idx].name)) {
-                screen.draw(&picture);
-                pane.selected = idx;
-                break;
-            }
+        // One step at a time: presses during a decode are dropped, not
+        // queued up to fire one after another once it's done.
+        if decoding.is_none() {
+            let pane = app.active_pane();
+            decoding = next_image(&pane.entries, pane.selected, forward)
+                .map(|next| decode_in_background(pane, next, forward));
         }
-    }
+    };
+    // A decode still running finishes on its own; its result is dropped.
     drop(screen);
+    if let Err(err) = closed {
+        app.set_error(format!("Image viewer closed: {err:#}"));
+    }
     terminal.clear()?;
     Ok(())
 }
 
-/// Indices of the image files after (or before) `from` in `entries`,
-/// nearest first, without wrapping around.
 #[cfg(target_os = "linux")]
-fn neighbor_images(entries: &[pane::Entry], from: usize, forward: bool) -> Vec<usize> {
+type Decoding = (usize, bool, mpsc::Receiver<Result<image::RgbImage>>);
+
+#[cfg(target_os = "linux")]
+fn decode_in_background(pane: &pane::Pane, idx: usize, forward: bool) -> Decoding {
+    let path = pane.cwd.join(&pane.entries[idx].name);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(tty_image::decode(&path));
+    });
+    (idx, forward, rx)
+}
+
+/// The nearest image file after (or before) `from` in `entries`, without
+/// wrapping around.
+#[cfg(target_os = "linux")]
+fn next_image(entries: &[pane::Entry], from: usize, forward: bool) -> Option<usize> {
     let is_image = |&idx: &usize| {
         let entry: &pane::Entry = &entries[idx];
         !entry.is_dir && tty_image::is_image(&entry.name)
     };
     if forward {
-        (from + 1..entries.len()).filter(is_image).collect()
+        (from + 1..entries.len()).find(is_image)
     } else {
-        (0..from).rev().filter(is_image).collect()
+        (0..from).rev().find(is_image)
     }
 }
 
@@ -925,7 +969,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn neighbor_images_skip_dirs_and_other_files() {
+    fn next_image_skips_dirs_and_other_files() {
         let entry = |name: &str, is_dir: bool| pane::Entry {
             name: name.to_string(),
             is_dir,
@@ -941,10 +985,11 @@ mod tests {
             entry("c.PNG", false),
             entry("d.webp", false),
         ];
-        assert_eq!(neighbor_images(&entries, 1, true), [4, 5]);
-        assert_eq!(neighbor_images(&entries, 4, false), [1]);
-        assert!(neighbor_images(&entries, 5, true).is_empty());
-        assert!(neighbor_images(&entries, 1, false).is_empty());
+        assert_eq!(next_image(&entries, 1, true), Some(4));
+        assert_eq!(next_image(&entries, 4, true), Some(5));
+        assert_eq!(next_image(&entries, 4, false), Some(1));
+        assert_eq!(next_image(&entries, 5, true), None);
+        assert_eq!(next_image(&entries, 1, false), None);
     }
 
     fn args(list: &[&str]) -> Vec<String> {

@@ -1247,31 +1247,18 @@ impl App {
         }
     }
 
-    /// Enter: opens the selected directory; for a file with the executable
+    /// Enter: opens the selected directory; for a known media file (image,
+    /// PDF, audio, video, HTML), hands it to the desktop's default viewer
+    /// (`xdg-open`, `open` on macOS, or Explorer on Windows) — except an
+    /// image on a bare Linux console, which PC shows itself (`tty_image`),
+    /// as there's no desktop there; for any other file with the executable
     /// permission bit set, runs it exactly as if its name had been typed on
     /// the command line (`./name`, or just `name` on Windows, which has no
-    /// such convention); for a known media file (image, PDF, audio, video,
-    /// HTML), hands it to the desktop's default viewer (`xdg-open`, `open`
-    /// on macOS, or Explorer on Windows) — except an image on a bare Linux
-    /// console, which PC shows itself (`tty_image`), as there's no desktop
-    /// there. Anything else does nothing, same as before.
+    /// such convention). Media go first because some filesystems (vfat,
+    /// exFAT, NTFS mounts) mark every file executable. Anything else does
+    /// nothing, same as before.
     pub fn open_selected(&mut self) -> Result<()> {
         let pane = self.active_pane_ref();
-        if let Some(entry) = pane.selected_entry()
-            && entry.is_executable
-        {
-            let command = if cfg!(windows) {
-                format!("\"{}\"", entry.name)
-            } else {
-                format!("./{}", shell_words::quote(&entry.name))
-            };
-            self.external_request = Some(ExternalRequest::Shell {
-                command,
-                cwd: pane.cwd.clone(),
-            });
-            return Ok(());
-        }
-
         #[cfg(target_os = "linux")]
         if let Some(entry) = pane.selected_entry()
             && !entry.is_dir
@@ -1289,6 +1276,21 @@ impl App {
             && let Some(path) = pane.selected_path()
         {
             self.open_externally(&path);
+            return Ok(());
+        }
+
+        if let Some(entry) = pane.selected_entry()
+            && entry.is_executable
+        {
+            let command = if cfg!(windows) {
+                format!("\"{}\"", entry.name)
+            } else {
+                format!("./{}", shell_words::quote(&entry.name))
+            };
+            self.external_request = Some(ExternalRequest::Shell {
+                command,
+                cwd: pane.cwd.clone(),
+            });
             return Ok(());
         }
 
@@ -1758,10 +1760,15 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 ];
 
 fn is_media_file(name: &str) -> bool {
+    has_extension(name, MEDIA_EXTENSIONS)
+}
+
+/// Whether `name`'s extension, in any case, is one of `extensions`.
+pub(crate) fn has_extension(name: &str, extensions: &[&str]) -> bool {
     Path::new(name)
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| MEDIA_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .is_some_and(|ext| extensions.contains(&ext.to_lowercase().as_str()))
 }
 
 /// Recognizes `cd`, `cd <path>`, `cd ~`, and `cd ~/path` on the command
