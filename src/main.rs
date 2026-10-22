@@ -2,6 +2,7 @@ mod app;
 mod bulk_rename;
 mod fs_ops;
 mod job;
+mod linux_console;
 mod logging;
 mod menu;
 mod pane;
@@ -223,6 +224,7 @@ fn run(
     // live "Capture mouse" setting (toggled in the Settings dialog) can be
     // applied the moment it happens, not just at the next TUI suspend.
     let mut mouse_capture_applied = mouse_capture_enabled;
+    let console = linux_console::Console::detect();
 
     while !app.should_quit && !should_exit.load(Ordering::Relaxed) {
         if app.mouse_capture != mouse_capture_applied {
@@ -230,7 +232,12 @@ fn run(
             mouse_capture_applied = app.mouse_capture;
         }
 
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| {
+            ui::draw(frame, &mut app);
+            if let Some(console) = &console {
+                console.adapt(frame.buffer_mut());
+            }
+        })?;
 
         // Redraw more often while a Copy/Move is running, so its progress
         // bar moves smoothly.
