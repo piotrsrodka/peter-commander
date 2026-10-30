@@ -8,7 +8,7 @@ written in Rust with [Ratatui](https://ratatui.rs). Made for
 [Omarchy](https://omarchy.org) and follows its theme, and runs on any
 Linux, macOS, or Windows.
 
-![Peter Commander](https://raw.githubusercontent.com/piotrsrodka/peter-commander/master/docs/ethereal.png)
+![Peter Commander: quick view, copy, new directory, delete to trash](https://raw.githubusercontent.com/piotrsrodka/peter-commander/master/docs/demo.gif)
 
 Miss the blue? Switch on the classic Norton Commander colors in
 Options > Settings:
