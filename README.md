@@ -2,16 +2,36 @@
 
 [![Rust](https://github.com/piotrsrodka/peter-commander/actions/workflows/rust.yml/badge.svg)](https://github.com/piotrsrodka/peter-commander/actions/workflows/rust.yml)
 
-A dual-pane, keyboard-driven terminal file manager in the tradition of
-Norton Commander. Built for Omarchy in Rust with Ratatui https://ratatui.rs.
-Should work on any Linux, macOS, or Windows.
+**Norton Commander, reborn for the modern terminal.** Two panes, F-keys,
+a command line at the bottom: the file manager you remember from DOS,
+written in Rust with [Ratatui](https://ratatui.rs). Made for
+[Omarchy](https://omarchy.org) and follows its theme, and runs on any
+Linux, macOS, or Windows.
 
 ![Peter Commander](https://raw.githubusercontent.com/piotrsrodka/peter-commander/master/docs/ethereal.png)
 
-Also comes with an optional classic retro Norton Commander color scheme
-(Options > Settings):
+Miss the blue? Switch on the classic Norton Commander colors in
+Options > Settings:
 
 ![Peter Commander in classic Norton Commander colors](https://raw.githubusercontent.com/piotrsrodka/peter-commander/master/docs/nc.jpeg)
+
+```sh
+cargo install peter-commander
+```
+
+## Why Peter Commander?
+
+- **The NC muscle memory, unchanged.** F3 view, F4 edit, F5 copy, F6 move,
+  F7 mkdir, F8 delete, Tab to switch panes, Ctrl+O for command output.
+- **Matches your desktop.** Picks up the current Omarchy theme, so it
+  looks like the rest of your system instead of a 1990s time capsule
+  (unless you want the time capsule).
+- **Safe by default.** Delete goes to the desktop trash; Shift+F8 when you
+  really mean it. Bulk renames warn before anything is overwritten.
+- **Works without a desktop.** On a bare Linux text console it still
+  draws proper frames and colors, and shows images full-screen by itself.
+- **One small binary.** No Python, no plugins to set up. `cargo install`,
+  `makepkg` on Arch, or a single `.exe` on Windows.
 
 ## Features
 
