@@ -152,7 +152,6 @@ fn list_dir(path: &Path, hide_hidden: bool) -> std::io::Result<Vec<DirEntryPrevi
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn image_extensions() {
         assert!(is_image("a.JPG"));
@@ -161,6 +160,7 @@ mod tests {
         assert!(!is_image("jpg"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn named_pipe_is_not_read_for_preview() {
         let base = std::env::temp_dir().join("pc_test_preview_fifo");

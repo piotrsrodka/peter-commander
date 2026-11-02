@@ -221,7 +221,8 @@ mod tests {
 
     #[test]
     fn single_item_shows_the_full_target_and_a_batch_only_the_directory() {
-        assert_eq!(single(Path::new("/d"), "a.txt").field.text(), "/d/a.txt");
+        let target = Path::new("/d").join("a.txt").display().to_string();
+        assert_eq!(single(Path::new("/d"), "a.txt").field.text(), target);
         let batch = Transfer::new(
             DialogKind::Copy,
             vec![

@@ -2796,6 +2796,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use std::path::Path;
 
+        // In the platform's own spelling, as the dialog shows it.
+        let target = Path::new("/dest").join("a.txt").display().to_string();
         for classic_style in [false, true] {
             let mut app = App::new().unwrap();
             app.classic_style = classic_style;
@@ -2808,7 +2810,12 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             let text = buffer_text(terminal.backend().buffer());
-            for expected in ["Copy \"a.txt\" to", "/dest/a.txt", "[ Copy ]", "[ Cancel ]"] {
+            for expected in [
+                "Copy \"a.txt\" to",
+                target.as_str(),
+                "[ Copy ]",
+                "[ Cancel ]",
+            ] {
                 assert!(text.contains(expected), "missing {expected:?}:\n{text}");
             }
 
@@ -2821,7 +2828,7 @@ mod tests {
             }
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             let text = buffer_text(terminal.backend().buffer());
-            for expected in ["already exists", "/dest/a.txt", "[ Overwrite ]"] {
+            for expected in ["already exists", target.as_str(), "[ Overwrite ]"] {
                 assert!(text.contains(expected), "missing {expected:?}:\n{text}");
             }
         }
