@@ -2021,6 +2021,11 @@ fn draw_pane(
     // even while the other pane has focus; the `is_active` check above is
     // what actually hides the highlight when inactive.
     list_state.select(Some(pane.selected));
+    // `List` only scrolls to keep the selection in view, so a listing that
+    // got shorter (a deleted file) or a taller window would leave blank rows
+    // under the last entry while others sit scrolled off the top.
+    let max_offset = list.len().saturating_sub(list_area.height as usize);
+    *list_state.offset_mut() = list_state.offset().min(max_offset);
 
     frame.render_stateful_widget(list, list_area, list_state);
 
@@ -2571,6 +2576,45 @@ mod tests {
         let chars = char_vec(&"\u{65e5}".repeat(30));
         let (start, end) = visible_chars(&chars, 15, 20);
         assert!((end - start) * 2 <= 18, "{start}..{end}");
+    }
+
+    #[test]
+    fn shrinking_a_scrolled_listing_leaves_no_hole_at_the_bottom() {
+        use crate::app::App;
+        use crate::pane::Pane;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::fs;
+
+        let dir = std::env::temp_dir().join("pc_test_list_hole");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..50 {
+            fs::write(dir.join(format!("f{index:02}")), "x").unwrap();
+        }
+        let mut app = App::new().unwrap();
+        app.left = Pane::new(dir.clone(), false).unwrap();
+        app.left.selected = app.left.entries.len() - 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let scrolled = app.left_list_state.offset();
+        assert!(scrolled > 0);
+
+        // Deleting the last file: one row less to scroll past.
+        fs::remove_file(dir.join("f49")).unwrap();
+        app.left.reload().unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.left_list_state.offset(), scrolled - 1);
+        assert_eq!(app.left.selected, app.left.entries.len() - 1);
+
+        // A listing that fits again shows from the top.
+        for index in 5..49 {
+            fs::remove_file(dir.join(format!("f{index:02}"))).unwrap();
+        }
+        app.left.reload().unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.left_list_state.offset(), 0);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
