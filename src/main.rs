@@ -8,6 +8,7 @@ mod menu;
 mod pane;
 mod preview;
 mod state;
+mod transfer;
 #[cfg(target_os = "linux")]
 mod tty_image;
 mod ui;
@@ -796,6 +797,28 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             KeyCode::Right => app.settings_select_right(),
             KeyCode::Enter => app.settings_save(),
             KeyCode::Esc | KeyCode::F(9) => app.settings_cancel(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if app.dialog_is_transfer() {
+        // AltGr letters arrive as Ctrl+Alt on Windows, so only one of the
+        // two marks a shortcut rather than text.
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let alt = modifiers.contains(KeyModifiers::ALT);
+        match code {
+            KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Enter => app.transfer_activate_button()?,
+            KeyCode::Up => app.transfer_focus_field(),
+            KeyCode::Down => app.transfer_focus_buttons(),
+            KeyCode::Left => app.transfer_left(),
+            KeyCode::Right => app.transfer_right(),
+            KeyCode::Home => app.transfer_home(),
+            KeyCode::End => app.transfer_end(),
+            KeyCode::Backspace => app.transfer_backspace(),
+            KeyCode::Delete => app.transfer_delete(),
+            KeyCode::Char(c) if ctrl == alt => app.transfer_insert(c),
             _ => {}
         }
         return Ok(());

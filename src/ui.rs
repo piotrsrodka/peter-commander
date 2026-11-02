@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -15,6 +17,7 @@ use crate::logging;
 use crate::menu::{Action, FN_KEYS, MENU_BAR};
 use crate::pane::{Pane, SortKey};
 use crate::preview::{self, PreviewContent};
+use crate::transfer::{TextField, Transfer};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = Layout::default()
@@ -117,40 +120,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match &app.dialog {
         Dialog::Confirm { kind, items } => {
-            let destination = matches!(kind, DialogKind::Copy | DialogKind::Move)
-                .then(|| app.inactive_pane_ref().cwd.display().to_string());
-            let summary = match items.as_slice() {
-                [(name, _)] => format!("\"{name}\""),
-                _ => format!("{} items", items.len()),
-            };
             draw_confirm_dialog(
                 frame,
                 app.classic_style,
                 *kind,
-                &summary,
-                destination.as_deref(),
+                &item_summary(items),
                 app.dialog_cancel_focused,
             );
         }
-        Dialog::ConfirmOverwrite {
-            items, conflicts, ..
-        } => {
-            let dest_dir = &app.inactive_pane_ref().cwd;
-            let comparison = match conflicts.as_slice() {
-                [name] => items
-                    .iter()
-                    .find(|(item, _)| item == name)
-                    .and_then(|(_, src)| {
-                        entry_summary(src).zip(entry_summary(&dest_dir.join(name)))
-                    }),
-                _ => None,
-            };
-            draw_overwrite_dialog(
+        Dialog::Transfer(transfer) => {
+            draw_transfer_dialog(
                 frame,
                 app.classic_style,
-                conflicts,
-                &dest_dir.display().to_string(),
-                comparison,
+                transfer,
                 app.dialog_cancel_focused,
             );
         }
@@ -287,6 +269,10 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
             "Shift+F8  Delete        Delete permanently",
             "F9        Menu          Open the pulldown menu",
             "F10       Quit          Quit Peter Commander",
+            "",
+            "In the F5/F6 window the target path is editable: just type.",
+            "Up enters it (Left/Right move the cursor), Down goes back to",
+            "the buttons. A new name copies beside a same-named file.",
         ],
     ),
     (
@@ -672,39 +658,33 @@ fn draw_dialog_box(
     }
 }
 
-/// Copy/Move/Delete confirmation — Copy and Move also show the destination
-/// (the other pane's directory, not editable) as a highlighted line.
+fn item_summary(items: &[(String, PathBuf)]) -> String {
+    match items {
+        [(name, _)] => format!("\"{name}\""),
+        _ => format!("{} items", items.len()),
+    }
+}
+
+/// Delete/Trash confirmation.
 fn draw_confirm_dialog(
     frame: &mut Frame,
     classic_style: bool,
     kind: DialogKind,
     summary: &str,
-    destination: Option<&str>,
     cancel_focused: bool,
 ) {
     let pal = dialog_palette(classic_style);
     let verb = kind.verb();
 
-    let message = match (kind, destination) {
-        (DialogKind::Trash | DialogKind::TrashByCopy, _) => format!("Move {summary} to trash?"),
-        (DialogKind::Delete, _) => format!("Permanently delete {summary}?"),
-        (_, Some(_)) => format!("{verb} {summary} to"),
-        (_, None) => format!("{verb} {summary}?"),
+    let message = match kind {
+        DialogKind::Trash | DialogKind::TrashByCopy => format!("Move {summary} to trash?"),
+        DialogKind::Delete => format!("Permanently delete {summary}?"),
+        _ => format!("{verb} {summary}?"),
     };
     let mut sections = vec![vec![DialogLine::Text(Line::from(Span::styled(
         message,
         Style::default().fg(pal.fg),
     )))]];
-
-    if let Some(dest) = destination {
-        sections.push(vec![DialogLine::Field {
-            content: vec![Span::styled(
-                dest.to_string(),
-                Style::default().bg(pal.field_bg).fg(pal.field_fg),
-            )],
-            fill_bg: pal.field_bg,
-        }]);
-    }
 
     let mut primary = verb;
     if kind == DialogKind::TrashByCopy {
@@ -732,6 +712,137 @@ fn draw_confirm_dialog(
         &pal,
     )]);
 
+    draw_dialog_frame(frame, classic_style, verb, sections, true);
+}
+
+/// How many cells of a dialog's width a `DialogLine::Field` can use, on a
+/// screen `screen_width` wide: what's left inside the outer margin, the border
+/// and the padding on each side.
+fn dialog_field_width(screen_width: u16) -> usize {
+    (screen_width as usize).saturating_sub(2 * OUTER_PAD_X as usize + 2 + 2 * DIALOG_PAD)
+}
+
+/// Which characters of a field fit in `max_cells` with the cursor (the cell
+/// at `cursor`, or one past the end) among them, as a `start..end` range.
+/// Text that doesn't fit gets `…` on each clipped side, so two cells are kept
+/// for those, and some of what follows the cursor stays visible.
+fn visible_chars(chars: &[char], cursor: usize, max_cells: usize) -> (usize, usize) {
+    let width = |c: char| Span::raw(c.to_string()).width();
+    let cursor_cells = chars.get(cursor).map_or(1, |&c| width(c).max(1));
+    let total: usize =
+        chars.iter().map(|&c| width(c)).sum::<usize>() + usize::from(cursor >= chars.len());
+    if total <= max_cells {
+        return (0, chars.len());
+    }
+    let budget = max_cells.saturating_sub(2).max(cursor_cells);
+    let mut used = cursor_cells;
+    let mut start = cursor;
+    let mut end = (cursor + 1).min(chars.len());
+    let right_context = used + budget / 4;
+    while end < chars.len() && used + width(chars[end]) <= right_context {
+        used += width(chars[end]);
+        end += 1;
+    }
+    while start > 0 && used + width(chars[start - 1]) <= budget {
+        start -= 1;
+        used += width(chars[start]);
+    }
+    while end < chars.len() && used + width(chars[end]) <= budget {
+        used += width(chars[end]);
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The Copy/Move target as a highlighted field. With the focus on it the
+/// cursor is a solid block; otherwise, since typing still goes there, it's
+/// the same blinking `_` as the other input dialogs.
+fn transfer_field_line(
+    field: &TextField,
+    editing: bool,
+    screen_width: u16,
+    pal: &DialogPalette,
+) -> DialogLine<'static> {
+    let style = Style::default().bg(pal.field_bg).fg(pal.field_fg);
+    let chars: Vec<char> = field.text().chars().collect();
+    let cursor = field.cursor();
+    let (start, end) = visible_chars(&chars, cursor, dialog_field_width(screen_width));
+    let slice = |from: usize, to: usize| chars[from..to].iter().collect::<String>();
+
+    let mut content = Vec::new();
+    if start > 0 {
+        content.push(Span::styled("…", style));
+    }
+    content.push(Span::styled(slice(start, cursor), style));
+    content.push(match (chars.get(cursor), editing) {
+        (Some(c), true) => Span::styled(c.to_string(), style.add_modifier(Modifier::REVERSED)),
+        (None, true) => Span::styled(" ", style.add_modifier(Modifier::REVERSED)),
+        (Some(c), false) => Span::styled(c.to_string(), style.add_modifier(Modifier::UNDERLINED)),
+        (None, false) => Span::styled("_", style.add_modifier(Modifier::SLOW_BLINK)),
+    });
+    if end > cursor + 1 {
+        content.push(Span::styled(slice(cursor + 1, end), style));
+    }
+    if end < chars.len() {
+        content.push(Span::styled("…", style));
+    }
+    DialogLine::Field {
+        content,
+        fill_bg: pal.field_bg,
+    }
+}
+
+/// Copy/Move: the question, the editable target, and the buttons — or the
+/// overwrite prompt when that target has items in the way.
+fn draw_transfer_dialog(
+    frame: &mut Frame,
+    classic_style: bool,
+    transfer: &Transfer,
+    cancel_focused: bool,
+) {
+    let pal = dialog_palette(classic_style);
+    let field = transfer_field_line(&transfer.field, transfer.editing, frame.area().width, &pal);
+    // Left/Right move the cursor while the field has the focus, so no button
+    // may look selectable then.
+    let primary_focused = !transfer.editing && !cancel_focused;
+    let cancel_focused = !transfer.editing && cancel_focused;
+    if let Some(overwrite) = &transfer.overwrite {
+        let comparison = match overwrite.conflicts.as_slice() {
+            [name] => overwrite
+                .items
+                .iter()
+                .find(|(item, _)| item == name)
+                .and_then(|(_, src)| {
+                    entry_summary(src).zip(entry_summary(&overwrite.dest_dir.join(name)))
+                }),
+            _ => None,
+        };
+        draw_overwrite_dialog(
+            frame,
+            classic_style,
+            &overwrite.conflicts,
+            field,
+            comparison,
+            button_row(
+                &[("Overwrite", primary_focused), ("Cancel", cancel_focused)],
+                &pal,
+            ),
+        );
+        return;
+    }
+    let verb = transfer.kind.verb();
+    let message = format!("{verb} {} to", item_summary(&transfer.items));
+    let sections = vec![
+        vec![DialogLine::Text(Line::from(Span::styled(
+            message,
+            Style::default().fg(pal.fg),
+        )))],
+        vec![field],
+        vec![button_row(
+            &[(verb, primary_focused), ("Cancel", cancel_focused)],
+            &pal,
+        )],
+    ];
     draw_dialog_frame(frame, classic_style, verb, sections, true);
 }
 
@@ -763,33 +874,28 @@ const OVERWRITE_LIST_LIMIT: usize = 3;
 
 /// Copy/Move onto items that already exist: names what's in the way and,
 /// for a single item, puts both versions' size and date side by side with
-/// the newer one marked, so it's clear what would be replaced.
+/// the newer one marked, so it's clear what would be replaced. The target
+/// stays editable, for going elsewhere instead.
 fn draw_overwrite_dialog(
     frame: &mut Frame,
     classic_style: bool,
     conflicts: &[String],
-    destination: &str,
+    field: DialogLine<'static>,
     comparison: Option<(EntrySummary, EntrySummary)>,
-    cancel_focused: bool,
+    buttons: DialogLine<'static>,
 ) {
     let pal = dialog_palette(classic_style);
     let text =
         |s: String| DialogLine::Text(Line::from(Span::styled(s, Style::default().fg(pal.fg))));
 
     let message = match conflicts {
-        [name] => format!("\"{name}\" already exists in"),
-        _ => format!("{} items already exist in", conflicts.len()),
+        [name] => format!("\"{name}\" already exists: overwrite, or edit the path"),
+        _ => format!(
+            "{} items already exist: overwrite, or edit the path",
+            conflicts.len()
+        ),
     };
-    let mut sections = vec![
-        vec![text(message)],
-        vec![DialogLine::Field {
-            content: vec![Span::styled(
-                destination.to_string(),
-                Style::default().bg(pal.field_bg).fg(pal.field_fg),
-            )],
-            fill_bg: pal.field_bg,
-        }],
-    ];
+    let mut sections = vec![vec![text(message)], vec![field]];
 
     let details = match comparison {
         Some((new, existing)) => {
@@ -824,10 +930,7 @@ fn draw_overwrite_dialog(
     };
     sections.push(details);
 
-    sections.push(vec![button_row(
-        &[("Overwrite", !cancel_focused), ("Cancel", cancel_focused)],
-        &pal,
-    )]);
+    sections.push(vec![buttons]);
 
     draw_dialog_frame(frame, classic_style, "Overwrite", sections, true);
 }
@@ -2439,6 +2542,108 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn char_vec(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn field_that_fits_shows_everything() {
+        let chars = char_vec("/home/a.txt");
+        assert_eq!(visible_chars(&chars, 3, 40), (0, chars.len()));
+    }
+
+    #[test]
+    fn long_field_always_keeps_the_cursor_in_view() {
+        let chars = char_vec(&"abcdefghij".repeat(10));
+        for cursor in 0..=chars.len() {
+            let (start, end) = visible_chars(&chars, cursor, 20);
+            assert!(start <= cursor && cursor <= end, "{cursor}: {start}..{end}");
+            assert!(end - start <= 18, "{cursor}: {start}..{end}");
+        }
+        assert_eq!(visible_chars(&chars, chars.len(), 20).1, chars.len());
+        assert_eq!(visible_chars(&chars, 0, 20).0, 0);
+    }
+
+    #[test]
+    fn wide_characters_count_as_two_cells() {
+        let chars = char_vec(&"\u{65e5}".repeat(30));
+        let (start, end) = visible_chars(&chars, 15, 20);
+        assert!((end - start) * 2 <= 18, "{start}..{end}");
+    }
+
+    #[test]
+    fn no_button_is_highlighted_while_editing_the_target() {
+        use crate::app::App;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new().unwrap();
+        app.classic_style = false;
+        let items = vec![("a.txt".to_string(), PathBuf::from("/src/a.txt"))];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        for editing in [false, true] {
+            let mut transfer =
+                Transfer::new(DialogKind::Copy, items.clone(), PathBuf::from("/dest"));
+            transfer.editing = editing;
+            app.dialog = Dialog::Transfer(transfer);
+            app.dialog_cancel_focused = false;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+            let buf = terminal.backend().buffer();
+            let area = buf.area;
+            // Only the button's own cells: the panes behind the dialog have
+            // bold entries of their own on the same row.
+            let has_bold_button = (area.top()..area.bottom()).any(|y| {
+                let cells: Vec<_> = (area.left()..area.right()).map(|x| &buf[(x, y)]).collect();
+                cells.windows(8).any(|button| {
+                    let label: String = button.iter().map(|cell| cell.symbol()).collect();
+                    label == "[ Copy ]" && button[0].modifier.contains(Modifier::BOLD)
+                })
+            });
+            assert_eq!(has_bold_button, !editing);
+        }
+    }
+
+    #[test]
+    fn transfer_dialog_draws_target_and_overwrite_prompt_in_both_styles() {
+        use crate::app::App;
+        use crate::transfer::Overwrite;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::path::Path;
+
+        for classic_style in [false, true] {
+            let mut app = App::new().unwrap();
+            app.classic_style = classic_style;
+            let items = vec![("a.txt".to_string(), PathBuf::from("/src/a.txt"))];
+            let mut transfer =
+                Transfer::new(DialogKind::Copy, items.clone(), PathBuf::from("/dest"));
+            transfer.editing = true;
+            app.dialog = Dialog::Transfer(transfer);
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            for expected in ["Copy \"a.txt\" to", "/dest/a.txt", "[ Copy ]", "[ Cancel ]"] {
+                assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+            }
+
+            if let Dialog::Transfer(transfer) = &mut app.dialog {
+                transfer.overwrite = Some(Overwrite {
+                    items,
+                    dest_dir: Path::new("/dest").to_path_buf(),
+                    conflicts: vec!["a.txt".to_string()],
+                });
+            }
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            for expected in ["already exists", "/dest/a.txt", "[ Overwrite ]"] {
+                assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+            }
+        }
     }
 
     #[test]

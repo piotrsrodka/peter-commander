@@ -15,6 +15,7 @@ use crate::menu::{Action, MENU_BAR};
 use crate::pane::{Pane, SortKey};
 use crate::preview;
 use crate::state;
+use crate::transfer::{self, Overwrite, Transfer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -90,15 +91,10 @@ pub enum Dialog {
         /// every marked item when the active pane has tags.
         items: Vec<(String, PathBuf)>,
     },
-    /// Shown after a Copy/Move confirm when some items already exist in the
-    /// destination, so nothing is replaced without being asked. Carries the
-    /// whole batch so Overwrite can run it unchanged.
-    ConfirmOverwrite {
-        kind: DialogKind,
-        items: Vec<(String, PathBuf)>,
-        /// Names from `items` whose destination already exists.
-        conflicts: Vec<String>,
-    },
+    /// Copy/Move, with an editable target. Turns into the overwrite prompt
+    /// when that target has items in the way, so nothing is replaced without
+    /// being asked.
+    Transfer(Transfer),
     TextInput {
         kind: TextInputKind,
         input: String,
@@ -1381,7 +1377,8 @@ impl App {
         } else {
             items
         };
-        self.dialog = Dialog::Confirm { kind, items };
+        let dest_dir = self.inactive_pane_ref().cwd.clone();
+        self.dialog = Dialog::Transfer(Transfer::new(kind, items, dest_dir));
         self.dialog_cancel_focused = !kind.default_yes();
     }
 
@@ -1446,28 +1443,9 @@ impl App {
             Dialog::Confirm { kind, items } => {
                 let kind = *kind;
                 let items = items.clone();
-                if matches!(kind, DialogKind::Copy | DialogKind::Move) {
-                    let dest_dir = self.inactive_pane_ref().cwd.clone();
-                    let conflicts = existing_destinations(&items, &dest_dir);
-                    if !conflicts.is_empty() {
-                        self.dialog = Dialog::ConfirmOverwrite {
-                            kind,
-                            items,
-                            conflicts,
-                        };
-                        // Replacing files is destructive, so like Delete
-                        // this defaults to "no".
-                        self.dialog_cancel_focused = true;
-                        return Ok(());
-                    }
-                }
-                self.run_file_operation(kind, items)?;
+                self.run_delete(kind, items)?;
             }
-            Dialog::ConfirmOverwrite { kind, items, .. } => {
-                let kind = *kind;
-                let items = items.clone();
-                self.run_file_operation(kind, items)?;
-            }
+            Dialog::Transfer(_) => self.confirm_transfer(),
             Dialog::Rename { input, src } => {
                 let new_name = input.clone();
                 let src = src.clone();
@@ -1564,42 +1542,88 @@ impl App {
         Ok(())
     }
 
-    /// Runs a confirmed Copy/Move/Delete/Trash; shared by the plain confirm
-    /// and the overwrite prompt. Copy/Move start a background job with its
-    /// progress window on top; Delete/Trash run right here.
-    fn run_file_operation(
-        &mut self,
-        kind: DialogKind,
-        items: Vec<(String, PathBuf)>,
-    ) -> Result<()> {
-        let src_dir = self.active_pane_ref().cwd.clone();
-        let wants_job = matches!(
-            kind,
-            DialogKind::Copy | DialogKind::Move | DialogKind::TrashByCopy
-        );
-        self.dialog = Dialog::None;
-        if wants_job && self.job.is_some() {
-            self.set_error("Another operation is still running (Ctrl+B shows it)".to_string());
-            return Ok(());
+    /// Enter on Copy/Move or Overwrite. Anything wrong with the target keeps
+    /// the dialog open under the error box, so the path can be corrected
+    /// without starting over.
+    fn confirm_transfer(&mut self) {
+        let base = self.active_pane_ref().cwd.clone();
+        let Dialog::Transfer(transfer) = &mut self.dialog else {
+            return;
+        };
+        let kind = transfer.kind;
+        if let Some(overwrite) = transfer.overwrite.take() {
+            self.start_job(kind, overwrite.items, overwrite.dest_dir);
+            return;
         }
+        let (items, dest_dir) = match transfer.resolve(&base) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
+        if items
+            .iter()
+            .any(|(name, src)| fs_ops::is_same_path(src, &dest_dir.join(name)))
+        {
+            // Copying within one directory only needs a new name, so go
+            // straight to the field for it.
+            transfer.editing = true;
+            self.set_error(
+                "Source and destination are the same: change the name or path".to_string(),
+            );
+            return;
+        }
+        let conflicts = existing_destinations(&items, &dest_dir);
+        if conflicts.is_empty() {
+            self.start_job(kind, items, dest_dir);
+            return;
+        }
+        transfer.overwrite = Some(Overwrite {
+            items,
+            dest_dir,
+            conflicts,
+        });
+        // Replacing files is destructive, so like Delete this defaults to
+        // "no", on the buttons where that can be seen.
+        transfer.editing = false;
+        self.dialog_cancel_focused = true;
+    }
+
+    /// Copy/Move (and a Trash that has to copy) run on a worker thread with a
+    /// progress window on top.
+    fn start_job(&mut self, kind: DialogKind, items: Vec<(String, PathBuf)>, dest_dir: PathBuf) {
+        self.dialog = Dialog::None;
+        if self.job.is_some() {
+            self.set_error("Another operation is still running (Ctrl+B shows it)".to_string());
+            return;
+        }
+        let src_dir = self.active_pane_ref().cwd.clone();
         // A job already holds its own list, so the marks can go now.
         self.active_pane().clear_marks();
+        self.job = Some(Job::start(kind, items, src_dir, dest_dir));
+        self.job_visible = true;
+        self.job_cancel_focused = false;
+    }
 
-        // Copy/Move (and a Trash that has to copy) run on a worker thread
-        // with a progress window on top.
-        if wants_job {
-            let dest_dir = if kind == DialogKind::TrashByCopy {
-                fs_ops::home_trash_dir().unwrap_or_else(|| src_dir.clone())
-            } else {
-                self.inactive_pane_ref().cwd.clone()
-            };
-            self.job = Some(Job::start(kind, items, src_dir, dest_dir));
-            self.job_visible = true;
-            self.job_cancel_focused = false;
+    /// Runs a confirmed Delete/Trash: right here, or as a job for a Trash
+    /// that has to copy.
+    fn run_delete(&mut self, kind: DialogKind, items: Vec<(String, PathBuf)>) -> Result<()> {
+        let src_dir = self.active_pane_ref().cwd.clone();
+        if kind == DialogKind::TrashByCopy {
+            let dest_dir = fs_ops::home_trash_dir().unwrap_or_else(|| src_dir.clone());
+            self.start_job(kind, items, dest_dir);
             return Ok(());
         }
+        self.dialog = Dialog::None;
+        self.active_pane().clear_marks();
 
-        let trashing = matches!(kind, DialogKind::Trash | DialogKind::TrashByCopy);
+        let trashing = match kind {
+            DialogKind::Trash | DialogKind::TrashByCopy => true,
+            DialogKind::Delete => false,
+            // Never reach the delete loop below: their sources must survive.
+            DialogKind::Copy | DialogKind::Move => return Ok(()),
+        };
         let mut done = 0usize;
         let mut errors: Vec<String> = Vec::new();
         for (name, src) in &items {
@@ -1656,6 +1680,107 @@ impl App {
             self.dialog,
             Dialog::TextInput { .. } | Dialog::Rename { .. }
         )
+    }
+
+    pub fn dialog_is_transfer(&self) -> bool {
+        matches!(self.dialog, Dialog::Transfer(_))
+    }
+
+    /// Enter acts on the highlighted button. From the field, where none is
+    /// highlighted, it goes ahead with the Copy/Move — except on an overwrite
+    /// prompt whose target wasn't changed: replacing files takes an explicit
+    /// Overwrite on the buttons.
+    pub fn transfer_activate_button(&mut self) -> Result<()> {
+        if let Dialog::Transfer(transfer) = &self.dialog
+            && transfer.editing
+        {
+            if transfer.overwrite.is_some() {
+                return Ok(());
+            }
+            return self.confirm_dialog();
+        }
+        if self.dialog_cancel_focused {
+            self.cancel_dialog();
+            return Ok(());
+        }
+        self.confirm_dialog()
+    }
+
+    /// The field takes over Left/Right. Which button was chosen is kept, so
+    /// Down comes back to it.
+    pub fn transfer_focus_field(&mut self) {
+        if let Dialog::Transfer(transfer) = &mut self.dialog {
+            transfer.editing = true;
+        }
+    }
+
+    pub fn transfer_focus_buttons(&mut self) {
+        if let Dialog::Transfer(transfer) = &mut self.dialog {
+            transfer.editing = false;
+        }
+    }
+
+    pub fn transfer_left(&mut self) {
+        match &mut self.dialog {
+            Dialog::Transfer(transfer) if transfer.editing => transfer.field.move_left(),
+            _ => self.toggle_dialog_focus(),
+        }
+    }
+
+    pub fn transfer_right(&mut self) {
+        match &mut self.dialog {
+            Dialog::Transfer(transfer) if transfer.editing => transfer.field.move_right(),
+            _ => self.toggle_dialog_focus(),
+        }
+    }
+
+    pub fn transfer_home(&mut self) {
+        self.transfer_focus_field();
+        if let Dialog::Transfer(transfer) = &mut self.dialog {
+            transfer.field.move_home();
+        }
+    }
+
+    pub fn transfer_end(&mut self) {
+        self.transfer_focus_field();
+        if let Dialog::Transfer(transfer) = &mut self.dialog {
+            transfer.field.move_end();
+        }
+    }
+
+    pub fn transfer_insert(&mut self, c: char) {
+        if let Dialog::Transfer(transfer) = &mut self.dialog {
+            transfer.field.insert(c);
+            self.after_transfer_edit();
+        }
+    }
+
+    pub fn transfer_backspace(&mut self) {
+        if let Dialog::Transfer(transfer) = &mut self.dialog
+            && transfer.field.backspace()
+        {
+            self.after_transfer_edit();
+        }
+    }
+
+    pub fn transfer_delete(&mut self) {
+        if let Dialog::Transfer(transfer) = &mut self.dialog
+            && transfer.field.delete()
+        {
+            self.after_transfer_edit();
+        }
+    }
+
+    /// A changed target is a new question: whatever the overwrite prompt was
+    /// asking about no longer applies, and Enter checks the new path. Cancel
+    /// goes with the prompt that picked it; a button the user chose stays.
+    fn after_transfer_edit(&mut self) {
+        if let Dialog::Transfer(transfer) = &mut self.dialog {
+            transfer.editing = true;
+            if transfer.overwrite.take().is_some() {
+                self.dialog_cancel_focused = false;
+            }
+        }
     }
 
     pub fn request_mkdir(&mut self) {
@@ -1782,13 +1907,10 @@ fn parse_cd_argument(command: &str) -> Option<PathBuf> {
         return None;
     }
     let arg = rest.trim();
-    if arg.is_empty() || arg == "~" {
+    if arg.is_empty() {
         return dirs::home_dir();
     }
-    if let Some(suffix) = arg.strip_prefix("~/") {
-        return Some(dirs::home_dir()?.join(suffix));
-    }
-    Some(PathBuf::from(arg))
+    transfer::expand_home(arg)
 }
 
 /// Names of the items whose Copy/Move target in `dest_dir` already exists.
@@ -1852,6 +1974,195 @@ mod tests {
         let items = vec![("a.txt".to_string(), dir.join("a.txt"))];
 
         assert!(existing_destinations(&items, &dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An app with the left pane active on `left` and the other on `right`.
+    fn app_with_panes(left: &Path, right: &Path) -> App {
+        let mut app = App::new().unwrap();
+        app.left = Pane::new(left.to_path_buf(), false).unwrap();
+        app.right = Pane::new(right.to_path_buf(), false).unwrap();
+        app.active = Side::Left;
+        app
+    }
+
+    fn select(app: &mut App, name: &str) {
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap();
+        app.left.selected = index;
+    }
+
+    fn wait_for_job(app: &mut App) {
+        while app.job.is_some() {
+            app.poll_job().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.transfer_insert(c);
+        }
+    }
+
+    fn overwrite_conflicts(app: &App) -> Option<Vec<String>> {
+        match &app.dialog {
+            Dialog::Transfer(transfer) => transfer.overwrite.as_ref().map(|o| o.conflicts.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn copy_within_one_directory_works_once_the_name_is_changed() {
+        let dir = std::env::temp_dir().join("pc_test_transfer_same_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let mut app = app_with_panes(&dir, &dir);
+        select(&mut app, "a.txt");
+
+        app.request_copy();
+        app.confirm_dialog().unwrap();
+        assert!(app.error_dialog.take().is_some());
+        assert!(app.dialog_is_transfer() && app.job.is_none());
+
+        // "a.txt" -> "a2.txt": into the name, before the extension.
+        for _ in 0..4 {
+            app.transfer_left();
+        }
+        type_text(&mut app, "2");
+        app.confirm_dialog().unwrap();
+        wait_for_job(&mut app);
+
+        assert_eq!(std::fs::read(dir.join("a2.txt")).unwrap(), b"x");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn overwrite_prompt_can_be_escaped_by_editing_the_name() {
+        let dir = std::env::temp_dir().join("pc_test_transfer_conflict");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("dest")).unwrap();
+        std::fs::write(dir.join("src/a"), "new").unwrap();
+        std::fs::write(dir.join("dest/a"), "old").unwrap();
+        let mut app = app_with_panes(&dir.join("src"), &dir.join("dest"));
+        select(&mut app, "a");
+
+        app.request_copy();
+        app.confirm_dialog().unwrap();
+        assert_eq!(overwrite_conflicts(&app), Some(vec!["a".to_string()]));
+        assert!(app.dialog_cancel_focused);
+
+        type_text(&mut app, "b");
+        assert_eq!(overwrite_conflicts(&app), None);
+        assert!(!app.dialog_cancel_focused);
+        app.confirm_dialog().unwrap();
+        wait_for_job(&mut app);
+
+        assert_eq!(std::fs::read(dir.join("dest/ab")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dir.join("dest/a")).unwrap(), b"old");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edited_name_that_collides_asks_and_overwrite_replaces_it() {
+        let dir = std::env::temp_dir().join("pc_test_transfer_new_conflict");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("dest")).unwrap();
+        std::fs::write(dir.join("src/a"), "new").unwrap();
+        std::fs::write(dir.join("dest/ab"), "old").unwrap();
+        let mut app = app_with_panes(&dir.join("src"), &dir.join("dest"));
+        select(&mut app, "a");
+
+        app.request_copy();
+        type_text(&mut app, "b");
+        app.confirm_dialog().unwrap();
+        assert_eq!(overwrite_conflicts(&app), Some(vec!["ab".to_string()]));
+        assert_eq!(std::fs::read(dir.join("dest/ab")).unwrap(), b"old");
+
+        app.confirm_dialog().unwrap();
+        wait_for_job(&mut app);
+        assert_eq!(std::fs::read(dir.join("dest/ab")).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enter_in_the_field_copies_but_never_overwrites_unasked() {
+        let dir = std::env::temp_dir().join("pc_test_transfer_enter");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("dest")).unwrap();
+        std::fs::write(dir.join("src/a"), "new").unwrap();
+        std::fs::write(dir.join("dest/a"), "old").unwrap();
+        std::fs::write(dir.join("dest/ab"), "old").unwrap();
+        let mut app = app_with_panes(&dir.join("src"), &dir.join("dest"));
+        select(&mut app, "a");
+
+        // Enter from the field on a target that's taken: asks, on the buttons.
+        app.request_copy();
+        app.transfer_focus_field();
+        app.transfer_activate_button().unwrap();
+        assert_eq!(overwrite_conflicts(&app), Some(vec!["a".to_string()]));
+        assert!(app.dialog_cancel_focused);
+
+        // Back in the field with the target unchanged: Enter does nothing.
+        app.transfer_focus_field();
+        app.transfer_activate_button().unwrap();
+        assert!(overwrite_conflicts(&app).is_some());
+        assert_eq!(std::fs::read(dir.join("dest/a")).unwrap(), b"old");
+
+        // Another taken name: asks again rather than replacing it.
+        type_text(&mut app, "b");
+        app.transfer_activate_button().unwrap();
+        assert_eq!(overwrite_conflicts(&app), Some(vec!["ab".to_string()]));
+        assert_eq!(std::fs::read(dir.join("dest/ab")).unwrap(), b"old");
+
+        // A free name: Enter copies straight from the field.
+        type_text(&mut app, "c");
+        app.transfer_activate_button().unwrap();
+        wait_for_job(&mut app);
+        assert_eq!(std::fs::read(dir.join("dest/abc")).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn down_returns_to_the_button_that_was_chosen() {
+        let dir = std::env::temp_dir().join("pc_test_transfer_focus");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        let mut app = app_with_panes(&dir, &dir);
+        select(&mut app, "a");
+
+        // Copy starts on Copy; choose Cancel, go up and back down.
+        app.request_copy();
+        assert!(!app.dialog_cancel_focused);
+        app.transfer_right();
+        assert!(app.dialog_cancel_focused);
+        app.transfer_focus_field();
+        app.transfer_left();
+        app.transfer_focus_buttons();
+        assert!(
+            app.dialog_cancel_focused,
+            "Left in the field moved the cursor"
+        );
+
+        // Typing in between doesn't change the choice either.
+        app.transfer_focus_field();
+        app.transfer_insert('b');
+        app.transfer_focus_buttons();
+        assert!(app.dialog_cancel_focused);
+
+        // And the buttons switch again once back on them.
+        app.transfer_left();
+        assert!(!app.dialog_cancel_focused);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
