@@ -12,12 +12,14 @@ use ratatui::widgets::{
 
 use crate::app::{App, Dialog, DialogKind, SettingItem, Side};
 use crate::bulk_rename::Plan;
+use crate::image_preview::{ImagePreview, ImageState};
 use crate::job::Job;
 use crate::logging;
 use crate::menu::{Action, FN_KEYS, MENU_BAR};
 use crate::pane::{Pane, SortKey};
 use crate::preview::{self, PreviewContent};
 use crate::transfer::{TextField, Transfer};
+use ratatui_image::Image;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = Layout::default()
@@ -50,6 +52,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.right_pane_area = panes[1];
 
     if app.quick_view {
+        // Graphics sit on top of the text grid and don't mix with anything
+        // drawn over them, so a picture steps aside for the duration.
+        let covered = app.menu_open
+            || app.help_open
+            || app.logs_open
+            || app.about_open
+            || app.job_visible
+            || app.error_dialog.is_some()
+            || !matches!(app.dialog, Dialog::None);
         match app.active {
             Side::Left => {
                 app.preview_visible_lines = panes[1].height.saturating_sub(2) as usize;
@@ -66,9 +77,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     frame,
                     panes[1],
                     &app.left,
-                    app.preview_focus,
-                    app.preview_scroll,
-                    app.classic_style,
+                    PreviewLook::of(app, covered),
+                    &mut app.image_preview,
                 );
             }
             Side::Right => {
@@ -78,9 +88,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     frame,
                     panes[0],
                     &app.right,
-                    app.preview_focus,
-                    app.preview_scroll,
-                    app.classic_style,
+                    PreviewLook::of(app, covered),
+                    &mut app.image_preview,
                 );
                 draw_pane(
                     frame,
@@ -2176,18 +2185,43 @@ fn column_header_line(pane: &Pane, name_width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// How the quick-view pane is to be drawn. `focused` is whether Tab has moved
+/// scroll focus onto it; `scroll` is how many lines of a text preview are
+/// skipped from the top; `covered` is whether something is open over it.
+#[derive(Clone, Copy)]
+struct PreviewLook {
+    focused: bool,
+    scroll: usize,
+    classic_style: bool,
+    covered: bool,
+}
+
+impl PreviewLook {
+    fn of(app: &App, covered: bool) -> Self {
+        PreviewLook {
+            focused: app.preview_focus,
+            scroll: app.preview_scroll,
+            classic_style: app.classic_style,
+            covered,
+        }
+    }
+}
+
 /// Quick-view: renders a live preview of `source`'s selected entry, in
-/// place of the opposite pane's own listing (Ctrl+Q). `focused` is whether
-/// Tab has moved scroll focus onto this pane; `scroll` is how many lines of
-/// a text preview are skipped from the top.
+/// place of the opposite pane's own listing (Ctrl+Q).
 fn draw_preview_pane(
     frame: &mut Frame,
     area: Rect,
     source: &Pane,
-    focused: bool,
-    scroll: usize,
-    classic_style: bool,
+    look: PreviewLook,
+    images: &mut ImagePreview,
 ) {
+    let PreviewLook {
+        focused,
+        scroll,
+        classic_style,
+        covered,
+    } = look;
     let title = match source.selected_entry() {
         Some(entry) if entry.name != ".." => {
             source.cwd.join(&entry.name).to_string_lossy().to_string()
@@ -2216,6 +2250,20 @@ fn draw_preview_pane(
         .border_style(border_style);
     if classic_style {
         block = block.style(Style::default().bg(classic::BG).fg(classic::FILE_FG));
+    }
+
+    if images.is_detected()
+        && let Some(entry) = source.selected_entry()
+        && !entry.is_dir
+        && preview::is_image(&entry.name)
+        && let Some(path) = source.preview_target()
+    {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if !covered {
+            draw_preview_image(frame, inner, images, &path);
+        }
+        return;
     }
 
     // For everything except Text, the scroll offset is applied by
@@ -2265,6 +2313,38 @@ fn draw_preview_pane(
         .wrap(Wrap { trim: false })
         .scroll((paragraph_scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// The picture centered in `area`, or a line saying why it isn't there.
+fn draw_preview_image(
+    frame: &mut Frame,
+    area: Rect,
+    images: &mut ImagePreview,
+    path: &std::path::Path,
+) {
+    let size = ratatui::layout::Size::new(area.width, area.height);
+    let note = |text: String, color: Color| {
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color))))
+            .wrap(Wrap { trim: false })
+    };
+    match images.state_for(path, size) {
+        ImageState::Ready(picture) => {
+            let drawn = picture.size();
+            let centered = Rect {
+                x: area.x + area.width.saturating_sub(drawn.width) / 2,
+                y: area.y + area.height.saturating_sub(drawn.height) / 2,
+                width: drawn.width.min(area.width),
+                height: drawn.height.min(area.height),
+            };
+            frame.render_widget(Image::new(picture), centered);
+        }
+        ImageState::Loading => {
+            frame.render_widget(note("Loading image...".to_string(), Color::DarkGray), area);
+        }
+        ImageState::Failed(err) => {
+            frame.render_widget(note(format!("Cannot preview: {err}"), Color::Red), area);
+        }
+    }
 }
 
 /// Command > Show Logs: reads the tail of the log file fresh each draw
@@ -2575,6 +2655,64 @@ mod tests {
         let chars = char_vec(&"\u{65e5}".repeat(30));
         let (start, end) = visible_chars(&chars, 15, 20);
         assert!((end - start) * 2 <= 18, "{start}..{end}");
+    }
+
+    #[test]
+    fn picture_shows_in_the_preview_pane_and_steps_aside_for_a_dialog() {
+        use crate::app::App;
+        use crate::pane::Pane;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui_image::picker::Picker;
+        use std::fs;
+
+        let dir = std::env::temp_dir().join("pc_test_preview_picture");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        image::RgbImage::from_pixel(300, 300, image::Rgb([200, 40, 40]))
+            .save(dir.join("a.png"))
+            .unwrap();
+
+        let mut app = App::new().unwrap();
+        app.left = Pane::new(dir.clone(), false).unwrap();
+        app.active = Side::Left;
+        app.left.selected = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "a.png")
+            .unwrap();
+        app.quick_view = true;
+        app.image_preview.set_picker(Picker::halfblocks());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("Loading image"));
+
+        let start = std::time::Instant::now();
+        loop {
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            if !buffer_text(terminal.backend().buffer()).contains("Loading image") {
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 10, "picture never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let has_picture = |buf: &Buffer| {
+            let area = buf.area;
+            (area.top()..area.bottom()).any(|y| {
+                (40..area.right()).any(|x| {
+                    buf[(x, y)].bg == Color::Rgb(200, 40, 40)
+                        || buf[(x, y)].fg == Color::Rgb(200, 40, 40)
+                })
+            })
+        };
+        assert!(has_picture(terminal.backend().buffer()));
+
+        app.about_open = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!has_picture(terminal.backend().buffer()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

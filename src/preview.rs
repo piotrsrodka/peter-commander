@@ -10,6 +10,14 @@ use crate::pane::Pane;
 /// memory; scrolling moves within this buffer rather than reading more.
 pub const PREVIEW_READ_LIMIT: usize = 1024 * 1024;
 
+/// Formats PC can decode itself (the `image` crate features enabled in
+/// Cargo.toml).
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+
+pub fn is_image(name: &str) -> bool {
+    crate::app::has_extension(name, IMAGE_EXTENSIONS)
+}
+
 /// A directory entry as shown in the quick-view listing: just enough to
 /// render a name and color it, no size/modified columns.
 pub struct DirEntryPreview {
@@ -145,6 +153,14 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[test]
+    fn image_extensions() {
+        assert!(is_image("a.JPG"));
+        assert!(is_image("b.webp"));
+        assert!(!is_image("c.svg"));
+        assert!(!is_image("jpg"));
+    }
+
     #[test]
     fn named_pipe_is_not_read_for_preview() {
         let base = std::env::temp_dir().join("pc_test_preview_fifo");

@@ -43,11 +43,11 @@ cargo install peter-commander
 - Quick search: jump to a file by typing part of its name (Command menu)
 - Rename selected files together in your `$EDITOR`, with a warning before anything is overwritten
 - Respects theme selection in Omarchy
-- Quick preview (F3) for text, directories, and binaries
+- Quick preview (F3) for text, directories, binaries and images (Sixel, Kitty or iTerm2 graphics, colored half blocks elsewhere)
 - Edit (F4) with your `$EDITOR`
 - Runs executable scripts and binaries directly
 - Opens images, PDFs, audio, video, and HTML in your system's default app
-- On a bare Linux console (tty), shows images full-screen itself (←/→ next image, Esc to return)
+- On a bare Linux console (tty), shows images full-screen itself, with F3 or Enter (←/→ next image, Esc to return)
 - Built-in command-line prompt, with `cd` support
 - Ctrl+O shows previous command output
 - Configurable settings: hidden files, F3 preview mode, trash

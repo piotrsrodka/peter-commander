@@ -9,6 +9,7 @@ use ratatui::widgets::ListState;
 
 use crate::bulk_rename::{self, Plan};
 use crate::fs_ops;
+use crate::image_preview::ImagePreview;
 use crate::job::Job;
 use crate::logging;
 use crate::menu::{Action, MENU_BAR};
@@ -292,6 +293,8 @@ pub struct App {
     /// (arrow keys, entering a directory, cd, ...) can reset the scroll
     /// position for the newly previewed entry.
     last_preview_target: Option<PathBuf>,
+    /// Pictures for the quick-view pane.
+    pub image_preview: ImagePreview,
     /// Whether F3 (View) shows the internal quick preview or shells out to
     /// $PAGER/less, per the "F3 View uses the internal quick preview"
     /// setting.
@@ -457,6 +460,7 @@ impl App {
             preview_focus: false,
             preview_scroll: 0,
             last_preview_target: None,
+            image_preview: ImagePreview::default(),
             internal_preview,
             mouse_capture,
             classic_style,
@@ -1258,17 +1262,10 @@ impl App {
     /// exFAT, NTFS mounts) mark every file executable. Anything else does
     /// nothing, same as before.
     pub fn open_selected(&mut self) -> Result<()> {
-        let pane = self.active_pane_ref();
-        #[cfg(target_os = "linux")]
-        if let Some(entry) = pane.selected_entry()
-            && !entry.is_dir
-            && crate::tty_image::is_image(&entry.name)
-            && crate::tty_image::on_console()
-            && let Some(path) = pane.selected_path()
-        {
-            self.external_request = Some(ExternalRequest::ShowImage(path));
+        if self.show_image_on_console() {
             return Ok(());
         }
+        let pane = self.active_pane_ref();
 
         if let Some(entry) = pane.selected_entry()
             && !entry.is_dir
@@ -1396,6 +1393,10 @@ impl App {
     /// which side currently has focus. Otherwise shells out to $PAGER/less
     /// as before.
     fn view_selected(&mut self) {
+        // The console can't show a picture inside a pane, only full-screen.
+        if !self.quick_view && self.show_image_on_console() {
+            return;
+        }
         if !self.internal_preview {
             self.request_external(ExternalRequest::View, "view");
             return;
@@ -1410,6 +1411,43 @@ impl App {
         }
         self.quick_view = true;
         self.preview_scroll = 0;
+    }
+
+    /// On a bare Linux console, queues the full-screen viewer for the selected
+    /// entry if it's an image. Returns whether it did.
+    fn show_image_on_console(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let pane = self.active_pane_ref();
+            if self.selected_is_image()
+                && crate::tty_image::on_console()
+                && let Some(path) = pane.selected_path()
+            {
+                self.external_request = Some(ExternalRequest::ShowImage(path));
+                return true;
+            }
+        }
+        false
+    }
+
+    fn selected_is_image(&self) -> bool {
+        self.active_pane_ref()
+            .selected_entry()
+            .is_some_and(|entry| !entry.is_dir && preview::is_image(&entry.name))
+    }
+
+    /// Whether the quick-view pane is about to show its first picture, so
+    /// the terminal has to be asked how to draw one. Never on a bare console,
+    /// whose pictures are full-screen.
+    pub fn image_preview_needs_detection(&self) -> bool {
+        if !self.quick_view || self.image_preview.is_detected() || !self.selected_is_image() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if crate::tty_image::on_console() {
+            return false;
+        }
+        true
     }
 
     fn request_external(&mut self, make: fn(PathBuf) -> ExternalRequest, verb: &str) {

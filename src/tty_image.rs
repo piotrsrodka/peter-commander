@@ -19,14 +19,6 @@ use anyhow::{Context, Result};
 use image::RgbImage;
 use signal_hook::SigId;
 
-/// Formats the viewer can decode (the `image` crate features enabled in
-/// Cargo.toml). Anything else still goes to `xdg-open`.
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
-
-pub fn is_image(name: &str) -> bool {
-    crate::app::has_extension(name, IMAGE_EXTENSIONS)
-}
-
 /// Whether PC is running straight on a kernel virtual console (`/dev/tty3`
 /// and so on) — the only place where it can take over the screen. A desktop
 /// terminal, ssh or tmux all show up as `/dev/pts/N` instead.
@@ -792,14 +784,6 @@ mod tests {
         assert!(!is_console_path(Path::new("/dev/tty")));
         assert!(!is_console_path(Path::new("/dev/ttyS0")));
         assert!(!is_console_path(Path::new("/dev/pts/2")));
-    }
-
-    #[test]
-    fn image_extensions() {
-        assert!(is_image("a.JPG"));
-        assert!(is_image("b.webp"));
-        assert!(!is_image("c.svg"));
-        assert!(!is_image("jpg"));
     }
 
     #[test]

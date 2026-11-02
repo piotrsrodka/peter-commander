@@ -1,6 +1,7 @@
 mod app;
 mod bulk_rename;
 mod fs_ops;
+mod image_preview;
 mod job;
 mod linux_console;
 mod logging;
@@ -233,6 +234,13 @@ fn run(
             mouse_capture_applied = app.mouse_capture;
         }
 
+        if app.image_preview_needs_detection() {
+            app.image_preview.detect();
+            // In case the terminal printed any of a query it doesn't know;
+            // a terminal this quiet isn't worth quitting over.
+            let _ = terminal.clear();
+        }
+
         terminal.draw(|frame| {
             ui::draw(frame, &mut app);
             if let Some(console) = &console {
@@ -241,8 +249,15 @@ fn run(
         })?;
 
         // Redraw more often while a Copy/Move is running, so its progress
-        // bar moves smoothly.
-        let poll_timeout = if app.job.is_some() { 100 } else { 200 };
+        // bar moves smoothly,
+        // and a picture being prepared shows up as soon as it's ready.
+        let poll_timeout = if app.image_preview.is_loading() {
+            30
+        } else if app.job.is_some() {
+            100
+        } else {
+            200
+        };
         if event::poll(Duration::from_millis(poll_timeout))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -426,7 +441,7 @@ fn decode_in_background(pane: &pane::Pane, idx: usize, forward: bool) -> Decodin
 fn next_image(entries: &[pane::Entry], from: usize, forward: bool) -> Option<usize> {
     let is_image = |&idx: &usize| {
         let entry: &pane::Entry = &entries[idx];
-        !entry.is_dir && tty_image::is_image(&entry.name)
+        !entry.is_dir && preview::is_image(&entry.name)
     };
     if forward {
         (from + 1..entries.len()).find(is_image)
