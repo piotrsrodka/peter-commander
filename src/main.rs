@@ -623,7 +623,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
         || app.help_open
         || app.logs_open
         || app.about_open
-        || app.dialog_is_text_input()
         || app.dialog_is_settings()
         || !matches!(app.dialog, Dialog::None)
     {
@@ -770,24 +769,6 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         return Ok(());
     }
 
-    if app.dialog_is_text_input() {
-        match code {
-            KeyCode::Enter => {
-                if app.dialog_cancel_focused {
-                    app.cancel_dialog();
-                } else {
-                    app.confirm_dialog()?;
-                }
-            }
-            KeyCode::Esc => app.cancel_dialog(),
-            KeyCode::Left | KeyCode::Right => app.toggle_dialog_focus(),
-            KeyCode::Backspace => app.text_input_backspace(),
-            KeyCode::Char(c) => app.text_input_push(c),
-            _ => {}
-        }
-        return Ok(());
-    }
-
     if app.dialog_is_settings() {
         match code {
             KeyCode::Up => app.settings_move_up(),
@@ -802,23 +783,23 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         return Ok(());
     }
 
-    if app.dialog_is_transfer() {
+    if app.dialog_has_field() {
         // AltGr letters arrive as Ctrl+Alt on Windows, so only one of the
         // two marks a shortcut rather than text.
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         let alt = modifiers.contains(KeyModifiers::ALT);
         match code {
             KeyCode::Esc => app.cancel_dialog(),
-            KeyCode::Enter => app.transfer_activate_button()?,
-            KeyCode::Up => app.transfer_focus_field(),
-            KeyCode::Down => app.transfer_focus_buttons(),
-            KeyCode::Left => app.transfer_left(),
-            KeyCode::Right => app.transfer_right(),
-            KeyCode::Home => app.transfer_home(),
-            KeyCode::End => app.transfer_end(),
-            KeyCode::Backspace => app.transfer_backspace(),
-            KeyCode::Delete => app.transfer_delete(),
-            KeyCode::Char(c) if ctrl == alt => app.transfer_insert(c),
+            KeyCode::Enter => app.activate_dialog_button()?,
+            KeyCode::Up => app.focus_dialog_field(),
+            KeyCode::Down => app.focus_dialog_buttons(),
+            KeyCode::Left => app.dialog_field_left(),
+            KeyCode::Right => app.dialog_field_right(),
+            KeyCode::Home => app.dialog_field_home(),
+            KeyCode::End => app.dialog_field_end(),
+            KeyCode::Backspace => app.dialog_field_backspace(),
+            KeyCode::Delete => app.dialog_field_delete(),
+            KeyCode::Char(c) if ctrl == alt => app.dialog_field_insert(c),
             _ => {}
         }
         return Ok(());

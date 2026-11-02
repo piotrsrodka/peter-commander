@@ -15,7 +15,7 @@ use crate::menu::{Action, MENU_BAR};
 use crate::pane::{Pane, SortKey};
 use crate::preview;
 use crate::state;
-use crate::transfer::{self, Overwrite, Transfer};
+use crate::transfer::{self, Overwrite, TextField, Transfer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -97,10 +97,14 @@ pub enum Dialog {
     Transfer(Transfer),
     TextInput {
         kind: TextInputKind,
-        input: String,
+        field: TextField,
+        /// The focus is on the field rather than the buttons; see
+        /// `Transfer::editing`.
+        editing: bool,
     },
     Rename {
-        input: String,
+        field: TextField,
+        editing: bool,
         src: PathBuf,
     },
     /// Rename Selected, after the editor closed with a valid edit: shows what
@@ -1347,7 +1351,11 @@ impl App {
         let Some(src) = pane.selected_path() else {
             return;
         };
-        self.dialog = Dialog::Rename { input: name, src };
+        self.dialog = Dialog::Rename {
+            field: TextField::new(name),
+            editing: true,
+            src,
+        };
         self.dialog_cancel_focused = false;
     }
 
@@ -1446,8 +1454,8 @@ impl App {
                 self.run_delete(kind, items)?;
             }
             Dialog::Transfer(_) => self.confirm_transfer(),
-            Dialog::Rename { input, src } => {
-                let new_name = input.clone();
+            Dialog::Rename { field, src, .. } => {
+                let new_name = field.text().to_string();
                 let src = src.clone();
                 if new_name.trim().is_empty() {
                     self.set_status("Name cannot be empty".to_string());
@@ -1473,22 +1481,22 @@ impl App {
                 self.left.reload()?;
                 self.right.reload()?;
             }
-            Dialog::TextInput { kind, input }
+            Dialog::TextInput { kind, field, .. }
                 if matches!(
                     kind,
                     TextInputKind::SelectFiles | TextInputKind::UnselectFiles
                 ) =>
             {
                 let select = *kind == TextInputKind::SelectFiles;
-                let patterns = input.clone();
+                let patterns = field.text().to_string();
                 let changed = self.active_pane().mark_matching(&patterns, select);
                 let verb = if select { "Selected" } else { "Unselected" };
                 self.set_status(format!("{verb} {changed} file(s) matching {patterns}"));
                 self.dialog = Dialog::None;
             }
-            Dialog::TextInput { kind, input } => {
+            Dialog::TextInput { kind, field, .. } => {
                 let kind = *kind;
-                let name = input.clone();
+                let name = field.text().to_string();
                 if name.trim().is_empty() {
                     self.set_status("Name cannot be empty".to_string());
                     self.dialog = Dialog::None;
@@ -1675,26 +1683,35 @@ impl App {
         self.dialog = Dialog::None;
     }
 
-    pub fn dialog_is_text_input(&self) -> bool {
+    /// The field of whichever dialog has one, and whether the focus is on it.
+    fn dialog_field(&mut self) -> Option<(&mut TextField, &mut bool)> {
+        match &mut self.dialog {
+            Dialog::Transfer(transfer) => Some((&mut transfer.field, &mut transfer.editing)),
+            Dialog::TextInput { field, editing, .. } | Dialog::Rename { field, editing, .. } => {
+                Some((field, editing))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn dialog_has_field(&self) -> bool {
         matches!(
             self.dialog,
-            Dialog::TextInput { .. } | Dialog::Rename { .. }
+            Dialog::Transfer(_) | Dialog::TextInput { .. } | Dialog::Rename { .. }
         )
     }
 
-    pub fn dialog_is_transfer(&self) -> bool {
-        matches!(self.dialog, Dialog::Transfer(_))
+    fn dialog_field_focused(&mut self) -> bool {
+        self.dialog_field().is_some_and(|(_, editing)| *editing)
     }
 
     /// Enter acts on the highlighted button. From the field, where none is
-    /// highlighted, it goes ahead with the Copy/Move — except on an overwrite
-    /// prompt whose target wasn't changed: replacing files takes an explicit
-    /// Overwrite on the buttons.
-    pub fn transfer_activate_button(&mut self) -> Result<()> {
-        if let Dialog::Transfer(transfer) = &self.dialog
-            && transfer.editing
-        {
-            if transfer.overwrite.is_some() {
+    /// highlighted, it goes ahead with the dialog's action — except on an
+    /// overwrite prompt whose target wasn't changed: replacing files takes an
+    /// explicit Overwrite on the buttons.
+    pub fn activate_dialog_button(&mut self) -> Result<()> {
+        if self.dialog_field_focused() {
+            if matches!(&self.dialog, Dialog::Transfer(t) if t.overwrite.is_some()) {
                 return Ok(());
             }
             return self.confirm_dialog();
@@ -1708,85 +1725,93 @@ impl App {
 
     /// The field takes over Left/Right. Which button was chosen is kept, so
     /// Down comes back to it.
-    pub fn transfer_focus_field(&mut self) {
-        if let Dialog::Transfer(transfer) = &mut self.dialog {
-            transfer.editing = true;
+    pub fn focus_dialog_field(&mut self) {
+        if let Some((_, editing)) = self.dialog_field() {
+            *editing = true;
         }
     }
 
-    pub fn transfer_focus_buttons(&mut self) {
-        if let Dialog::Transfer(transfer) = &mut self.dialog {
-            transfer.editing = false;
+    pub fn focus_dialog_buttons(&mut self) {
+        if let Some((_, editing)) = self.dialog_field() {
+            *editing = false;
         }
     }
 
-    pub fn transfer_left(&mut self) {
-        match &mut self.dialog {
-            Dialog::Transfer(transfer) if transfer.editing => transfer.field.move_left(),
-            _ => self.toggle_dialog_focus(),
-        }
-    }
-
-    pub fn transfer_right(&mut self) {
-        match &mut self.dialog {
-            Dialog::Transfer(transfer) if transfer.editing => transfer.field.move_right(),
-            _ => self.toggle_dialog_focus(),
-        }
-    }
-
-    pub fn transfer_home(&mut self) {
-        self.transfer_focus_field();
-        if let Dialog::Transfer(transfer) = &mut self.dialog {
-            transfer.field.move_home();
-        }
-    }
-
-    pub fn transfer_end(&mut self) {
-        self.transfer_focus_field();
-        if let Dialog::Transfer(transfer) = &mut self.dialog {
-            transfer.field.move_end();
-        }
-    }
-
-    pub fn transfer_insert(&mut self, c: char) {
-        if let Dialog::Transfer(transfer) = &mut self.dialog {
-            transfer.field.insert(c);
-            self.after_transfer_edit();
-        }
-    }
-
-    pub fn transfer_backspace(&mut self) {
-        if let Dialog::Transfer(transfer) = &mut self.dialog
-            && transfer.field.backspace()
-        {
-            self.after_transfer_edit();
-        }
-    }
-
-    pub fn transfer_delete(&mut self) {
-        if let Dialog::Transfer(transfer) = &mut self.dialog
-            && transfer.field.delete()
-        {
-            self.after_transfer_edit();
-        }
-    }
-
-    /// A changed target is a new question: whatever the overwrite prompt was
-    /// asking about no longer applies, and Enter checks the new path. Cancel
-    /// goes with the prompt that picked it; a button the user chose stays.
-    fn after_transfer_edit(&mut self) {
-        if let Dialog::Transfer(transfer) = &mut self.dialog {
-            transfer.editing = true;
-            if transfer.overwrite.take().is_some() {
-                self.dialog_cancel_focused = false;
+    pub fn dialog_field_left(&mut self) {
+        if self.dialog_field_focused() {
+            if let Some((field, _)) = self.dialog_field() {
+                field.move_left();
             }
+        } else {
+            self.toggle_dialog_focus();
+        }
+    }
+
+    pub fn dialog_field_right(&mut self) {
+        if self.dialog_field_focused() {
+            if let Some((field, _)) = self.dialog_field() {
+                field.move_right();
+            }
+        } else {
+            self.toggle_dialog_focus();
+        }
+    }
+
+    pub fn dialog_field_home(&mut self) {
+        if let Some((field, editing)) = self.dialog_field() {
+            *editing = true;
+            field.move_home();
+        }
+    }
+
+    pub fn dialog_field_end(&mut self) {
+        if let Some((field, editing)) = self.dialog_field() {
+            *editing = true;
+            field.move_end();
+        }
+    }
+
+    pub fn dialog_field_insert(&mut self, c: char) {
+        if let Some((field, _)) = self.dialog_field() {
+            field.insert(c);
+            self.after_field_edit();
+        }
+    }
+
+    pub fn dialog_field_backspace(&mut self) {
+        if let Some((field, _)) = self.dialog_field()
+            && field.backspace()
+        {
+            self.after_field_edit();
+        }
+    }
+
+    pub fn dialog_field_delete(&mut self) {
+        if let Some((field, _)) = self.dialog_field()
+            && field.delete()
+        {
+            self.after_field_edit();
+        }
+    }
+
+    /// A changed Copy/Move target is a new question: whatever the overwrite
+    /// prompt was asking about no longer applies, and Enter checks the new
+    /// path. Cancel goes with the prompt that picked it; a button the user
+    /// chose stays.
+    fn after_field_edit(&mut self) {
+        self.focus_dialog_field();
+        if let Dialog::Transfer(transfer) = &mut self.dialog
+            && transfer.overwrite.take().is_some()
+        {
+            self.dialog_cancel_focused = false;
         }
     }
 
     pub fn request_mkdir(&mut self) {
         self.dialog = Dialog::TextInput {
             kind: TextInputKind::MkDir,
-            input: String::new(),
+            field: TextField::new(String::new()),
+            editing: true,
         };
         self.dialog_cancel_focused = false;
     }
@@ -1796,7 +1821,8 @@ impl App {
     fn request_select_files(&mut self, kind: TextInputKind) {
         self.dialog = Dialog::TextInput {
             kind,
-            input: "*".to_string(),
+            field: TextField::new("*".to_string()),
+            editing: true,
         };
         self.dialog_cancel_focused = false;
     }
@@ -1804,7 +1830,8 @@ impl App {
     pub fn request_new_file(&mut self) {
         self.dialog = Dialog::TextInput {
             kind: TextInputKind::NewFile,
-            input: String::new(),
+            field: TextField::new(String::new()),
+            editing: true,
         };
         self.dialog_cancel_focused = false;
     }
@@ -1814,22 +1841,6 @@ impl App {
     /// plain flip rather than tracking an index.
     pub fn toggle_dialog_focus(&mut self) {
         self.dialog_cancel_focused = !self.dialog_cancel_focused;
-    }
-
-    pub fn text_input_push(&mut self, c: char) {
-        match &mut self.dialog {
-            Dialog::TextInput { input, .. } | Dialog::Rename { input, .. } => input.push(c),
-            _ => {}
-        }
-    }
-
-    pub fn text_input_backspace(&mut self) {
-        match &mut self.dialog {
-            Dialog::TextInput { input, .. } | Dialog::Rename { input, .. } => {
-                input.pop();
-            }
-            _ => {}
-        }
     }
 
     pub fn command_line_push(&mut self, c: char) {
@@ -2005,7 +2016,7 @@ mod tests {
 
     fn type_text(app: &mut App, text: &str) {
         for c in text.chars() {
-            app.transfer_insert(c);
+            app.dialog_field_insert(c);
         }
     }
 
@@ -2028,11 +2039,11 @@ mod tests {
         app.request_copy();
         app.confirm_dialog().unwrap();
         assert!(app.error_dialog.take().is_some());
-        assert!(app.dialog_is_transfer() && app.job.is_none());
+        assert!(app.dialog_has_field() && app.job.is_none());
 
         // "a.txt" -> "a2.txt": into the name, before the extension.
         for _ in 0..4 {
-            app.transfer_left();
+            app.dialog_field_left();
         }
         type_text(&mut app, "2");
         app.confirm_dialog().unwrap();
@@ -2107,26 +2118,26 @@ mod tests {
 
         // Enter from the field on a target that's taken: asks, on the buttons.
         app.request_copy();
-        app.transfer_focus_field();
-        app.transfer_activate_button().unwrap();
+        app.focus_dialog_field();
+        app.activate_dialog_button().unwrap();
         assert_eq!(overwrite_conflicts(&app), Some(vec!["a".to_string()]));
         assert!(app.dialog_cancel_focused);
 
         // Back in the field with the target unchanged: Enter does nothing.
-        app.transfer_focus_field();
-        app.transfer_activate_button().unwrap();
+        app.focus_dialog_field();
+        app.activate_dialog_button().unwrap();
         assert!(overwrite_conflicts(&app).is_some());
         assert_eq!(std::fs::read(dir.join("dest/a")).unwrap(), b"old");
 
         // Another taken name: asks again rather than replacing it.
         type_text(&mut app, "b");
-        app.transfer_activate_button().unwrap();
+        app.activate_dialog_button().unwrap();
         assert_eq!(overwrite_conflicts(&app), Some(vec!["ab".to_string()]));
         assert_eq!(std::fs::read(dir.join("dest/ab")).unwrap(), b"old");
 
         // A free name: Enter copies straight from the field.
         type_text(&mut app, "c");
-        app.transfer_activate_button().unwrap();
+        app.activate_dialog_button().unwrap();
         wait_for_job(&mut app);
         assert_eq!(std::fs::read(dir.join("dest/abc")).unwrap(), b"new");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2144,25 +2155,84 @@ mod tests {
         // Copy starts on Copy; choose Cancel, go up and back down.
         app.request_copy();
         assert!(!app.dialog_cancel_focused);
-        app.transfer_right();
+        app.dialog_field_right();
         assert!(app.dialog_cancel_focused);
-        app.transfer_focus_field();
-        app.transfer_left();
-        app.transfer_focus_buttons();
+        app.focus_dialog_field();
+        app.dialog_field_left();
+        app.focus_dialog_buttons();
         assert!(
             app.dialog_cancel_focused,
             "Left in the field moved the cursor"
         );
 
         // Typing in between doesn't change the choice either.
-        app.transfer_focus_field();
-        app.transfer_insert('b');
-        app.transfer_focus_buttons();
+        app.focus_dialog_field();
+        app.dialog_field_insert('b');
+        app.focus_dialog_buttons();
         assert!(app.dialog_cancel_focused);
 
         // And the buttons switch again once back on them.
-        app.transfer_left();
+        app.dialog_field_left();
         assert!(!app.dialog_cancel_focused);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rename_starts_in_the_field_and_edits_anywhere_in_the_name() {
+        let dir = std::env::temp_dir().join("pc_test_rename_cursor");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let mut app = app_with_panes(&dir, &dir);
+        select(&mut app, "a.txt");
+
+        app.request_rename();
+        for _ in 0..4 {
+            app.dialog_field_left();
+        }
+        assert!(!app.dialog_cancel_focused, "Left moved the cursor");
+        type_text(&mut app, "2");
+        app.activate_dialog_button().unwrap();
+
+        assert!(dir.join("a2.txt").exists() && !dir.join("a.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rename_buttons_are_reached_with_down() {
+        let dir = std::env::temp_dir().join("pc_test_rename_buttons");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        let mut app = app_with_panes(&dir, &dir);
+        select(&mut app, "a");
+
+        app.request_rename();
+        type_text(&mut app, "b");
+        app.focus_dialog_buttons();
+        app.dialog_field_right();
+        assert!(app.dialog_cancel_focused);
+        app.activate_dialog_button().unwrap();
+
+        assert!(!app.dialog_has_field());
+        assert!(dir.join("a").exists() && !dir.join("ab").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn new_directory_edits_mid_name_too() {
+        let dir = std::env::temp_dir().join("pc_test_mkdir_cursor");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app_with_panes(&dir, &dir);
+
+        app.request_mkdir();
+        type_text(&mut app, "ac");
+        app.dialog_field_left();
+        type_text(&mut app, "b");
+        app.activate_dialog_button().unwrap();
+
+        assert!(dir.join("abc").is_dir());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -136,17 +136,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.dialog_cancel_focused,
             );
         }
-        Dialog::TextInput { kind, input } => {
+        Dialog::TextInput {
+            kind,
+            field,
+            editing,
+        } => {
             draw_input_dialog(
                 frame,
                 app.classic_style,
                 kind.title(),
                 kind.prompt(),
-                input,
+                field,
+                *editing,
                 app.dialog_cancel_focused,
             );
         }
-        Dialog::Rename { input, src } => {
+        Dialog::Rename {
+            field,
+            editing,
+            src,
+        } => {
             let old_name = src
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -156,7 +165,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.classic_style,
                 "Rename",
                 &format!("Rename \"{old_name}\" to:"),
-                input,
+                field,
+                *editing,
                 app.dialog_cancel_focused,
             );
         }
@@ -270,9 +280,9 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
             "F9        Menu          Open the pulldown menu",
             "F10       Quit          Quit Peter Commander",
             "",
-            "In the F5/F6 window the target path is editable: just type.",
-            "Up enters it (Left/Right move the cursor), Down goes back to",
-            "the buttons. A new name copies beside a same-named file.",
+            "In windows with a name or path, typing edits it. Up enters the",
+            "field (Left/Right move the cursor), Down goes to the buttons.",
+            "F5/F6: a new name copies beside a same-named file.",
         ],
     ),
     (
@@ -754,10 +764,16 @@ fn visible_chars(chars: &[char], cursor: usize, max_cells: usize) -> (usize, usi
     (start, end)
 }
 
-/// The Copy/Move target as a highlighted field. With the focus on it the
-/// cursor is a solid block; otherwise, since typing still goes there, it's
-/// the same blinking `_` as the other input dialogs.
-fn transfer_field_line(
+/// Which of the two buttons to highlight. Left/Right move the cursor while the
+/// field has the focus, so none may look selectable then.
+fn focused_buttons(editing: bool, cancel_focused: bool) -> (bool, bool) {
+    (!editing && !cancel_focused, !editing && cancel_focused)
+}
+
+/// A dialog's text as a highlighted field. With the focus on it the cursor is
+/// a solid block; otherwise, since typing still goes there, a blinking `_` at
+/// the end, or an underlined character within the text.
+fn text_field_line(
     field: &TextField,
     editing: bool,
     screen_width: u16,
@@ -801,11 +817,8 @@ fn draw_transfer_dialog(
     cancel_focused: bool,
 ) {
     let pal = dialog_palette(classic_style);
-    let field = transfer_field_line(&transfer.field, transfer.editing, frame.area().width, &pal);
-    // Left/Right move the cursor while the field has the focus, so no button
-    // may look selectable then.
-    let primary_focused = !transfer.editing && !cancel_focused;
-    let cancel_focused = !transfer.editing && cancel_focused;
+    let field = text_field_line(&transfer.field, transfer.editing, frame.area().width, &pal);
+    let (primary_focused, cancel_focused) = focused_buttons(transfer.editing, cancel_focused);
     if let Some(overwrite) = &transfer.overwrite {
         let comparison = match overwrite.conflicts.as_slice() {
             [name] => overwrite
@@ -1162,41 +1175,27 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Rename and MkDir/New file: a label line, a highlighted editable-field
-/// line showing the text typed so far (with a blinking cursor), and a
-/// button row.
+/// Rename and MkDir/New file: a label line, the editable field and a button
+/// row.
 fn draw_input_dialog(
     frame: &mut Frame,
     classic_style: bool,
     title: &str,
     prompt: &str,
-    input: &str,
+    field: &TextField,
+    editing: bool,
     cancel_focused: bool,
 ) {
     let pal = dialog_palette(classic_style);
+    let (ok_focused, cancel_focused) = focused_buttons(editing, cancel_focused);
     let sections = vec![
         vec![DialogLine::Text(Line::from(Span::styled(
             prompt.to_string(),
             Style::default().fg(pal.fg),
         )))],
-        vec![DialogLine::Field {
-            content: vec![
-                Span::styled(
-                    input.to_string(),
-                    Style::default().bg(pal.field_bg).fg(pal.field_fg),
-                ),
-                Span::styled(
-                    "_",
-                    Style::default()
-                        .bg(pal.field_bg)
-                        .fg(pal.field_fg)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ),
-            ],
-            fill_bg: pal.field_bg,
-        }],
+        vec![text_field_line(field, editing, frame.area().width, &pal)],
         vec![button_row(
-            &[("OK", !cancel_focused), ("Cancel", cancel_focused)],
+            &[("OK", ok_focused), ("Cancel", cancel_focused)],
             &pal,
         )],
     ];
