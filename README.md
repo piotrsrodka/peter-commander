@@ -93,7 +93,12 @@ pce +12 src/main.rs                # starting at line 12
 pce                                # an untitled text; Save asks for a name
 git config --global core.editor pce
 export EDITOR=pce                  # crontab -e, and the rest
+pce .                              # a directory: Peter Commander itself, there
 ```
+
+Given a directory, as tools that run `$EDITOR .` do (expecting nvim's
+file browser), it starts the whole file manager with its left pane there,
+just like `peter-commander DIR`.
 
 Esc, F10 or Ctrl+Q close it, asking first about unsaved changes. It
 comes with `cargo install peter-commander` (a small launcher for the

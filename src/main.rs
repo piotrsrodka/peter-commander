@@ -147,6 +147,22 @@ fn parse_edit_args(args: Vec<String>) -> CliRequest {
     CliRequest::Edit { line, file }
 }
 
+/// What `pce` (or `--edit`) starts: on a directory — `$EDITOR .`, as
+/// tmux layouts and the like run it, expecting nvim's file browser — the
+/// file manager, its left pane there, just as `peter-commander DIR` (`+N`
+/// then means nothing); on anything else, the editor alone.
+fn start_for_edit(file: Option<&str>, line: Option<usize>) -> std::result::Result<Start, String> {
+    if let Some(arg) = file
+        && Path::new(arg).is_dir()
+    {
+        return Ok(Start::Panes(StartDirs {
+            left: Some(resolve_dir(arg)?),
+            right: None,
+        }));
+    }
+    Ok(Start::Editor(Box::new(editor_for(file, line)?)))
+}
+
 /// The editor `pce` starts with, or why it can't — said before the
 /// terminal switches to the UI, so it lands in the shell (or in git's
 /// output, as `core.editor`). A name that isn't there yet is a new file,
@@ -210,6 +226,7 @@ fn usage_text() -> String {
          {name} LEFT_DIR RIGHT_DIR   Open the left and right pane\n  \
          {name} --edit [+N] [FILE]   Just the editor, on FILE (at line N);\n  \
          pce [+N] [FILE]                      the same, also as $EDITOR\n  \
+         pce DIR                              The panes, the left one in DIR\n  \
          {name} -h, --help           Print this help\n  \
          {name} -V, -v, --version    Print the version (-version works too)\n\n\
          As usual, the left pane starts in the current directory, or\n\
@@ -227,8 +244,8 @@ fn usage_text() -> String {
 
 fn main() -> Result<()> {
     let start = match parse_cli(env::args()) {
-        CliRequest::Edit { line, file } => match editor_for(file.as_deref(), line) {
-            Ok(editor) => Start::Editor(Box::new(editor)),
+        CliRequest::Edit { line, file } => match start_for_edit(file.as_deref(), line) {
+            Ok(start) => start,
             Err(message) => {
                 eprintln!("pce: {message}");
                 std::process::exit(1);
@@ -2369,7 +2386,6 @@ mod tests {
         std::fs::write(dir.join("latin2.txt"), b"\xb1").unwrap();
         let refused = |name: &str| editor_for(Some(&dir.join(name).display().to_string()), None);
         let why = |name: &str| refused(name).err().unwrap();
-        assert!(why("").contains("directory"));
         assert!(why("bin.dat").contains("binary"));
         assert!(why("latin2.txt").contains("UTF-8"));
         assert!(refused("missing/new.txt").is_err(), "no such directory");
@@ -2505,6 +2521,49 @@ mod tests {
         assert!(!config.join("sort").exists());
         state::test_dir::set(None);
         std::fs::remove_dir_all(&config).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_on_a_directory_starts_the_file_manager_there() {
+        let dir = std::env::temp_dir().join(format!("pc_test_pce_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let start = |arg: &Path, line| start_for_edit(Some(&arg.display().to_string()), line);
+        let left_pane = |start| match start {
+            Ok(Start::Panes(dirs)) => dirs.left.expect("the left pane's directory"),
+            Ok(Start::Editor(_)) => panic!("the editor, not the panes"),
+            Err(message) => panic!("{message}"),
+        };
+        let real = dir.canonicalize().unwrap();
+        assert_eq!(left_pane(start(&dir, None)), real);
+        // `+N` means nothing for a directory.
+        assert_eq!(
+            left_pane(start(&dir.join("sub"), Some(3))),
+            real.join("sub")
+        );
+        // A link to a directory is one.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("sub"), dir.join("link")).unwrap();
+            assert_eq!(left_pane(start(&dir.join("link"), None)), real.join("sub"));
+        }
+        // `.`: where it's run.
+        assert_eq!(
+            left_pane(start_for_edit(Some("."), None)),
+            env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        // A file, or a name not there yet, is still the editor.
+        assert!(matches!(
+            start(&dir.join("a.txt"), None),
+            Ok(Start::Editor(_))
+        ));
+        match start(&dir.join("new.txt"), None) {
+            Ok(Start::Editor(editor)) => assert!(editor.new_file),
+            _ => panic!("a new file in the editor"),
+        }
+        assert!(matches!(start_for_edit(None, None), Ok(Start::Editor(_))));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
