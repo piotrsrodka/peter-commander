@@ -802,8 +802,8 @@ impl App {
         // behind the editor (see `menu::EDITOR_MENU_BAR`); this keeps any
         // other way to it shut as well. With the file list's keyboard
         // (Tab), the usual menus are back, all but Copy and Move, whose
-        // target — the other pane — is under the editor.
-        if self.ruled_out_beside_editor(action) {
+        // target — the other pane — is under the editor (or the quick view).
+        if self.ruled_out_by_covered_pane(action) {
             return false;
         }
         if self.editor_has_focus()
@@ -1506,11 +1506,12 @@ impl App {
         }
     }
 
-    /// What the file list can't do while the editor is open beside it:
-    /// Copy and Move, whose target — the other pane — is under the editor.
-    /// One rule for the menu, the F-key bar and the keys.
-    pub fn ruled_out_beside_editor(&self, action: Action) -> bool {
-        self.editor.is_some() && matches!(action, Action::Copy | Action::Move)
+    /// What the file list can't do while the editor or the F3 quick view
+    /// covers the other pane: Copy and Move, whose target is that pane's
+    /// directory, out of sight. One rule for the menu, the F-key bar and
+    /// the keys.
+    pub fn ruled_out_by_covered_pane(&self, action: Action) -> bool {
+        (self.editor.is_some() || self.quick_view) && matches!(action, Action::Copy | Action::Move)
     }
 
     /// Whether the editor is open and has the keyboard (rather than the
@@ -1671,14 +1672,19 @@ impl App {
             // other pane, wait for the editor to close.
             Action::View if self.editor.is_some() => self.quick_view_from_list(),
             Action::Edit if self.editor.is_some() => self.edit_from_list(),
-            Action::Copy | Action::Move if self.ruled_out_beside_editor(action) => {
+            Action::Copy | Action::Move if self.ruled_out_by_covered_pane(action) => {
                 let verb = if action == Action::Copy {
                     "Copy"
                 } else {
                     "Move"
                 };
+                let (what, close) = if self.editor.is_some() {
+                    ("the editor", "the editor")
+                } else {
+                    ("the quick view", "it")
+                };
                 self.set_notice(format!(
-                    "{verb} needs the other pane, which the editor has: close the editor first (Esc)"
+                    "{verb} needs the other pane, which {what} has: close {close} first (Esc)"
                 ));
             }
             Action::Rename => self.request_rename(),
@@ -3712,6 +3718,31 @@ mod tests {
             app.editor_key(KeyCode::Char(c), KeyModifiers::NONE)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn copy_and_move_wait_while_the_quick_view_covers_the_other_pane() {
+        let (mut app, dir) = app_with_files("quick_view_copy", &[("a.txt", b"hello\n")]);
+        assert!(app.action_enabled(Action::Copy));
+        app.run_action(Action::View).unwrap();
+        assert!(app.quick_view);
+        for action in [Action::Copy, Action::Move] {
+            assert!(!app.action_enabled(action), "{action:?} greyed out");
+            app.run_action(action).unwrap();
+            assert!(
+                matches!(app.dialog, Dialog::None),
+                "{action:?} asks nothing"
+            );
+            let note = app.error_dialog.take().unwrap();
+            assert!(note.contains("quick view"), "{note}");
+        }
+        // Other things on the list still work beside the quick view.
+        assert!(app.action_enabled(Action::MkDir));
+        // With the quick view closed, Copy is back.
+        app.run_action(Action::View).unwrap();
+        assert!(!app.quick_view);
+        assert!(app.action_enabled(Action::Copy));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

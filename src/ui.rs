@@ -3216,11 +3216,11 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
             app.editor_fn_key(fn_key)
         } else if fn_key
             .action
-            .is_some_and(|action| app.ruled_out_beside_editor(action))
+            .is_some_and(|action| app.ruled_out_by_covered_pane(action))
         {
-            // The file list's keyboard beside the editor: what it rules
-            // out there (Copy and Move, whose target is the other pane,
-            // under the editor) is dimmed as in the menu.
+            // The file list beside the editor or the quick view: what that
+            // rules out (Copy and Move, whose target is the other pane,
+            // covered) is dimmed as in the menu.
             (fn_key.label, false)
         } else if fn_key.action == Some(Action::View) && app.preview_next_mode() {
             // F3 is Find Next in a quick view being searched.
