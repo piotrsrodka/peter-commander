@@ -30,7 +30,10 @@ pub enum Action {
     /// The built-in editor's own: File > Save/Close and the Edit menu,
     /// shown only while it's open.
     Save,
+    SaveAs,
     Close,
+    /// Command > Open Editor: the built-in editor on no file yet.
+    OpenEditor,
     WrapLines,
     SelectAll,
     Find,
@@ -71,6 +74,8 @@ impl Action {
             Action::InvertSelection => "Invert Selection",
             Action::Quit => "Quit",
             Action::Save => "Save",
+            Action::SaveAs => "Save As...",
+            Action::OpenEditor => "Open Editor",
             Action::Close => "Close",
             Action::WrapLines => "Wrap Lines",
             Action::SelectAll => "Select All",
@@ -153,6 +158,7 @@ const FILE: MenuCategory = MenuCategory {
 const COMMAND: MenuCategory = MenuCategory {
     title: "Command",
     items: &[
+        Action::OpenEditor,
         Action::QuickSearch,
         Action::Separator,
         Action::SortByName,
@@ -184,7 +190,7 @@ pub const PREVIEW_MENU_BAR: &[MenuCategory] = &[FILE, PREVIEW_OPTIONS, COMMAND];
 pub const EDITOR_MENU_BAR: &[MenuCategory] = &[
     MenuCategory {
         title: "File",
-        items: &[Action::Save, Action::Rename, Action::Close],
+        items: &[Action::Save, Action::SaveAs, Action::Rename, Action::Close],
     },
     MenuCategory {
         title: "Edit",
@@ -292,6 +298,7 @@ mod tests {
             items,
             [
                 Action::Save,
+                Action::SaveAs,
                 Action::Rename,
                 Action::Close,
                 Action::WrapLines,

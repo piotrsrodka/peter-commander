@@ -662,8 +662,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
         return Ok(());
     }
 
-    if app.editor.is_some() && !app.menu_open {
-        return handle_editor_mouse(app, mouse);
+    if app.editor.is_some() && !app.menu_open && handle_editor_mouse(app, mouse)? {
+        return Ok(());
     }
 
     match mouse.kind {
@@ -711,11 +711,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     Ok(())
 }
 
-/// The mouse while editing: the wheel scrolls the editor, a click places its
-/// cursor (Shift+click or a drag selects), the menu bar opens the menu, and
-/// an F-key tile does what that key does in the editor (nothing, for the
-/// dimmed ones).
-fn handle_editor_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+/// The mouse while editing: the wheel over the editor scrolls it, a click in
+/// its text gives it the keyboard and places its cursor (Shift+click or a
+/// drag selects), a click in the file list beside it gives the keyboard to
+/// the list, the menu bar opens the menu, and with the editor's keyboard an
+/// F-key tile does what that key does there (nothing, for the dimmed ones).
+/// Returns `false` for what's handled as if no editor were open: the wheel
+/// over the list, and with the list's keyboard the F-key bar.
+fn handle_editor_mouse(app: &mut App, mouse: MouseEvent) -> Result<bool> {
     let pos = Position::new(mouse.column, mouse.row);
     let area = app.editor_text_area;
     // Where in the text a press or drag lands, held to the text area so a
@@ -727,10 +730,17 @@ fn handle_editor_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
         .row
         .clamp(area.y, area.bottom().saturating_sub(1).max(area.y));
     let (row, x) = ((row - area.y) as usize, (column - area.x) as usize);
+    let list_area = match app.active {
+        app::Side::Left => app.left_pane_area,
+        app::Side::Right => app.right_pane_area,
+    };
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            if app.debounced_scroll() || !app.editor_area.contains(pos) {
-                return Ok(());
+            if !app.editor_area.contains(pos) {
+                return Ok(false);
+            }
+            if app.debounced_scroll() {
+                return Ok(true);
             }
             const WHEEL_EDITOR_ROWS: isize = 3;
             let rows = if mouse.kind == MouseEventKind::ScrollUp {
@@ -743,6 +753,7 @@ fn handle_editor_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
             }
         }
         MouseEventKind::Down(MouseButton::Left) if area.contains(pos) => {
+            app.set_list_focus(false);
             let extend = mouse.modifiers.contains(KeyModifiers::SHIFT);
             if let Some(editor) = &mut app.editor
                 && editor.find.is_none()
@@ -751,23 +762,32 @@ fn handle_editor_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if app.list_focus {
+                return Ok(false);
+            }
             if let Some(editor) = &mut app.editor
                 && editor.find.is_none()
             {
                 editor.click(row, x, true);
             }
         }
+        MouseEventKind::Down(MouseButton::Left) if list_area.contains(pos) => {
+            app.set_list_focus(true);
+        }
         MouseEventKind::Down(MouseButton::Left) => {
-            if !click_menu_bar(app, pos)
-                && let Some(&(_, action)) =
-                    app.fn_key_tiles.iter().find(|(rect, _)| rect.contains(pos))
-            {
-                app.click_editor_fn_key(action)?;
+            if click_menu_bar(app, pos) {
+                return Ok(true);
+            }
+            let tile = app.fn_key_tiles.iter().find(|(rect, _)| rect.contains(pos));
+            match tile {
+                Some(_) if app.list_focus => return Ok(false),
+                Some(&(_, action)) => app.click_editor_fn_key(action)?,
+                None => {}
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A click on a menu bar title opens that menu, whether or not one is
@@ -845,7 +865,7 @@ fn handle_paste(app: &mut App, text: &str) {
     if !app.dialog_has_field() && !matches!(app.dialog, Dialog::None) {
         return;
     }
-    if app.editor.is_some() && !app.dialog_has_field() {
+    if app.editor_has_focus() && !app.dialog_has_field() {
         app.editor_paste(text);
         return;
     }
@@ -1003,9 +1023,15 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
     }
 
     // The editor has the keyboard while it's open — after any dialog or
-    // the menu on top of it, so those still work as usual.
-    if app.editor.is_some() {
+    // the menu on top of it, so those still work as usual — unless Tab gave
+    // it to the file list beside it: then everything below is as with no
+    // editor open, but Tab, which gives it back.
+    if app.editor_has_focus() {
         return app.editor_key(code, modifiers);
+    }
+    if app.editor.is_some() && code == KeyCode::Tab {
+        app.toggle_editor_focus();
+        return Ok(());
     }
 
     if app.quick_search.is_some() {
@@ -1064,7 +1090,6 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
                     app.preview_find_next(!modifiers.contains(KeyModifiers::SHIFT));
                     return Ok(());
                 }
-                KeyCode::Esc if app.clear_preview_match() => return Ok(()),
                 _ => {}
             }
         }
@@ -1104,7 +1129,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             app.active_pane().move_page_down(page);
         }
         KeyCode::Backspace => app.command_line_backspace(),
-        KeyCode::Esc => app.command_line_clear(),
+        KeyCode::Esc => app.escape(),
         // Classic Norton Commander: Enter runs whatever is typed on the
         // command line, or opens the selected entry if nothing was typed —
         // unless keyboard focus is on the quick-view preview, which has
@@ -1666,6 +1691,532 @@ mod tests {
         ctrl(&mut app, 'f');
         assert!(app.preview_find.is_none());
         assert!(app.quick_search.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An editor open on `a.txt` (changed, not saved) beside a list of
+    /// `a.txt`, `b.txt` and `sub/`, the list's cursor on `a.txt`.
+    fn editing_beside_a_list(name: &str) -> (App, PathBuf) {
+        let (mut app, dir) = app_on_a_file(name, "jeden\ndwa\n", true);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        app.left.reload().unwrap();
+        app.left.select_name("a.txt");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.editor.as_ref().unwrap().is_modified());
+        (app, dir)
+    }
+
+    /// Every kind of key, with the modifiers that make a difference.
+    fn all_keys() -> Vec<(KeyCode, KeyModifiers)> {
+        let none = KeyModifiers::NONE;
+        let shift = KeyModifiers::SHIFT;
+        let alt = KeyModifiers::ALT;
+        let ctrl = KeyModifiers::CONTROL;
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let mut keys = Vec::new();
+        for n in 1..=10 {
+            for m in [none, shift, alt] {
+                keys.push((KeyCode::F(n), m));
+            }
+        }
+        for c in ['a', 'Z', '1', ' ', '/', 'ą', 'ó', 'ł', 'Ż'] {
+            for m in [none, shift, alt, altgr] {
+                keys.push((KeyCode::Char(c), m));
+            }
+        }
+        for c in 'a'..='z' {
+            keys.push((KeyCode::Char(c), ctrl));
+        }
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Insert,
+            KeyCode::Delete,
+            KeyCode::Backspace,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+        ] {
+            for m in [none, shift, ctrl] {
+                keys.push((code, m));
+            }
+        }
+        for code in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Enter] {
+            keys.push((code, alt));
+        }
+        keys
+    }
+
+    /// Whatever a key opened, closed again — without answering anything.
+    fn settle(app: &mut App) {
+        app.cancel_dialog();
+        app.error_dialog = None;
+        app.close_menu();
+        app.help_open = false;
+        app.logs_open = false;
+        app.about_open = false;
+        app.end_quick_search();
+        app.external_request = None;
+    }
+
+    fn panes_snapshot(app: &App) -> String {
+        format!(
+            "{:?}",
+            [&app.left, &app.right].map(|pane| (
+                pane.cwd.clone(),
+                pane.selected,
+                {
+                    let mut marked: Vec<_> = pane.marked.iter().cloned().collect();
+                    marked.sort();
+                    marked
+                },
+                pane.sort_key,
+                pane.sort_reversed,
+                pane.hide_hidden,
+            ))
+        ) + &format!("{:?}{}", app.active, app.command_line)
+    }
+
+    /// `editing_beside_a_list`, with all a leaked key could show itself on:
+    /// something in the clipboard to paste, an indented line to unindent,
+    /// and a selection to copy, cut or type over.
+    fn matrix_fixture(name: &str) -> (App, PathBuf) {
+        let (mut app, dir) = editing_beside_a_list(name);
+        app.clipboard.copy("ZZZ".to_string());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Home);
+        typed(&mut app, "    ");
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT).unwrap();
+        assert!(app.editor.as_ref().unwrap().selection().is_some());
+        (app, dir)
+    }
+
+    /// What a key left open, by kind, before `settle` closes it.
+    fn opened(app: &App) -> String {
+        let dialog = match &app.dialog {
+            Dialog::None => "none".to_string(),
+            Dialog::UnsavedChanges { .. } => "unsaved".to_string(),
+            Dialog::Rename { src, .. } => format!("rename {}", src.display()),
+            Dialog::TextInput { kind, .. } => format!("text {kind:?}"),
+            Dialog::Settings { .. } => "settings".to_string(),
+            Dialog::ConfirmQuit => "quit".to_string(),
+            _ => "other dialog".to_string(),
+        };
+        format!(
+            "{dialog}; external {}; menu {}; help {}",
+            app.external_request.is_some(),
+            if !app.menu_open {
+                "closed"
+            } else if app
+                .menu_bar()
+                .iter()
+                .any(|category| category.title == "Edit")
+            {
+                "editor's"
+            } else {
+                "the panes'"
+            },
+            if app.help_open {
+                app.help_page.to_string()
+            } else {
+                "closed".to_string()
+            },
+        )
+    }
+
+    #[test]
+    fn with_the_list_focused_no_key_reaches_the_editor() {
+        for (code, modifiers) in all_keys() {
+            let (mut app, dir) = matrix_fixture("route_list");
+            press(&mut app, KeyCode::Tab);
+            assert!(app.list_focus);
+            let before = app.editor.as_ref().unwrap().snapshot();
+            let clipboard = app.clipboard.paste();
+            handle_key(&mut app, code, modifiers).unwrap();
+            settle(&mut app);
+            let editor = app.editor.as_ref().expect("the editor stays open");
+            assert_eq!(editor.snapshot(), before, "{code:?} {modifiers:?}");
+            assert_eq!(app.clipboard.paste(), clipboard, "{code:?} {modifiers:?}");
+            // Only Tab, and F4 on the edited file, give the keyboard back.
+            // (Esc, F3, F10 and Ctrl+Q ask about the editor's changes —
+            // answered with Cancel here — and the editor stays as it was.)
+            let back = code == KeyCode::Tab
+                || code == KeyCode::F(4) && !modifiers.contains(KeyModifiers::SHIFT);
+            assert_eq!(app.list_focus, !back, "{code:?} {modifiers:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        // A paste too.
+        let (mut app, dir) = matrix_fixture("route_list_paste");
+        press(&mut app, KeyCode::Tab);
+        let before = app.editor.as_ref().unwrap().snapshot();
+        handle_paste(&mut app, "ls -l");
+        assert_eq!(app.editor.as_ref().unwrap().snapshot(), before);
+        assert_eq!(app.command_line, "ls -l");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn with_the_editor_focused_no_key_reaches_the_list() {
+        let edited = |dir: &Path| format!("rename {}", dir.join("a.txt").display());
+        for (code, modifiers) in all_keys() {
+            let (mut app, dir) = matrix_fixture("route_editor");
+            let before = panes_snapshot(&app);
+            handle_key(&mut app, code, modifiers).unwrap();
+            // What the editor may open: its own prompt, the Rename of its
+            // file, Save As, its help page and its menu bar — never a pane
+            // dialog, nothing run, the panes' menus or help.
+            let what = opened(&app);
+            let (dialog, rest) = what.split_once(';').unwrap();
+            assert!(
+                ["none", "unsaved", "text SaveAs"].contains(&dialog) || dialog == edited(&dir),
+                "{code:?} {modifiers:?} opened {what}"
+            );
+            assert!(
+                rest.contains("external false"),
+                "{code:?} {modifiers:?}: {what}"
+            );
+            assert!(
+                !rest.contains("the panes'"),
+                "{code:?} {modifiers:?}: {what}"
+            );
+            assert!(
+                rest.ends_with("help closed")
+                    || rest.ends_with(&format!("help {}", app::EDITOR_HELP_PAGE)),
+                "{code:?} {modifiers:?}: {what}"
+            );
+            settle(&mut app);
+            assert_eq!(panes_snapshot(&app), before, "{code:?} {modifiers:?}");
+            assert!(app.quick_search.is_none() && !app.quick_view);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let (mut app, dir) = editing_beside_a_list("route_editor_paste");
+        let before = panes_snapshot(&app);
+        handle_paste(&mut app, "ls -l");
+        assert_eq!(panes_snapshot(&app), before);
+        assert_eq!(app.editor.as_ref().unwrap().lines()[0], "xls -ljeden");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_list_beside_the_editor_works_as_with_no_editor() {
+        let (mut app, dir) = editing_beside_a_list("list_keys");
+        press(&mut app, KeyCode::Tab);
+        // Moving and marking, the command line, Esc clearing it — and never
+        // closing the editor.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.left.entries[app.left.selected].name, "b.txt");
+        press(&mut app, KeyCode::Insert);
+        assert!(app.left.marked.contains("b.txt"));
+        typed(&mut app, "ls");
+        assert_eq!(app.command_line, "ls");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.command_line, "");
+        assert!(app.editor.is_some(), "the command line goes first");
+        // Then Esc closes the editor, as from the editor: asking first.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.dialog_is_unsaved_changes());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.editor.is_some());
+        // The usual menu bar and its items, F2 renaming the list's entry.
+        assert_eq!(app.menu_bar()[0].items, menu::MENU_BAR[0].items);
+        assert!(app.action_enabled(Action::MkDir) && app.action_enabled(Action::Delete));
+        // Copy and Move would go to the other pane, under the editor.
+        for (key, verb) in [(5, "Copy"), (6, "Move")] {
+            assert!(!app.action_enabled(if key == 5 { Action::Copy } else { Action::Move }));
+            press(&mut app, KeyCode::F(key));
+            assert!(matches!(app.dialog, Dialog::None));
+            assert!(app.error_dialog.take().unwrap().starts_with(verb));
+        }
+        press(&mut app, KeyCode::F(2));
+        match &app.dialog {
+            Dialog::Rename { src, .. } => assert_eq!(src, &dir.join("b.txt")),
+            _ => panic!("no Rename dialog"),
+        }
+        app.cancel_dialog();
+        // Ctrl+S is Settings here.
+        ctrl(&mut app, 's');
+        assert!(app.dialog_is_settings());
+        app.settings_cancel();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_on_the_list_closes_an_unchanged_editor_back_to_the_view_before() {
+        let (mut app, dir) = app_on_a_file("list_esc_closes", "x\n", false);
+        press(&mut app, KeyCode::F(3));
+        press(&mut app, KeyCode::F(4));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.editor.is_none());
+        assert!(app.quick_view, "back to the quick view F4 replaced");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn f3_beside_the_editor_closes_it_for_the_quick_view_asking_first() {
+        let (mut app, dir) = editing_beside_a_list("list_f3");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        // Unsaved changes: asked first; Cancel leaves everything as it was.
+        press(&mut app, KeyCode::F(3));
+        assert!(app.dialog_is_unsaved_changes());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.editor.is_some() && !app.quick_view && app.list_focus);
+        // Don't Save: the quick view of the file under the cursor.
+        press(&mut app, KeyCode::F(3));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.editor.is_none());
+        assert!(app.quick_view && !app.preview_focus);
+        assert_eq!(app.left.preview_target(), Some(dir.join("b.txt")));
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"jeden\ndwa\n");
+        // Unchanged, no question.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.quick_view, "Esc closes the quick view");
+        press(&mut app, KeyCode::F(4));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::F(3));
+        assert!(app.editor.is_none() && app.quick_view);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn f4_beside_the_editor_goes_back_to_it_or_opens_another_file() {
+        let (mut app, dir) = editing_beside_a_list("list_f4");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::F(4));
+        assert!(!app.list_focus, "on the edited file: back to it");
+        assert_eq!(app.editor.as_ref().unwrap().path, dir.join("a.txt"));
+
+        // Another file, with unsaved changes: asked first; Cancel keeps all.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::F(4));
+        assert!(app.dialog_is_unsaved_changes());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.editor.as_ref().unwrap().path, dir.join("a.txt"));
+        assert!(app.editor.as_ref().unwrap().is_modified());
+        // Don't Save: the other file, with the keyboard.
+        press(&mut app, KeyCode::F(4));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.path, dir.join("b.txt"));
+        assert!(!editor.is_modified() && !app.list_focus);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"jeden\ndwa\n");
+        // Unchanged, the next one opens straight away; a directory doesn't.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::F(4));
+        assert_eq!(app.editor.as_ref().unwrap().path, dir.join("a.txt"));
+        press(&mut app, KeyCode::Tab);
+        app.left.select_name("sub");
+        press(&mut app, KeyCode::F(4));
+        assert_eq!(app.editor.as_ref().unwrap().path, dir.join("a.txt"));
+        assert!(app.list_focus);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn quitting_from_the_list_still_asks_about_the_editors_changes() {
+        for (code, modifiers) in [
+            (KeyCode::F(10), KeyModifiers::NONE),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+        ] {
+            let (mut app, dir) = editing_beside_a_list("list_quit");
+            press(&mut app, KeyCode::Tab);
+            handle_key(&mut app, code, modifiers).unwrap();
+            assert!(matches!(
+                app.dialog,
+                Dialog::UnsavedChanges {
+                    quit_after: true,
+                    ..
+                }
+            ));
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    fn save_as_field(app: &App) -> String {
+        match &app.dialog {
+            Dialog::TextInput {
+                kind: app::TextInputKind::SaveAs,
+                field,
+                ..
+            } => field.text().to_string(),
+            _ => panic!("no Save As dialog"),
+        }
+    }
+
+    #[test]
+    fn renamed_from_the_list_the_edited_file_is_saved_where_the_user_says() {
+        let (mut app, dir) = editing_beside_a_list("list_rename_edited");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::F(2));
+        for _ in 0.."a.txt".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        typed(&mut app, "c.txt");
+        press(&mut app, KeyCode::Enter);
+        // The editor stays on its file's old name, and says so.
+        assert_eq!(app.editor.as_ref().unwrap().path, dir.join("a.txt"));
+        assert!(app.error_dialog.take().unwrap().contains("renamed to"));
+        // Ctrl+S asks where, suggesting the new name.
+        press(&mut app, KeyCode::Tab);
+        ctrl(&mut app, 's');
+        assert_eq!(save_as_field(&app), "c.txt");
+        // Taken (it's the renamed file): asked again before replacing it.
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.dialog, Dialog::ConfirmSaveAs { .. }));
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.path, dir.join("c.txt"));
+        assert!(!editor.is_modified());
+        assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"xjeden\ndwa\n");
+        assert!(!dir.join("a.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn deleted_from_the_list_the_edited_file_keeps_its_text_unsaved() {
+        let (mut app, dir) = editing_beside_a_list("list_delete_edited");
+        app.editor.as_mut().unwrap().mark_saved();
+        app.use_trash = false;
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::F(8));
+        app.confirm_dialog().unwrap();
+        assert!(!dir.join("a.txt").exists());
+        assert!(
+            app.error_dialog
+                .take()
+                .unwrap()
+                .contains("renamed or deleted")
+        );
+        assert!(app.editor.as_ref().unwrap().is_modified());
+        // The note isn't said again on every refresh.
+        app.refresh_from_disk();
+        assert!(app.error_dialog.is_none());
+        // Save: where? The old name; saving there brings the file back.
+        press(&mut app, KeyCode::Tab);
+        ctrl(&mut app, 's');
+        assert_eq!(save_as_field(&app), "a.txt");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"xjeden\ndwa\n");
+        assert!(!app.editor.as_ref().unwrap().is_modified());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_changed_by_another_program_is_noticed_once() {
+        let (mut app, dir) = editing_beside_a_list("outside_rename_edited");
+        std::fs::rename(dir.join("a.txt"), dir.join("z.txt")).unwrap();
+        // Missing once might be a program saving it anew: looked at again.
+        app.refresh_from_disk();
+        assert!(app.error_dialog.is_none());
+        std::fs::rename(dir.join("z.txt"), dir.join("a.txt")).unwrap();
+        app.refresh_from_disk();
+        assert!(app.error_dialog.is_none(), "back: nothing to say");
+        std::fs::rename(dir.join("a.txt"), dir.join("z.txt")).unwrap();
+        app.refresh_from_disk();
+        app.refresh_from_disk();
+        let note = app.error_dialog.take().unwrap();
+        assert!(note.contains("renamed or deleted"), "{note}");
+        assert!(app.editor.as_ref().unwrap().is_modified());
+        app.refresh_from_disk();
+        assert!(app.error_dialog.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_replaced_by_another_one_is_noticed_and_saved_through_save_as() {
+        let (mut app, dir) = editing_beside_a_list("outside_replace_edited");
+        // Another program writes a new file over it, the way many save.
+        std::fs::write(dir.join("new.tmp"), "theirs, longer\n").unwrap();
+        std::fs::rename(dir.join("new.tmp"), dir.join("a.txt")).unwrap();
+        app.refresh_from_disk();
+        let note = app.error_dialog.take().unwrap();
+        assert!(note.contains("replaced on disk"), "{note}");
+        // Then deleted too: the text has no copy anywhere — unsaved.
+        app.editor.as_mut().unwrap().mark_saved();
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        app.refresh_from_disk();
+        app.refresh_from_disk();
+        assert!(app.error_dialog.is_none(), "said once");
+        assert!(app.editor.as_ref().unwrap().is_modified());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_mouse_gives_the_keyboard_to_what_it_clicks() {
+        let (mut app, dir) = editing_beside_a_list("mouse_focus");
+        app.left_pane_area = ratatui::layout::Rect::new(0, 1, 40, 20);
+        app.editor_area = ratatui::layout::Rect::new(40, 1, 40, 20);
+        app.editor_text_area = ratatui::layout::Rect::new(41, 2, 38, 15);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        mouse(&mut app, down, 5, 5);
+        assert!(app.list_focus);
+        mouse(&mut app, down, 43, 2);
+        assert!(!app.list_focus);
+        assert_eq!(
+            app.editor.as_ref().unwrap().cursor(),
+            editor::Pos::new(0, 2)
+        );
+        // The wheel scrolls what's under it, the keyboard staying put.
+        mouse(&mut app, down, 5, 5);
+        let before = app.left.selected;
+        mouse(&mut app, MouseEventKind::ScrollDown, 50, 5);
+        assert!(app.list_focus);
+        assert_eq!(app.left.selected, before);
+        // (Past the wheel's debounce.)
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        mouse(&mut app, MouseEventKind::ScrollDown, 5, 5);
+        assert!(app.list_focus);
+        assert_eq!(app.left.selected, before + 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_mouse_under_the_lists_keyboard_leaves_the_editor_to_the_wheel() {
+        let text: String = (0..60).map(|n| format!("line {n}\n")).collect();
+        let (mut app, dir) = app_on_a_file("mouse_list_focus", &text, true);
+        app.left_pane_area = ratatui::layout::Rect::new(0, 1, 40, 20);
+        app.editor_area = ratatui::layout::Rect::new(40, 1, 40, 20);
+        app.editor_text_area = ratatui::layout::Rect::new(41, 2, 38, 15);
+        app.fn_key_tiles = vec![(
+            ratatui::layout::Rect::new(48, 23, 7, 1),
+            Some(Action::MkDir),
+        )];
+        app.editor.as_mut().unwrap().scroll_into_view(15, 38);
+        press(&mut app, KeyCode::Tab);
+        let cursor = app.editor.as_ref().unwrap().cursor();
+        // A drag doesn't reach into the editor.
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 45, 5);
+        assert_eq!(app.editor.as_ref().unwrap().cursor(), cursor);
+        assert!(app.list_focus);
+        // An F-key tile is the list's: F7 makes a directory there.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 50, 23);
+        assert!(matches!(app.dialog, Dialog::TextInput { .. }));
+        app.cancel_dialog();
+        // The wheel over the editor scrolls it, the keyboard staying put.
+        let before = app.editor.as_ref().unwrap().snapshot();
+        mouse(&mut app, MouseEventKind::ScrollDown, 50, 5);
+        assert_ne!(app.editor.as_ref().unwrap().snapshot(), before);
+        assert_eq!(app.editor.as_ref().unwrap().cursor(), cursor);
+        assert!(app.list_focus);
+        // A click into the text ends a quick search on the list, like Tab.
+        ctrl(&mut app, 'f');
+        assert!(app.quick_search.is_some());
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 43, 3);
+        assert!(!app.list_focus && app.quick_search.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

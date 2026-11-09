@@ -77,10 +77,12 @@ fn draw_full_screen_editor(frame: &mut Frame, app: &mut App) {
 /// `draw_editor` with what it needs from `app`, recording where it went for
 /// the mouse.
 fn draw_editor_in(frame: &mut Frame, area: Rect, app: &mut App) {
-    let show_cursor = !overlay_open(app);
+    let focused = !app.list_focus;
+    let show_cursor = focused && !overlay_open(app);
     let classic_style = app.classic_style;
     if let Some(editor) = app.editor.as_mut() {
-        app.editor_text_area = draw_editor(frame, area, editor, classic_style, show_cursor);
+        app.editor_text_area =
+            draw_editor(frame, area, editor, classic_style, focused, show_cursor);
         app.editor_area = area;
     }
 }
@@ -117,7 +119,7 @@ fn draw_panels(frame: &mut Frame, app: &mut App) {
 
     if app.editor.is_some() {
         // The editor takes the other pane, like the quick view; the listing
-        // beside it has no highlight, since the keyboard is in the editor.
+        // beside it has the highlight only while it has the keyboard (Tab).
         let (list_area, editor_area) = match app.active {
             Side::Left => (panes[0], panes[1]),
             Side::Right => (panes[1], panes[0]),
@@ -126,7 +128,7 @@ fn draw_panels(frame: &mut Frame, app: &mut App) {
             Side::Left => (&app.left, &mut app.left_list_state),
             Side::Right => (&app.right, &mut app.right_list_state),
         };
-        draw_pane(frame, list_area, pane, false, list_state, look);
+        draw_pane(frame, list_area, pane, app.list_focus, list_state, look);
         draw_editor_in(frame, editor_area, app);
     } else if app.quick_view {
         // Graphics sit on top of the text grid and don't mix with anything
@@ -271,6 +273,13 @@ fn draw_overlays(frame: &mut Frame, app: &mut App) {
                 .map_or_else(|| "the file".to_string(), Editor::file_name);
             draw_unsaved_dialog(frame, app.classic_style, &name, *focused);
         }
+        Dialog::ConfirmSaveAs { target } => {
+            let name = target.file_name().map_or_else(
+                || target.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            draw_save_over_dialog(frame, app.classic_style, &name, app.dialog_cancel_focused);
+        }
         Dialog::ConfirmQuit => {
             draw_quit_dialog(
                 frame,
@@ -413,23 +422,23 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
         "Built-in editor",
         &[
             "F4 opens the file in the other pane; F4 again: full screen.",
-            "Esc clears a selection, or else closes it; F10/Ctrl+Q quits.",
+            "Tab: keys to the list beside it (F4 edits, F3 views) and back.",
+            "Esc clears a selection, or else closes the editor (also there).",
             "Closing and quitting ask first about unsaved changes.",
-            "",
             "Ctrl+S        Save           Ctrl+Z/Y      Undo/redo",
-            "F2            Rename the file (keeps your unsaved changes)",
+            "F2            Rename the file  File menu    Save As...",
             "Ctrl+A        Select all     Ctrl+C/X/V    Copy/cut/paste",
             "Shift+arrows  Select         Ctrl+\u{2190}/\u{2192}      Move by word",
             "Home/End      Line start/end Ctrl+Home/End File start/end",
-            "Tab           4 spaces       Shift+Tab     Remove 4 spaces",
+            "Tab (full sc.) 4 spaces      Shift+Tab     Remove 4 spaces",
             "Ctrl+Bksp/Del Delete a word  F9, Alt+E     Menu, Edit menu",
             "Ctrl+F        Find           F3/Shift+F3   Next/previous",
             "In Find, typing searches as you go (case doesn't matter);",
             "Enter keeps the match selected, Esc clears it; F3 goes on.",
             "Wrap Lines (Edit or Options) wraps long lines, F3's as well.",
-            "Line endings are kept (a stray CR shows as \u{240d}). Settings:",
-            "External editor sends F4 to $EDITOR; Focus mode editor",
-            "hides the menu bar full screen until F9.",
+            "Command > Open Editor: a new, untitled text. Line endings",
+            "are kept (a stray CR shows as \u{240d}). Settings: External editor",
+            "sends F4 to $EDITOR; Focus mode hides the bar full screen.",
         ],
     ),
     (
@@ -437,8 +446,8 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
         &[
             "Type anywhere to fill the command line; Enter runs it in the",
             "active pane's directory, or opens the selection if it's empty.",
-            "Esc clears the command line. A paste never runs it: only its",
-            "first line goes in, for you to check and run with Enter.",
+            "Esc clears it, or closes F3's view. A paste never runs it:",
+            "only its first line goes in, to check and run with Enter.",
             "",
             "Command > Sort by Name/Type/Size/Date sorts the active pane;",
             "picking the same sort again reverses it. Each pane keeps its",
@@ -1110,6 +1119,22 @@ fn draw_quit_dialog(
         )],
     ];
     draw_dialog_frame(frame, classic_style, "Quit", sections, false);
+}
+
+/// Saving onto a file that's there already: replace it?
+fn draw_save_over_dialog(frame: &mut Frame, classic_style: bool, name: &str, cancel: bool) {
+    let pal = dialog_palette(classic_style);
+    let sections = vec![
+        vec![DialogLine::Text(Line::from(Span::styled(
+            format!("\"{name}\" already exists. Replace it?"),
+            Style::default().fg(pal.fg),
+        )))],
+        vec![button_row(
+            &[("Replace", !cancel), ("Cancel", cancel)],
+            &pal,
+        )],
+    ];
+    draw_dialog_frame(frame, classic_style, "Save As", sections, false);
 }
 
 /// Closing the editor (or quitting) with unsaved changes, as Notepad asks.
@@ -2638,24 +2663,37 @@ fn draw_editor(
     area: Rect,
     editor: &mut Editor,
     classic_style: bool,
+    focused: bool,
     show_cursor: bool,
 ) -> Rect {
-    let border_style = if classic_style {
-        Style::default()
+    // Without the keyboard (Tab gave it to the file list), framed like an
+    // inactive pane, the selection still there but dimmed.
+    let border_style = match (classic_style, focused) {
+        (true, true) => Style::default()
             .fg(classic::ACTIVE_BORDER_FG)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
+            .add_modifier(Modifier::BOLD),
+        (true, false) => Style::default()
+            .fg(classic::INACTIVE_BORDER_FG)
+            .add_modifier(Modifier::BOLD),
+        (false, true) => Style::default()
             .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::BOLD),
+        (false, false) => Style::default().fg(Color::DarkGray),
     };
-    let look = EditorLook::of(classic_style);
+    let mut look = EditorLook::of(classic_style);
+    if !focused {
+        look.selected = Style::default().fg(Color::White).bg(Color::DarkGray);
+    }
 
     let mut block = titled_with_label(
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style),
-        &editor.path.display().to_string(),
+        &if editor.untitled {
+            editor.file_name()
+        } else {
+            editor.path.display().to_string()
+        },
         // Marked as Notepad marks its title, on the border where the eye
         // goes first.
         if editor.is_modified() {
@@ -2726,7 +2764,12 @@ fn draw_editor(
     }
     if let Some(status_area) = status_area {
         frame.render_widget(
-            Paragraph::new(editor_status_text(editor, status_area.width as usize)).style(look.text),
+            Paragraph::new(editor_status_line(
+                editor,
+                status_area.width as usize,
+                focused,
+            ))
+            .style(look.text),
             status_area,
         );
     }
@@ -2931,11 +2974,32 @@ fn draw_find_bar(
     (x < area.width as usize).then(|| ratatui::layout::Position::new(area.x + x as u16, area.y))
 }
 
-/// "Ln 3, Col 14  Modified" on the left — plus a note like "Saved" —
+/// "Ln 3, Col 14, U+0105  Modified" on the left — plus a note like "Saved" —
 /// and the main keys on the right, as room allows.
+#[cfg(test)]
 fn editor_status_text(editor: &Editor, width: usize) -> String {
+    editor_status_line(editor, width, true)
+}
+
+/// The editor's status line; `focused`: whether it has the keyboard (the
+/// keys it offers are its own only then).
+fn editor_status_line(editor: &Editor, width: usize, focused: bool) -> String {
     let cursor = editor.cursor();
     let mut left = format!(" Ln {}, Col {}", cursor.line + 1, cursor.col + 1);
+    // The code of the character under the cursor, as Unicode writes it;
+    // at the end of a line, the line ending's (nothing after the last line
+    // of a file without one). Read from the cached layout, so a very long
+    // line isn't walked again.
+    let under: Vec<char> = match editor.line_layout(cursor.line).chars.get(cursor.col) {
+        Some(&c) => vec![c],
+        None => editor.line_ending(cursor.line).to_vec(),
+    };
+    if !under.is_empty() {
+        left.push(',');
+        for c in under {
+            left.push_str(&format!(" U+{:04X}", u32::from(c)));
+        }
+    }
     if editor.is_modified() {
         left.push_str("  Modified");
     }
@@ -2951,12 +3015,18 @@ fn editor_status_text(editor: &Editor, width: usize) -> String {
     // `App::run_editor_command`), so that's what the hint says.
     let selected = editor.selection().is_some();
     let hints: &[&str] = match (editor.full_screen, editor.find.is_some(), selected) {
+        // The file list has the keyboard: its keys are the F-key bar's.
+        _ if !focused => &[],
         (false, true, _) => &[
             "F3 Next  Shift+F3 Previous  Enter Select ",
             "F3 Next  Enter Select ",
             "F3 Next ",
         ],
-        (false, false, _) => &["Ctrl+S Save  F4 Full screen ", "Ctrl+S Save "],
+        (false, false, _) => &[
+            "Ctrl+S Save  Tab List  F4 Full screen ",
+            "Ctrl+S Save  Tab List ",
+            "Tab List ",
+        ],
         (true, true, _) => &[
             "F1 Help  F9 Menu  F3 Next  Shift+F3 Previous  Enter Select  Esc Done ",
             "F1 Help  F9 Menu  F3 Next  Enter Select  Esc Done ",
@@ -3142,8 +3212,16 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
         // While editing, each key as the editor has it: relabeled where it
         // does something else there, dimmed (like a grayed menu item)
         // where it does nothing.
-        let (label, active) = if app.editor.is_some() {
+        let (label, active) = if app.editor_has_focus() {
             app.editor_fn_key(fn_key)
+        } else if fn_key
+            .action
+            .is_some_and(|action| app.ruled_out_beside_editor(action))
+        {
+            // The file list's keyboard beside the editor: what it rules
+            // out there (Copy and Move, whose target is the other pane,
+            // under the editor) is dimmed as in the menu.
+            (fn_key.label, false)
         } else if fn_key.action == Some(Action::View) && app.preview_next_mode() {
             // F3 is Find Next in a quick view being searched.
             ("Next", true)
@@ -3611,7 +3689,7 @@ mod tests {
         assert!(text.contains("Ln 2, Col 2"), "{text}");
         // In the pane the F-key bar below has help, the menu and the rest;
         // the status line only what it doesn't.
-        assert!(text.contains("Ctrl+S Save"), "{text}");
+        assert!(text.contains("Tab List"), "{text}");
         assert!(
             !text.contains("F1 Help") && !text.contains("Esc Close"),
             "{text}"
@@ -4015,6 +4093,95 @@ mod tests {
         let title = text.lines().nth(1).unwrap();
         assert!(title.contains("/nowe.md\u{2500}"), "{text}");
         assert!(dir.join("nowe.md").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_status_line_shows_the_code_of_the_character_under_the_cursor() {
+        let path = PathBuf::from("notes.txt");
+        let editor = Editor::from_bytes(path.clone(), "ąb".as_bytes()).unwrap();
+        assert!(
+            editor_status_text(&editor, 80).starts_with(" Ln 1, Col 1, U+0105"),
+            "{}",
+            editor_status_text(&editor, 80)
+        );
+        // At the end of a line, the line ending's codes; after the last
+        // line of a file without one, none.
+        let lf = Editor::from_bytes(path.clone(), b"\n").unwrap();
+        let text = editor_status_text(&lf, 80);
+        assert!(text.starts_with(" Ln 1, Col 1, U+000A "), "{text}");
+        let crlf = Editor::from_bytes(path.clone(), b"\r\n").unwrap();
+        let text = editor_status_text(&crlf, 80);
+        assert!(text.starts_with(" Ln 1, Col 1, U+000D U+000A "), "{text}");
+        let empty = Editor::from_bytes(path, b"").unwrap();
+        let text = editor_status_text(&empty, 80);
+        assert!(
+            text.starts_with(" Ln 1, Col 1 ") && !text.contains("U+"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_part_with_the_keyboard_looks_it() {
+        let (mut app, dir) = editing_app("editor_focus_look", "kot\n");
+        app.editor
+            .as_mut()
+            .unwrap()
+            .apply(editor::Command::SelectAll);
+        let corner = |app: &mut App| {
+            let terminal = draw_app(app);
+            let buf = terminal.backend().buffer().clone();
+            let area = app.editor_area;
+            (buf[(area.x, area.y)].fg, buf[(area.x + 1, area.y + 1)].bg)
+        };
+        let mut terminal = draw_app(&mut app);
+        assert!(terminal.backend_mut().get_cursor_position().is_ok());
+        let text_area = app.editor_text_area;
+        assert_eq!(corner(&mut app), (Color::Yellow, SELECTION_BG));
+        let fn_bar = |app: &mut App| {
+            let text = buffer_text(draw_app(app).backend().buffer());
+            text.lines().last().unwrap().to_string()
+        };
+        assert!(fn_bar(&mut app).contains("F3Next"));
+        assert!(buffer_text(draw_app(&mut app).backend().buffer()).contains("Tab List"));
+
+        // Tab: the list's. The editor's frame and selection dim, no cursor
+        // of its own, and the F-key bar is the usual one.
+        app.toggle_editor_focus();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.hide_cursor().unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        use ratatui::backend::Backend;
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        assert!(
+            !text_area.contains(cursor),
+            "no cursor in the text: {cursor:?}"
+        );
+        assert_eq!(corner(&mut app), (Color::DarkGray, Color::DarkGray));
+        let bar = fn_bar(&mut app);
+        assert!(bar.contains("F3View") && bar.contains("F4Edit"), "{bar}");
+        // Copy and Move dimmed: their target pane is under the editor.
+        let terminal = draw_app(&mut app);
+        let buf = terminal.backend().buffer().clone();
+        let row = buf.area.height - 1;
+        let x = bar.find("Copy").unwrap() as u16;
+        assert_eq!(buf[(x, row)].fg, Color::DarkGray);
+        let x = bar.find("View").unwrap() as u16;
+        assert_ne!(buf[(x, row)].fg, Color::DarkGray);
+        let text = buffer_text(draw_app(&mut app).backend().buffer());
+        assert!(!text.contains("Tab List"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_untitled_editor_is_titled_so() {
+        let (mut app, dir) = editing_app("editor_untitled_title", "x\n");
+        app.editor = Some(Editor::untitled());
+        let text = buffer_text(draw_app(&mut app).backend().buffer());
+        let title = text.lines().nth(1).unwrap();
+        assert!(title.contains("\u{250c}Untitled\u{2500}"), "{text}");
+        assert!(title.ends_with("Editing\u{2510}"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

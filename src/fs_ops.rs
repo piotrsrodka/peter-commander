@@ -678,6 +678,87 @@ fn write_in_place(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Which file a path is, to tell it from another one put in its place
+/// (see `FileId::same_file`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    /// Device and inode on Unix; on Windows, where std has no stable file
+    /// index, the creation time stands in (as `(0, time)`).
+    node: Option<(u64, u64)>,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl FileId {
+    /// Whether `other` is this same file: the same inode — or, since some
+    /// file systems (CIFS without server inodes, some FUSE/sshfs mounts)
+    /// hand out a new inode for an unchanged file, the same modification
+    /// time and size.
+    pub fn same_file(&self, other: &FileId) -> bool {
+        self.node.is_some() && self.node == other.node
+            || self.modified.is_some() && self.modified == other.modified && self.len == other.len
+    }
+}
+
+/// Which file `path` is now; `None` when there's no such file.
+pub fn file_identity(path: &Path) -> Option<FileId> {
+    fs::metadata(path).ok().map(|meta| identity_of(&meta))
+}
+
+pub fn identity_of(meta: &fs::Metadata) -> FileId {
+    #[cfg(unix)]
+    let node = {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    };
+    #[cfg(windows)]
+    let node = {
+        use std::os::windows::fs::MetadataExt;
+        Some((0, meta.creation_time()))
+    };
+    #[cfg(not(any(unix, windows)))]
+    let node = None;
+    FileId {
+        node,
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    }
+}
+
+/// The permission bits of a file (Unix), to give a copy of it the same.
+pub fn permission_bits(meta: &fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Writes `contents` as a new file at `path`, which mustn't exist — if it
+/// does by now, `AlreadyExists`, so nothing that appeared meanwhile is
+/// overwritten unasked. With `mode`, created with those permission bits
+/// (before the umask) instead of the usual ones, written before the file
+/// is readable by anyone the mode doesn't allow.
+pub fn write_new_file(path: &Path, contents: &[u8], mode: Option<u32>) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(path)?;
+    io::Write::write_all(&mut file, contents)?;
+    file.sync_all()
+}
+
 pub fn delete_recursive(path: &Path) -> Result<()> {
     if path.is_dir() {
         fs::remove_dir_all(path)?;
@@ -867,6 +948,35 @@ mod tests {
         assert!(!temp.exists());
         assert_eq!(fs::read(target.join("inside.txt")).unwrap(), b"kept");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_inode_with_the_same_time_and_size_is_the_same_file() {
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let id = |node, len| FileId {
+            node: Some(node),
+            modified: Some(at),
+            len,
+        };
+        assert!(id((1, 1), 5).same_file(&id((1, 2), 5)));
+        assert!(!id((1, 1), 5).same_file(&id((1, 2), 6)));
+        let other = FileId {
+            node: Some((1, 2)),
+            modified: None,
+            len: 5,
+        };
+        assert!(!id((1, 1), 5).same_file(&other));
+    }
+
+    #[test]
+    fn a_new_file_is_never_written_over_one_that_appeared() {
+        let dir = fresh_dir("pc_test_write_new_file");
+        let path = dir.join("a.txt");
+        write_new_file(&path, b"first", None).unwrap();
+        let err = write_new_file(&path, b"second", None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"first");
         fs::remove_dir_all(&dir).unwrap();
     }
 

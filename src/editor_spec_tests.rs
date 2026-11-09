@@ -291,7 +291,9 @@ fn shift_letter_inserts_uppercase() {
 
 #[test]
 fn tab_inserts_four_spaces() {
+    // Full screen: in its pane, Tab gives the keyboard to the file list.
     let mut f = fx("tab", "x");
+    f.press(K::F(4));
     f.press(K::Tab);
     assert_eq!(f.text(), "    x");
     assert_eq!(f.cur(), (0, 4));
@@ -749,6 +751,8 @@ fn undo_after_save_marks_modified_again_and_redo_returns_to_saved() {
 fn undo_everything_restores_original_through_many_kinds_of_edits() {
     let orig = "zażółć\ngęślą jaźń\n";
     let mut f = fx("undo3", orig);
+    // Full screen, where Tab is four spaces.
+    f.press(K::F(4));
     let before = f.text();
     f.typ("abc ");
     f.press(K::Enter);

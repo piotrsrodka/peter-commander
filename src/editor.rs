@@ -5,7 +5,7 @@
 //! key does what) lives here so it can be tested on its own; `App` only adds
 //! the file system, the clipboard, the menu and the dialogs around it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -508,6 +508,14 @@ fn class(c: char) -> CharClass {
     }
 }
 
+/// A hash of the whole text, to tell it from the saved one.
+fn text_hash(lines: &[String]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    lines.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Case folding for search, one character for one so match positions line up
 /// with the text: `Ż` finds `ż`. The rare letter whose lowercase is longer
 /// (Turkish `İ`) is left as it is.
@@ -656,12 +664,36 @@ pub struct Editor {
     version: u64,
     next_version: u64,
     saved_version: u64,
+    /// The saved text's line count and hash, so a text that came back to
+    /// it by any road (typing a letter and deleting it again) counts as
+    /// unmodified too, not only undoing back to it.
+    saved_lines: usize,
+    saved_hash: u64,
+    /// The text's length in bytes (lines joined by `\n`), kept up to date
+    /// edit by edit, and the saved text's: while either count differs from
+    /// the saved one, the text is modified without hashing all of it — the
+    /// usual case while typing.
+    bytes: usize,
+    saved_bytes: usize,
+    /// `is_modified`'s answer for one `version`, so the text is hashed once
+    /// per edit rather than on every draw.
+    modified: Cell<Option<(u64, bool)>>,
     pub find: Option<FindBar>,
     /// What was searched for last, offered again when Ctrl+F reopens the
     /// bar.
     last_search: String,
     /// A short note for the status line ("Saved"), until the next key.
     pub message: Option<String>,
+    /// No file at all yet (Command > Open Editor): "Untitled", and the
+    /// first save asks for a name.
+    pub untitled: bool,
+    /// Which file on disk this is (device and inode), as opened or last
+    /// saved — to notice it renamed, deleted or replaced under the editor,
+    /// so a save can't silently land somewhere other than the user thinks.
+    pub disk_id: Option<crate::fs_ops::FileId>,
+    /// The file's permission bits as opened, for a copy made of it by Save
+    /// As (a private file stays private); `None` for Untitled.
+    pub mode: Option<u32>,
     /// Counts every change to `lines`, so what's worked out from them can be
     /// kept until they change: unlike `version`, it never goes back.
     text_gen: u64,
@@ -692,7 +724,19 @@ impl Editor {
             return Err(refuse("larger than 10 MB"));
         }
         let bytes = std::fs::read(path).map_err(|err| refuse(&err.to_string()))?;
-        Editor::from_bytes(path.to_path_buf(), &bytes).map_err(refuse)
+        let mut editor = Editor::from_bytes(path.to_path_buf(), &bytes).map_err(refuse)?;
+        editor.disk_id = crate::fs_ops::file_identity(path);
+        editor.mode = crate::fs_ops::permission_bits(&meta);
+        Ok(editor)
+    }
+
+    /// An empty buffer that's no file yet: LF line endings, a final newline
+    /// and no byte order mark once it's saved as one.
+    pub fn untitled() -> Editor {
+        let mut editor = Editor::from_bytes(PathBuf::new(), b"").expect("empty text is fine");
+        editor.trailing_newline = true;
+        editor.untitled = true;
+        editor
     }
 
     /// The text of a file as it is on disk; `Err` says why it isn't plain
@@ -718,7 +762,10 @@ impl Editor {
             text.to_string()
         };
         let body = body.strip_suffix('\n').unwrap_or(&body);
-        let lines = body.split('\n').map(String::from).collect();
+        let lines: Vec<String> = body.split('\n').map(String::from).collect();
+        let saved_lines = lines.len();
+        let saved_hash = text_hash(&lines);
+        let bytes = body.len();
         Ok(Editor {
             path,
             lines,
@@ -742,12 +789,20 @@ impl Editor {
             version: 0,
             next_version: 1,
             saved_version: 0,
+            saved_lines,
+            saved_hash,
+            bytes,
+            saved_bytes: bytes,
+            modified: Cell::new(None),
             find: None,
             last_search: String::new(),
             message: None,
             text_gen: 0,
             layout: RefCell::default(),
             folded: RefCell::default(),
+            untitled: false,
+            disk_id: None,
+            mode: None,
         })
     }
 
@@ -766,22 +821,88 @@ impl Editor {
         text.into_bytes()
     }
 
+    /// Whether the text differs from what's on disk: not after undoing back
+    /// to it, nor after an edit that put back what was there.
     pub fn is_modified(&self) -> bool {
-        self.version != self.saved_version
+        if self.version == self.saved_version {
+            return false;
+        }
+        if let Some((version, modified)) = self.modified.get()
+            && version == self.version
+        {
+            return modified;
+        }
+        let modified = self.lines.len() != self.saved_lines
+            || self.bytes != self.saved_bytes
+            || text_hash(&self.lines) != self.saved_hash;
+        self.modified.set(Some((self.version, modified)));
+        modified
+    }
+
+    /// Everything about the editor's state a key could change, for tests
+    /// that prove a key went elsewhere.
+    #[cfg(test)]
+    pub fn snapshot(&self) -> String {
+        format!(
+            "{:?}",
+            (
+                self.to_bytes(),
+                self.cursor,
+                self.anchor,
+                self.undo.len(),
+                self.redo.len(),
+                self.version,
+                self.is_modified(),
+                (self.scroll_row, self.scroll_sub, self.scroll_x),
+                self.full_screen,
+                self.find
+                    .as_ref()
+                    .map(|bar| (bar.field.text(), bar.status())),
+                (&self.path, &self.message, &self.last_search),
+            )
+        )
+    }
+
+    /// The file is gone from disk: whatever the text, it isn't saved —
+    /// until Ctrl+S writes it again.
+    pub fn mark_unsaved(&mut self) {
+        self.saved_version = u64::MAX;
+        self.saved_lines = usize::MAX;
+        self.saved_bytes = usize::MAX;
+        self.modified.set(None);
     }
 
     pub fn mark_saved(&mut self) {
         self.saved_version = self.version;
+        self.saved_lines = self.lines.len();
+        self.saved_hash = text_hash(&self.lines);
+        self.saved_bytes = self.bytes;
+        self.modified.set(None);
         // Typing on after a save starts a new undo step, so undo can go back
         // to exactly what's on disk.
         self.merge = None;
     }
 
     pub fn file_name(&self) -> String {
+        if self.untitled {
+            return "Untitled".to_string();
+        }
         self.path.file_name().map_or_else(
             || self.path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         )
+    }
+
+    /// The line ending after `line` as the file has it: CR LF or LF, or
+    /// none after the last line of a file that doesn't end with one.
+    pub fn line_ending(&self, line: usize) -> &'static [char] {
+        if line + 1 == self.lines.len() && !self.trailing_newline {
+            &[]
+        } else if self.crlf {
+            &['\r', '\n']
+        } else {
+            &['\n']
+        }
     }
 
     #[cfg(test)]
@@ -1073,6 +1194,12 @@ impl Editor {
     /// The one primitive every edit goes through: replaces `start..end` with
     /// `text` (`\n`-separated) and returns what was there.
     fn splice(&mut self, start: Pos, end: Pos, text: &str) -> String {
+        let removed = self.splice_text(start, end, text);
+        self.bytes = self.bytes + text.len() - removed.len();
+        removed
+    }
+
+    fn splice_text(&mut self, start: Pos, end: Pos, text: &str) -> String {
         if start.line == end.line && !text.contains('\n') {
             return self.splice_in_line(start.line, start.col, end.col, text);
         }
@@ -1817,6 +1944,35 @@ mod tests {
 
     fn shift(editor: &mut Editor, code: KeyCode) {
         key(editor, code, KeyModifiers::SHIFT);
+    }
+
+    #[test]
+    fn putting_the_text_back_by_hand_counts_as_unmodified() {
+        // A letter typed and deleted again: no undo, same text as on disk.
+        let mut ed = editor("abc\n");
+        type_str(&mut ed, "x");
+        assert!(ed.is_modified());
+        press(&mut ed, KeyCode::Backspace);
+        assert!(!ed.is_modified());
+        // A Tab and Ctrl+Z, the accidental-Tab case.
+        press(&mut ed, KeyCode::Tab);
+        assert!(ed.is_modified());
+        ctrl(&mut ed, KeyCode::Char('z'));
+        assert!(!ed.is_modified());
+        // A whole line added and removed again.
+        press(&mut ed, KeyCode::Enter);
+        assert!(ed.is_modified());
+        press(&mut ed, KeyCode::Backspace);
+        assert!(!ed.is_modified());
+
+        // After a save, the saved text is the one compared with.
+        type_str(&mut ed, "y");
+        ed.mark_saved();
+        assert!(!ed.is_modified());
+        press(&mut ed, KeyCode::Backspace);
+        assert!(ed.is_modified(), "differs from what was just saved");
+        type_str(&mut ed, "y");
+        assert!(!ed.is_modified());
     }
 
     #[test]

@@ -45,13 +45,16 @@ cargo install peter-commander
 - Rename selected files together in your `$EDITOR`, with a warning before anything is overwritten
 - Respects theme selection in Omarchy
 - Quick preview (F3) for text, directories, binaries and images (Sixel, Kitty or iTerm2 graphics, colored half blocks elsewhere);
-  Tab onto it and Ctrl+F finds in the text (F3/Shift+F3 next/previous, first 1 MB of big files)
+  Tab onto it and Ctrl+F finds in the text (F3/Shift+F3 next/previous, first 1 MB of big files);
+  Esc closes it
 - Built-in text editor (F4) in the other pane, or full screen with F4 again:
   Notepad keys (Shift to select, Ctrl+arrows by word, Ctrl+S/Z/Y/A/C/X/V,
   Ctrl+F find with F3/Shift+F3 for the next/previous match), optional
   line wrap (Edit or Options menu, shared with the F3 preview, which is
   scrolled sideways with ←/→ when unwrapped), keeps line endings and tabs
-  as they are, F2 renames the file being edited, asks before unsaved
+  as they are, F2 renames the file being edited, File > Save As, Command >
+  Open Editor starts an untitled text, Tab switches the keyboard
+  between the editor and the file list beside it, asks before unsaved
   changes are lost, and Esc goes back to the quick view you came from; full screen can
   hide the menu bar (focus mode, Settings); or edit in your `$EDITOR`
   instead (Settings)
