@@ -3048,6 +3048,8 @@ fn editor_status_line(editor: &Editor, width: usize, focused: bool) -> String {
     let left_width = Span::raw(left.as_str()).width();
     match hints
         .iter()
+        // `pce` has no pane for F4 to go back to.
+        .filter(|hint| !(editor.standalone && hint.contains("F4")))
         .find(|hint| left_width + 2 + hint.chars().count() <= width)
     {
         Some(hint) => format!(

@@ -514,6 +514,8 @@ pub struct App {
     last_refresh_check: Option<Instant>,
     /// A note from that check, waiting for whatever's open to close.
     pending_notice: Option<String>,
+    /// `pce`: the editor is all there is (see `App::editor_only`).
+    pub editor_only: bool,
 }
 
 /// Directories named on the command line (`pc LEFT [RIGHT]`), already
@@ -536,6 +538,23 @@ impl App {
     }
 
     pub fn with_start_dirs(start_dirs: StartDirs) -> Result<Self> {
+        Self::build(start_dirs, false)
+    }
+
+    /// `pce`: the built-in editor alone, on `editor`, full screen — no
+    /// panes to show, and none of their saved state read or written (the
+    /// two kept behind the editor are just the current directory, for Save
+    /// As of an untitled text to start from). Closing it ends the program.
+    pub fn editor_only(mut editor: Editor) -> Result<Self> {
+        let mut app = Self::build(StartDirs::default(), true)?;
+        editor.standalone = true;
+        editor.full_screen = true;
+        app.install_editor(editor);
+        app.view_before_editor = None;
+        Ok(app)
+    }
+
+    fn build(start_dirs: StartDirs, editor_only: bool) -> Result<Self> {
         let cwd = env::current_dir()?;
         let saved_settings = state::load_settings();
         let start_left_in_cwd = saved_settings
@@ -546,7 +565,8 @@ impl App {
             .get(SettingItem::PaneTotals.key())
             .copied()
             .unwrap_or(true);
-        let (left_dir, right_dir) = match state::load() {
+        let last_dirs = if editor_only { None } else { state::load() };
+        let (left_dir, right_dir) = match last_dirs {
             Some(last) if start_left_in_cwd => (cwd.clone(), last.right),
             Some(last) => (last.left, last.right),
             None => (cwd.clone(), cwd),
@@ -658,12 +678,20 @@ impl App {
             last_scroll_at: None,
             last_refresh_check: None,
             pending_notice: None,
+            editor_only,
         };
-        app.restore_sorts();
+        if !editor_only {
+            app.restore_sorts();
+        }
         Ok(app)
     }
 
+    /// Where the panes were, for the next start — not for `pce`, which
+    /// has none of its own.
     pub fn save_state(&self) {
+        if self.editor_only {
+            return;
+        }
         state::save(&self.left.cwd, &self.right.cwd);
         state::save_sorts(
             (self.left.sort_key, self.left.sort_reversed),
@@ -1182,7 +1210,13 @@ impl App {
                 ..
             } | Dialog::Transfer(_)
         );
-        for side in [Side::Left, Side::Right] {
+        // `pce` shows no panes, so has none to keep up to date.
+        let sides: &[Side] = if self.editor_only {
+            &[]
+        } else {
+            &[Side::Left, Side::Right]
+        };
+        for &side in sides {
             match self.pane_mut(side).changed_on_disk() {
                 Ok(false) => {}
                 // A failure is reported once: the listing is then up to
@@ -1539,6 +1573,9 @@ impl App {
     /// usual one while the file list has the keyboard), Wrap Lines in
     /// Options while the quick view is open.
     pub fn menu_bar(&self) -> &'static [MenuCategory] {
+        if self.editor_only {
+            return menu::PCE_MENU_BAR;
+        }
         menu::menu_bar(self.editor_has_focus(), self.quick_view)
     }
 
@@ -1751,6 +1788,8 @@ impl App {
                     focused: 0,
                 };
             }
+            // `pce` quits as an editor does, without "Really quit?".
+            Action::Quit if self.editor_only => self.quit(),
             Action::Quit => {
                 self.dialog = Dialog::ConfirmQuit;
                 self.dialog_cancel_focused = false;
@@ -2124,7 +2163,7 @@ impl App {
         let Some(editor) = &mut self.editor else {
             return;
         };
-        if editor.untitled {
+        if editor.untitled || editor.new_file {
             return;
         }
         let what = match std::fs::metadata(&editor.path) {
@@ -2475,6 +2514,8 @@ impl App {
             // selected does Esc close the editor.
             EditorCommand::Close if editor.selection().is_some() => editor.deselect(),
             EditorCommand::Close => self.close_editor(),
+            // `pce` has no pane to go back to.
+            EditorCommand::ToggleFullScreen if editor.standalone => {}
             EditorCommand::ToggleFullScreen => {
                 editor.full_screen = !editor.full_screen;
                 self.list_focus = false;
@@ -2538,6 +2579,15 @@ impl App {
         if editor.untitled {
             self.open_save_as(None);
             return false;
+        }
+        // Not made yet (`pce new.txt`): made now — unless something else
+        // took the name meanwhile, which isn't replaced unasked.
+        if editor.new_file {
+            if std::fs::symlink_metadata(&path).is_ok() {
+                self.confirm_save_over(path);
+                return false;
+            }
+            return self.write_editor_to(&path, false);
         }
         let still_it = match (editor.disk_id, fs_ops::file_identity(&path)) {
             (Some(was), Some(now)) => was.same_file(&now),
@@ -2621,6 +2671,10 @@ impl App {
         let written = if new {
             let mode = if editor.untitled { None } else { editor.mode };
             fs_ops::write_new_file(path, &editor.to_bytes(), mode)
+        } else if editor.standalone && editor.path == path {
+            // `pce` as `$EDITOR`: whoever handed over the file may read it
+            // back through the descriptor it holds (crontab -e insists).
+            fs_ops::overwrite_in_place(path, &editor.to_bytes())
         } else {
             fs_ops::write_file_safely(path, &editor.to_bytes())
         };
@@ -2636,6 +2690,7 @@ impl App {
             Ok(()) => {
                 editor.path = path.to_path_buf();
                 editor.untitled = false;
+                editor.new_file = false;
                 let meta = std::fs::metadata(path).ok();
                 editor.disk_id = meta.as_ref().map(fs_ops::identity_of);
                 editor.mode = meta.as_ref().and_then(fs_ops::permission_bits);
@@ -2685,6 +2740,11 @@ impl App {
     /// scroll resets by itself should the selection have moved meanwhile;
     /// see `sync_preview_scroll`).
     fn drop_editor(&mut self) {
+        if self.editor_only {
+            // Nothing behind it: closing the editor is the end.
+            self.should_quit = true;
+            return;
+        }
         self.editor = None;
         self.list_focus = false;
         self.after_prompt = None;
@@ -4724,6 +4784,16 @@ mod tests {
         save_as(&mut app, "link");
         assert!(matches!(app.dialog, Dialog::ConfirmSaveAs { .. }));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_saves_an_untitled_text_where_it_was_started() {
+        let mut app = App::editor_only(Editor::untitled()).unwrap();
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(app.save_as_target("notes.txt"), Some(cwd.join("notes.txt")));
+        // Untouched, closing it just ends the program.
+        app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(app.should_quit && matches!(app.dialog, Dialog::None));
     }
 
     #[test]

@@ -81,6 +81,25 @@ A directory given on the command line wins over where that pane would
 otherwise start (including the "Restore last session" setting). With the
 `pc` alias from the install script, `pc ~/projects` works the same.
 
+## pce — the editor alone
+
+`pce` is Peter Commander's built-in editor on its own, full screen, with the
+same keys (F1 shows them), theme and settings — for quick edits from the
+shell, and as `$EDITOR`:
+
+```sh
+pce notes.txt                      # edit a file (one not there yet is made on the first save)
+pce +12 src/main.rs                # starting at line 12
+pce                                # an untitled text; Save asks for a name
+git config --global core.editor pce
+export EDITOR=pce                  # crontab -e, and the rest
+```
+
+Esc, F10 or Ctrl+Q close it, asking first about unsaved changes. It
+comes with `cargo install peter-commander` (a small launcher for the
+main binary), the Arch package and `scripts/install.sh`;
+`peter-commander --edit [+N] [FILE]` is the same thing.
+
 ## Installing
 
 Already have Rust? This works on Linux, macOS, and Windows:

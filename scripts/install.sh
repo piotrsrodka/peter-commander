@@ -20,6 +20,10 @@ bin_dir="$HOME/.local/bin"
 mkdir -p "$bin_dir"
 cp target/release/peter-commander "$bin_dir/"
 echo "Installed peter-commander to $bin_dir/peter-commander"
+# pce, the editor alone (usable as $EDITOR): a link, as the binary notices
+# the name it was run under.
+ln -sf peter-commander "$bin_dir/pce"
+echo "Linked $bin_dir/pce (the editor alone) to it"
 
 case ":${PATH:-}:" in
     *":$bin_dir:"*) ;;

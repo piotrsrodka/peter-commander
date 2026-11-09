@@ -687,6 +687,11 @@ pub struct Editor {
     /// No file at all yet (Command > Open Editor): "Untitled", and the
     /// first save asks for a name.
     pub untitled: bool,
+    /// Named, but not on disk yet (`pce new.txt`): the first save makes it.
+    pub new_file: bool,
+    /// The editor alone, with no panes to go back to (`pce`): always full
+    /// screen, and closing it ends the program.
+    pub standalone: bool,
     /// Which file on disk this is (device and inode), as opened or last
     /// saved — to notice it renamed, deleted or replaced under the editor,
     /// so a save can't silently land somewhere other than the user thinks.
@@ -710,24 +715,47 @@ impl Editor {
             || path.display().to_string(),
             |n| n.to_string_lossy().into(),
         );
-        let refuse = |why: &str| {
+        Editor::read(path).map_err(|why| {
             format!(
                 "Cannot edit \"{name}\" here: {why} (Settings: External editor opens it in $EDITOR)"
             )
-        };
-        let meta = std::fs::metadata(path).map_err(|err| refuse(&err.to_string()))?;
+        })
+    }
+
+    /// `open`, its refusal just the reason ("not a regular file").
+    pub fn read(path: &Path) -> Result<Editor, String> {
+        let meta = std::fs::metadata(path).map_err(|err| err.to_string())?;
         // A FIFO or device would block the read forever, or never end.
         if !meta.is_file() {
-            return Err(refuse("not a regular file"));
+            return Err("not a regular file".to_string());
         }
         if meta.len() > MAX_FILE_BYTES {
-            return Err(refuse("larger than 10 MB"));
+            return Err("larger than 10 MB".to_string());
         }
-        let bytes = std::fs::read(path).map_err(|err| refuse(&err.to_string()))?;
-        let mut editor = Editor::from_bytes(path.to_path_buf(), &bytes).map_err(refuse)?;
+        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+        let mut editor = Editor::from_bytes(path.to_path_buf(), &bytes)?;
         editor.disk_id = crate::fs_ops::file_identity(path);
         editor.mode = crate::fs_ops::permission_bits(&meta);
         Ok(editor)
+    }
+
+    /// An empty buffer for `path`, which isn't there yet (`pce new.txt`):
+    /// nothing is made on disk until the first save, which makes it with LF
+    /// line endings and a final newline.
+    pub fn new_file(path: PathBuf) -> Editor {
+        let mut editor = Editor::from_bytes(path, b"").expect("empty text is fine");
+        editor.trailing_newline = true;
+        editor.new_file = true;
+        editor
+    }
+
+    /// `pce +N`: the cursor to the start of line `line` (counted from 1),
+    /// or the last line if there are fewer.
+    pub fn go_to_line(&mut self, line: usize) {
+        self.cursor = Pos::new(line.saturating_sub(1).min(self.lines.len() - 1), 0);
+        self.anchor = None;
+        self.goal_x = None;
+        self.follow_cursor = true;
     }
 
     /// An empty buffer that's no file yet: LF line endings, a final newline
@@ -801,6 +829,8 @@ impl Editor {
             layout: RefCell::default(),
             folded: RefCell::default(),
             untitled: false,
+            new_file: false,
+            standalone: false,
             disk_id: None,
             mode: None,
         })

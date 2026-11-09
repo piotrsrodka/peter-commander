@@ -678,6 +678,21 @@ fn write_in_place(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Saves `contents` over the file at `path` where it is — the same file,
+/// same inode, links followed — as programs that hand a file to `$EDITOR`
+/// and read it back by its open descriptor need: `crontab -e`, for one,
+/// refuses a file that was replaced ("temp file must be edited in
+/// place"). Unlike `write_file_safely`, a crash part-way can leave it half
+/// written.
+pub fn overwrite_in_place(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    io::Write::write_all(&mut file, contents)?;
+    file.sync_all()
+}
+
 /// Which file a path is, to tell it from another one put in its place
 /// (see `FileId::same_file`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

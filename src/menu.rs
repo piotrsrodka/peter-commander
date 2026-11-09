@@ -192,15 +192,7 @@ pub const EDITOR_MENU_BAR: &[MenuCategory] = &[
         title: "File",
         items: &[Action::Save, Action::SaveAs, Action::Rename, Action::Close],
     },
-    MenuCategory {
-        title: "Edit",
-        items: &[
-            Action::WrapLines,
-            Action::SelectAll,
-            Action::Find,
-            Action::FindNext,
-        ],
-    },
+    EDIT,
     OPTIONS,
     MenuCategory {
         title: "Command",
@@ -210,6 +202,31 @@ pub const EDITOR_MENU_BAR: &[MenuCategory] = &[
             Action::About,
             Action::Quit,
         ],
+    },
+];
+
+const EDIT: MenuCategory = MenuCategory {
+    title: "Edit",
+    items: &[
+        Action::WrapLines,
+        Action::SelectAll,
+        Action::Find,
+        Action::FindNext,
+    ],
+};
+
+/// `pce`'s menu bar: the editor's, without what belongs to the file
+/// manager around it (its logs).
+pub const PCE_MENU_BAR: &[MenuCategory] = &[
+    MenuCategory {
+        title: "File",
+        items: &[Action::Save, Action::SaveAs, Action::Rename, Action::Close],
+    },
+    EDIT,
+    OPTIONS,
+    MenuCategory {
+        title: "Command",
+        items: &[Action::About, Action::Quit],
     },
 ];
 

@@ -44,6 +44,7 @@ use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 
 use app::{App, Dialog, ExternalRequest, SettingItem, StartDirs};
+use editor::Editor;
 use menu::{Action, FN_KEYS};
 
 fn restore_terminal() {
@@ -51,6 +52,8 @@ fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = io::stdout().execute(DisableMouseCapture);
     let _ = io::stdout().execute(LeaveAlternateScreen);
+    // Hidden while drawing; on a panic nothing else would show it again.
+    let _ = io::stdout().execute(crossterm::cursor::Show);
 }
 
 /// What the command line asks for, before any terminal setup.
@@ -62,10 +65,32 @@ enum CliRequest {
         left: Option<String>,
         right: Option<String>,
     },
+    /// `--edit` (or run as `pce`): the built-in editor alone, on `file` (or
+    /// an untitled text), at `line` (`+N`, counted from 1).
+    Edit {
+        line: Option<usize>,
+        file: Option<String>,
+    },
     Version,
     Help,
     /// A usage mistake, reported with the usage text and exit code 2.
     Invalid(String),
+}
+
+/// The command line as given — the program's name first, since run as
+/// `pce` (a link to this binary, or the launcher) it's the editor alone,
+/// as with `--edit`.
+fn parse_cli<I: IntoIterator<Item = String>>(argv: I) -> CliRequest {
+    let mut argv = argv.into_iter();
+    let program = argv.next().unwrap_or_default();
+    let as_pce = Path::new(&program)
+        .file_stem()
+        .is_some_and(|stem| stem == "pce");
+    if as_pce {
+        parse_args(std::iter::once("--edit".to_string()).chain(argv))
+    } else {
+        parse_args(argv)
+    }
 }
 
 /// `-V`/`-v`/`--version`/`-version` and `-h`/`--help` win wherever they
@@ -75,10 +100,12 @@ enum CliRequest {
 fn parse_args<I: IntoIterator<Item = String>>(args: I) -> CliRequest {
     let mut dirs = Vec::new();
     let mut invalid = None;
+    let mut edit = false;
     for arg in args {
         match arg.as_str() {
             "-V" | "-v" | "--version" | "-version" => return CliRequest::Version,
             "-h" | "--help" => return CliRequest::Help,
+            "--edit" => edit = true,
             option if option.len() > 1 && option.starts_with('-') => {
                 invalid.get_or_insert(format!("unknown option '{option}'"));
             }
@@ -87,6 +114,9 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> CliRequest {
     }
     if let Some(message) = invalid {
         return CliRequest::Invalid(message);
+    }
+    if edit {
+        return parse_edit_args(dirs);
     }
     if dirs.len() > 2 {
         return CliRequest::Invalid(format!(
@@ -99,6 +129,57 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> CliRequest {
         left: dirs.next(),
         right: dirs.next(),
     }
+}
+
+/// `--edit [+N] [FILE]`: a line to start on, as vim and nano take it, and
+/// one file at most. A `+` not followed by digits is a file name.
+fn parse_edit_args(args: Vec<String>) -> CliRequest {
+    let mut args = args.into_iter().peekable();
+    let line = args
+        .next_if(|arg| {
+            arg.len() > 1 && arg.starts_with('+') && arg[1..].bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|arg| arg[1..].parse().ok());
+    let file = args.next();
+    if let Some(extra) = args.next() {
+        return CliRequest::Invalid(format!("--edit takes one file, not also '{extra}'"));
+    }
+    CliRequest::Edit { line, file }
+}
+
+/// The editor `pce` starts with, or why it can't — said before the
+/// terminal switches to the UI, so it lands in the shell (or in git's
+/// output, as `core.editor`). A name that isn't there yet is a new file,
+/// made on the first save.
+fn editor_for(file: Option<&str>, line: Option<usize>) -> std::result::Result<Editor, String> {
+    let mut editor = match file {
+        None => Editor::untitled(),
+        Some(arg) => {
+            let path =
+                std::path::absolute(arg).map_err(|err| format!("cannot edit '{arg}': {err}"))?;
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() => {
+                    return Err(format!("cannot edit '{arg}': it's a directory"));
+                }
+                Ok(_) => {
+                    Editor::read(&path).map_err(|why| format!("cannot edit '{arg}': {why}"))?
+                }
+                // New, in a directory that's there: made on the first save.
+                Err(err)
+                    if err.kind() == io::ErrorKind::NotFound
+                        && path.parent().is_some_and(Path::is_dir)
+                        && !arg.ends_with(['/', std::path::MAIN_SEPARATOR]) =>
+                {
+                    Editor::new_file(path)
+                }
+                Err(err) => return Err(format!("cannot edit '{arg}': {err}")),
+            }
+        }
+    };
+    if let Some(line) = line {
+        editor.go_to_line(line);
+    }
+    Ok(editor)
 }
 
 /// Turns a directory argument into an absolute path, or says why it can't
@@ -127,19 +208,32 @@ fn usage_text() -> String {
          {name}                      Start with the panes as usual (below)\n  \
          {name} LEFT_DIR             Open the left pane in LEFT_DIR\n  \
          {name} LEFT_DIR RIGHT_DIR   Open the left and right pane\n  \
+         {name} --edit [+N] [FILE]   Just the editor, on FILE (at line N);\n  \
+         pce [+N] [FILE]                      the same, also as $EDITOR\n  \
          {name} -h, --help           Print this help\n  \
          {name} -V, -v, --version    Print the version (-version works too)\n\n\
          As usual, the left pane starts in the current directory, or\n\
          where you left it with \"Restore last session\" (Options > Settings);\n\
          the right pane starts where you left it. First run: both in the\n\
-         current directory.\n",
+         current directory.\n\n\
+         The editor alone (pce) closes with Esc, F10 or Ctrl+Q, asking first\n\
+         about unsaved changes. A FILE that isn't there yet is made on the\n\
+         first save; without one, Save asks for a name. For git:\n  \
+         git config --global core.editor pce\n",
         version_text(),
         env!("CARGO_PKG_DESCRIPTION"),
     )
 }
 
 fn main() -> Result<()> {
-    let start_dirs = match parse_args(env::args().skip(1)) {
+    let start = match parse_cli(env::args()) {
+        CliRequest::Edit { line, file } => match editor_for(file.as_deref(), line) {
+            Ok(editor) => Start::Editor(Box::new(editor)),
+            Err(message) => {
+                eprintln!("pce: {message}");
+                std::process::exit(1);
+            }
+        },
         CliRequest::Run { left, right } => {
             let resolve = |arg: Option<String>| arg.as_deref().map(resolve_dir).transpose();
             match resolve(left).and_then(|left| {
@@ -148,7 +242,7 @@ fn main() -> Result<()> {
                     right: resolve(right)?,
                 })
             }) {
-                Ok(dirs) => dirs,
+                Ok(dirs) => Start::Panes(dirs),
                 Err(message) => {
                     eprintln!("error: {message}");
                     std::process::exit(2);
@@ -205,12 +299,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal::new")?;
 
-    let result = run(
-        &mut terminal,
-        &should_exit,
-        mouse_capture_enabled,
-        start_dirs,
-    );
+    let result = run(&mut terminal, &should_exit, mouse_capture_enabled, start);
 
     restore_terminal();
 
@@ -221,13 +310,22 @@ fn main() -> Result<()> {
     result
 }
 
+/// What `main` starts: the file manager, or (`pce`) the editor alone.
+enum Start {
+    Panes(StartDirs),
+    Editor(Box<Editor>),
+}
+
 fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     should_exit: &AtomicBool,
     mouse_capture_enabled: bool,
-    start_dirs: StartDirs,
+    start: Start,
 ) -> Result<()> {
-    let mut app = App::with_start_dirs(start_dirs)?;
+    let mut app = match start {
+        Start::Panes(start_dirs) => App::with_start_dirs(start_dirs)?,
+        Start::Editor(editor) => App::editor_only(*editor)?,
+    };
     // Tracks what's actually been sent to the terminal, so a change to the
     // live "Capture mouse" setting (toggled in the Settings dialog) can be
     // applied the moment it happens, not just at the next TUI suspend.
@@ -2217,6 +2315,196 @@ mod tests {
         assert!(app.quick_search.is_some());
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 43, 3);
         assert!(!app.list_focus && app.quick_search.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn edit(line: Option<usize>, file: Option<&str>) -> CliRequest {
+        CliRequest::Edit {
+            line,
+            file: file.map(String::from),
+        }
+    }
+
+    #[test]
+    fn edit_mode_is_asked_for_by_flag_or_by_the_name_pce() {
+        assert_eq!(parse_args(args(&["--edit"])), edit(None, None));
+        assert_eq!(
+            parse_args(args(&["--edit", "a.txt"])),
+            edit(None, Some("a.txt"))
+        );
+        assert_eq!(
+            parse_args(args(&["a.txt", "--edit"])),
+            edit(None, Some("a.txt"))
+        );
+        assert_eq!(
+            parse_args(args(&["--edit", "+12", "a"])),
+            edit(Some(12), Some("a"))
+        );
+        // A `+` without a number is a name; a line without a file is fine.
+        assert_eq!(parse_args(args(&["--edit", "+x"])), edit(None, Some("+x")));
+        assert_eq!(parse_args(args(&["--edit", "+3"])), edit(Some(3), None));
+        assert!(matches!(
+            parse_args(args(&["--edit", "a", "b"])),
+            CliRequest::Invalid(_)
+        ));
+        assert_eq!(parse_args(args(&["--edit", "-h"])), CliRequest::Help);
+        // Run as `pce` (a link, or the launcher's child named so).
+        assert_eq!(
+            parse_cli(args(&["/usr/bin/pce", "+2", "f"])),
+            edit(Some(2), Some("f"))
+        );
+        assert_eq!(parse_cli(args(&["pce.exe"])), edit(None, None));
+        assert_eq!(
+            parse_cli(args(&["peter-commander", "d"])),
+            run(Some("d"), None)
+        );
+    }
+
+    #[test]
+    fn pce_refuses_what_it_cant_edit_before_any_ui() {
+        let dir = std::env::temp_dir().join(format!("pc_test_pce_refuse_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bin.dat"), b"\x00\x01").unwrap();
+        std::fs::write(dir.join("latin2.txt"), b"\xb1").unwrap();
+        let refused = |name: &str| editor_for(Some(&dir.join(name).display().to_string()), None);
+        let why = |name: &str| refused(name).err().unwrap();
+        assert!(why("").contains("directory"));
+        assert!(why("bin.dat").contains("binary"));
+        assert!(why("latin2.txt").contains("UTF-8"));
+        assert!(refused("missing/new.txt").is_err(), "no such directory");
+        // A new name in a directory that's there: an editor, nothing made.
+        let editor = refused("new.txt").unwrap();
+        assert!(editor.new_file && !dir.join("new.txt").exists());
+        // +N: that line, or the last.
+        std::fs::write(dir.join("lines.txt"), "a\nb\nc\n").unwrap();
+        let path = dir.join("lines.txt").display().to_string();
+        assert_eq!(
+            editor_for(Some(&path), Some(2)).unwrap().cursor(),
+            editor::Pos::new(1, 0)
+        );
+        assert_eq!(
+            editor_for(Some(&path), Some(99)).unwrap().cursor(),
+            editor::Pos::new(2, 0)
+        );
+        assert!(editor_for(None, None).unwrap().untitled);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `pce` on `dir/name` (made with `text` unless `None`).
+    fn pce_on(dir_name: &str, name: &str, text: Option<&str>) -> (App, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("pc_test_pce_{dir_name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = text {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let editor = editor_for(Some(&dir.join(name).display().to_string()), None).unwrap();
+        let mut app = App::editor_only(editor).unwrap();
+        app.clipboard = clipboard::Clipboard::internal();
+        (app, dir)
+    }
+
+    #[test]
+    fn pce_edits_a_commit_message_and_ends_when_closed() {
+        let (mut app, dir) = pce_on("commit", "COMMIT_EDITMSG", Some("\n# Please enter...\n"));
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(dir.join("COMMIT_EDITMSG")).unwrap().ino()
+        };
+        let editor = app.editor.as_ref().unwrap();
+        assert!(editor.full_screen && editor.standalone);
+        let titles: Vec<&str> = app.menu_bar().iter().map(|c| c.title).collect();
+        assert_eq!(titles, ["File", "Edit", "Options", "Command"]);
+        let items: Vec<Action> = app
+            .menu_bar()
+            .iter()
+            .flat_map(|c| c.items.iter().copied())
+            .collect();
+        assert!(!items.contains(&Action::ShowLogs) && items.contains(&Action::SaveAs));
+        typed(&mut app, "Fix the thing");
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Esc);
+        assert!(app.should_quit, "closed: the program ends");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("COMMIT_EDITMSG")).unwrap(),
+            "Fix the thing\n# Please enter...\n"
+        );
+        // Written in place: the same file, as crontab -e requires.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(dir.join("COMMIT_EDITMSG")).unwrap().ino(),
+                inode
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_has_no_panes_to_switch_to_and_quits_without_asking_twice() {
+        let (mut app, dir) = pce_on("keys", "a.txt", Some("x\n"));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.editor.as_ref().unwrap().lines()[0], "    x");
+        assert!(!app.list_focus);
+        press(&mut app, KeyCode::F(4));
+        assert!(
+            app.editor.as_ref().unwrap().full_screen,
+            "F4: no pane to go to"
+        );
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(app.help_page, app::EDITOR_HELP_PAGE);
+        press(&mut app, KeyCode::Esc);
+        // Changed: F10 asks; Don't Save ends it, the file as it was.
+        press(&mut app, KeyCode::F(10));
+        assert!(app.dialog_is_unsaved_changes());
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.should_quit);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"x\n");
+        // Unchanged: Ctrl+Q just quits, no "Really quit?".
+        let (mut app, dir2) = pce_on("keys_clean", "a.txt", Some("x\n"));
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit && matches!(app.dialog, Dialog::None));
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn pce_on_a_new_name_makes_the_file_only_when_saved() {
+        let (mut app, dir) = pce_on("new", "new.txt", None);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.should_quit && matches!(app.dialog, Dialog::None));
+        assert!(!dir.join("new.txt").exists());
+        let (mut app, _) = pce_on("new", "new.txt", None);
+        typed(&mut app, "hi");
+        ctrl(&mut app, 's');
+        assert_eq!(std::fs::read(dir.join("new.txt")).unwrap(), b"hi\n");
+        assert!(!app.editor.as_ref().unwrap().new_file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_leaves_the_panes_saved_state_alone() {
+        let config = std::env::temp_dir().join(format!("pc_test_pce_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("last_dirs"), "/left\n/right\n").unwrap();
+        state::test_dir::set(Some(config.clone()));
+        let (app, dir) = pce_on("state", "a.txt", Some("x"));
+        let cwd = env::current_dir().unwrap();
+        assert_eq!((&app.left.cwd, &app.right.cwd), (&cwd, &cwd));
+        app.save_state();
+        assert_eq!(
+            std::fs::read_to_string(config.join("last_dirs")).unwrap(),
+            "/left\n/right\n"
+        );
+        assert!(!config.join("sort").exists());
+        state::test_dir::set(None);
+        std::fs::remove_dir_all(&config).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

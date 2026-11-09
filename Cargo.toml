@@ -7,6 +7,8 @@ description = "Norton Commander-style dual-pane file manager for the terminal, m
 license = "MIT"
 repository = "https://github.com/piotrsrodka/peter-commander"
 readme = "README.md"
+# `pce` (src/bin/pce.rs) is only a launcher for this one.
+default-run = "peter-commander"
 keywords = ["file-manager", "tui", "terminal", "norton-commander"]
 categories = ["command-line-utilities", "filesystem"]
 # Only what `cargo install` needs; screenshots, packaging and CI stay on GitHub.
