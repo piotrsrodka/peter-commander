@@ -636,6 +636,9 @@ fn remove_temp(temp: &Path) {
 fn remove_read_only(temp: &Path) {
     if let Ok(meta) = fs::metadata(temp) {
         let mut permissions = meta.permissions();
+        // Windows only, where this just clears the read-only attribute
+        // (clippy's worry is Unix's world-writable bits).
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         let _ = fs::set_permissions(temp, permissions);
         let _ = fs::remove_file(temp);
@@ -726,6 +729,18 @@ fn write_over(path: &Path, contents: &[u8], follow_links: bool) -> Result<(), In
     io::Write::write_all(&mut file, contents).map_err(touched)?;
     file.set_len(contents.len() as u64).map_err(touched)?;
     file.sync_all().map_err(touched)
+}
+
+/// A fresh directory for a test, under its real name: the temp dir is
+/// another spelling of itself on macOS (`/var` → `/private/var`) and on
+/// Windows (`RUNNER~1`), while the app works with the real one wherever
+/// it resolves a path (a pane's `cd`, a directory moved into).
+#[cfg(test)]
+pub fn test_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    crate::pane::strip_verbatim_prefix(fs::canonicalize(&dir).unwrap())
 }
 
 /// Which file a path is, to tell it from another one put in its place

@@ -1170,6 +1170,8 @@ fn very_long_line_scrolls_horizontally_without_panic() {
 fn pseudo_random_key_storm_never_panics_or_corrupts() {
     let text = "zażółć gęślą jaźń\r\n\tTab😀\r\ne\u{301}\r\n\r\nŻÓŁW";
     let mut f = fx("storm", text);
+    f.key(K::F(4), M::NONE);
+    assert!(f.ed().full_screen);
     let keys: &[(K, M)] = &[
         (K::Left, M::NONE),
         (K::Right, M::NONE),
@@ -1229,7 +1231,12 @@ fn pseudo_random_key_storm_never_panics_or_corrupts() {
         if step % 97 == 0 {
             f.draw(25, 7);
         }
+        // Through the pane layout and back: full screen, Tab stays text
+        // (in the pane it hands the keyboard to the file list, and keys
+        // there could open whatever else is in the temp directory).
         if step % 500 == 0 {
+            f.key(K::F(4), M::NONE);
+            f.draw(25, 7);
             f.key(K::F(4), M::NONE);
         }
     }

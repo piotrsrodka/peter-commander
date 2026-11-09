@@ -1482,9 +1482,7 @@ mod tests {
     /// An app with the left pane on a fresh directory holding `a.txt`
     /// (`text`), selected — and, with `edit`, open in the editor.
     fn app_on_a_file(name: &str, text: &str, edit: bool) -> (App, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("pc_test_main_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fs_ops::test_dir(&format!("pc_test_main_{name}"));
         std::fs::write(dir.join("a.txt"), text).unwrap();
         let mut app = App::new().unwrap();
         app.left = pane::Pane::new(dir.clone(), false).unwrap();
@@ -2507,10 +2505,7 @@ mod tests {
 
     /// `pce` on `dir/name` (made with `text` unless `None`).
     fn pce_on(dir_name: &str, name: &str, text: Option<&str>) -> (App, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("pc_test_pce_{dir_name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = fs_ops::test_dir(&format!("pc_test_pce_{dir_name}"));
         if let Some(text) = text {
             std::fs::write(dir.join(name), text).unwrap();
         }

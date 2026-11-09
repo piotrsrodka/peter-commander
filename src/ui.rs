@@ -3698,9 +3698,7 @@ mod tests {
     /// An app editing a file holding `text`, drawn on an 80x24 screen.
     fn editing_app(name: &str, text: &str) -> (App, PathBuf) {
         use crate::pane::Pane;
-        let dir = std::env::temp_dir().join(format!("pc_test_ui_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::fs_ops::test_dir(&format!("pc_test_ui_{name}"));
         std::fs::write(dir.join("notes.txt"), text).unwrap();
         let mut app = App::new().unwrap();
         app.classic_style = false;
@@ -3751,7 +3749,10 @@ mod tests {
         assert!(right_title.contains("\u{2026}"), "{text}");
         // What the pane is, on the right of the same border.
         assert!(
-            right_title.contains("/notes.txt\u{2500}Editing\u{2510}"),
+            right_title.contains(&format!(
+                "{}notes.txt\u{2500}Editing\u{2510}",
+                std::path::MAIN_SEPARATOR
+            )),
             "{text}"
         );
         assert!(rows[2].contains("\u{2502}zażółć"), "{text}");
@@ -4095,7 +4096,10 @@ mod tests {
         let text = buffer_text(terminal.backend().buffer());
         let right = text.lines().nth(1).unwrap();
         let right = &right[right.find('\u{2510}').unwrap()..];
-        assert!(right.contains("/notes.txt\u{2500}"), "{text}");
+        assert!(
+            right.contains(&format!("{}notes.txt\u{2500}", std::path::MAIN_SEPARATOR)),
+            "{text}"
+        );
         assert!(right.ends_with("Preview\u{2510}"), "{text}");
         assert!(!text.contains("Preview:"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -4161,7 +4165,10 @@ mod tests {
         app.confirm_dialog().unwrap();
         let text = buffer_text(draw_app(&mut app).backend().buffer());
         let title = text.lines().nth(1).unwrap();
-        assert!(title.contains("/nowe.md\u{2500}"), "{text}");
+        assert!(
+            title.contains(&format!("{}nowe.md\u{2500}", std::path::MAIN_SEPARATOR)),
+            "{text}"
+        );
         assert!(dir.join("nowe.md").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }

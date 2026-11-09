@@ -269,6 +269,27 @@ struct EditedFileWatch {
     missing_once: bool,
 }
 
+/// `path` with its `.` and `..` taken out by name, as the user means them
+/// ("next to the file, one directory up") — not by resolving links, which
+/// would turn a path the panes show (`/var/…` on macOS, a short name on
+/// Windows) into another spelling of it that they don't recognise.
+fn without_dots(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// The F1 page about the built-in editor, which F1 opens straight onto from
 /// the editor: an index into `ui::HELP_PAGES` (which checks that it is).
 pub const EDITOR_HELP_PAGE: usize = 2;
@@ -2262,10 +2283,12 @@ impl App {
         let Some(path) = pane.selected_path() else {
             return;
         };
+        // The same file however its path is spelled (a link, `/var` and
+        // `/private/var` on macOS, a short name on Windows).
         if self
             .editor
             .as_ref()
-            .is_some_and(|editor| editor.path == path)
+            .is_some_and(|editor| editor.path == path || fs_ops::is_same_path(&editor.path, &path))
         {
             self.list_focus = false;
             return;
@@ -2664,15 +2687,7 @@ impl App {
         } else {
             base.map_or_else(|| typed.clone(), |dir| dir.join(&typed))
         };
-        // `..` and links resolved where the directory is there, so the
-        // file is recognised in a pane listing that directory.
-        Some(match (target.parent(), target.file_name()) {
-            (Some(dir), Some(name)) => match dir.canonicalize() {
-                Ok(dir) => crate::pane::strip_verbatim_prefix(dir).join(name),
-                Err(_) => target.clone(),
-            },
-            _ => target,
-        })
+        Some(without_dots(&target))
     }
 
     /// Saving onto `target`, which is there: asks first, No by default.
@@ -3807,8 +3822,7 @@ mod tests {
     /// An app on a fresh temp directory holding `files`, the first one
     /// selected, with the built-in editor on.
     fn app_with_files(name: &str, files: &[(&str, &[u8])]) -> (App, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("pc_test_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = fs_ops::test_dir(&format!("pc_test_{name}"));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         for (file, contents) in files {
             std::fs::write(dir.join(file), contents).unwrap();
@@ -4307,7 +4321,21 @@ mod tests {
     /// `seconds` from now: a change the panes notice, with no waiting.
     fn touch(path: &Path, seconds: u64) {
         let at = std::time::SystemTime::now() + Duration::from_secs(seconds);
-        std::fs::File::open(path).unwrap().set_modified(at).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true);
+        // Windows opens a directory only with backup semantics.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        // Unix opens a directory read-only, which is all futimens needs.
+        #[cfg(unix)]
+        if path.is_dir() {
+            options.write(false).read(true);
+        }
+        options.open(path).unwrap().set_modified(at).unwrap();
     }
 
     #[test]
@@ -4787,7 +4815,7 @@ mod tests {
         app.confirm_dialog().unwrap();
         let note = app.error_dialog.take().unwrap();
         assert!(
-            note.contains(&dir.join("moved/in.txt").display().to_string()),
+            note.contains(&dir.join("moved").join("in.txt").display().to_string()),
             "{note}"
         );
         assert_eq!(app.editor.as_ref().unwrap().path, dir.join("sub/in.txt"));
