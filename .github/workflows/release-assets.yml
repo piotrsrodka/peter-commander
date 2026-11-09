@@ -1,8 +1,9 @@
 name: Release Assets
 
-# Builds a Windows binary and attaches it to a GitHub Release — triggered
-# automatically when a release is published, or manually (workflow_dispatch)
-# to backfill an existing release.
+# Builds the Windows binaries (peter-commander.exe, and the pce.exe launcher
+# that runs it from beside it) and attaches them to a GitHub Release —
+# triggered automatically when a release is published, or manually
+# (workflow_dispatch) to backfill an existing release.
 
 on:
   release:
@@ -31,4 +32,4 @@ jobs:
     - name: Upload to GitHub Release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: gh release upload ${{ github.event.release.tag_name || inputs.tag }} target/release/peter-commander.exe --clobber
+      run: gh release upload ${{ github.event.release.tag_name || inputs.tag }} target/release/peter-commander.exe target/release/pce.exe --clobber

@@ -1,6 +1,6 @@
 [package]
 name = "peter-commander"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 authors = ["Piotr Śródka <piotr.srodka@hey.com>"]
 description = "Norton Commander-style dual-pane file manager for the terminal, made for Omarchy"

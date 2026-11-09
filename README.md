@@ -167,7 +167,8 @@ No sudo needed. Installs to `~/.local/bin` and sets up a `pc` alias.
 
 Download `peter-commander.exe` from the
 [latest release](https://github.com/piotrsrodka/peter-commander/releases/latest)
-and run it — no installer needed.
+and run it — no installer needed. For `pce`, put `pce.exe` from the same
+release in the same folder.
 
 ---
 
