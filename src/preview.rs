@@ -1,8 +1,12 @@
+use std::cell::RefCell;
 use std::fs;
 use std::fs::File;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::SystemTime;
 
+use crate::editor::{self, LineLayout};
 use crate::pane::Pane;
 
 /// How much of a file's start is read for the quick-view preview and to
@@ -34,11 +38,27 @@ pub enum PreviewContent {
     /// Sniffed as binary (contains a NUL byte in the sampled prefix) — shown
     /// as just a size, never dumped as text.
     Binary(u64),
-    Text(Vec<String>),
+    /// Shared with the cache (see `read_file`), so showing it again costs
+    /// nothing.
+    Text(Rc<Vec<String>>),
     Error(String),
 }
 
 impl PreviewContent {
+    /// The same content (text shared, not copied), for what the cache keeps.
+    fn shallow_clone_if_cacheable(&self) -> Option<Self> {
+        match self {
+            PreviewContent::Text(lines) => Some(PreviewContent::Text(Rc::clone(lines))),
+            PreviewContent::Binary(size) => Some(PreviewContent::Binary(*size)),
+            _ => None,
+        }
+    }
+
+    fn shallow_clone(&self) -> Self {
+        self.shallow_clone_if_cacheable()
+            .unwrap_or(PreviewContent::Empty)
+    }
+
     pub fn line_count(&self) -> usize {
         match self {
             PreviewContent::Text(lines) => lines.len(),
@@ -47,23 +67,71 @@ impl PreviewContent {
         }
     }
 
-    /// Like `line_count`, but for `Text` it's the number of rows the
-    /// content actually renders to once word-wrapped to `width` — a long
-    /// logical line can span several visual rows. Scroll clamping (so the
-    /// last line lands at the bottom instead of getting cut off) needs
-    /// this, not the logical count, once wrapping is in play.
-    pub fn wrapped_line_count(&self, width: u16) -> usize {
+    /// How many screen rows the content takes in a preview `width` cells
+    /// wide: for `Text` with `wrap` (the editor's Wrap Lines, shared), a
+    /// long line spans several, broken exactly where the editor breaks it.
+    /// Scroll clamping (so the last line lands at the bottom instead of
+    /// getting cut off) needs this, not the count of lines.
+    pub fn screen_row_count(&self, width: usize, wrap: bool) -> usize {
         match self {
-            PreviewContent::Text(lines) => {
-                let rendered: Vec<ratatui::text::Line> =
-                    lines.iter().map(|line| line.as_str().into()).collect();
-                ratatui::widgets::Paragraph::new(rendered)
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .line_count(width)
+            PreviewContent::Text(lines) if wrap => {
+                lines.iter().map(|line| rows_of(line, width).len()).sum()
             }
             _ => self.line_count(),
         }
     }
+
+    /// The screen row at which text line `line` starts, in the same terms.
+    pub fn first_row_of(&self, line: usize, width: usize, wrap: bool) -> usize {
+        match self {
+            PreviewContent::Text(lines) if wrap => lines
+                .iter()
+                .take(line)
+                .map(|line| rows_of(line, width).len())
+                .sum(),
+            _ => line,
+        }
+    }
+
+    /// The text line screen row `row` belongs to (the inverse of
+    /// `first_row_of`), for keeping the same place when wrapping is
+    /// switched.
+    pub fn line_at_row(&self, row: usize, width: usize, wrap: bool) -> usize {
+        match self {
+            PreviewContent::Text(lines) if wrap => {
+                let mut seen = 0;
+                for (idx, line) in lines.iter().enumerate() {
+                    seen += rows_of(line, width).len();
+                    if seen > row {
+                        return idx;
+                    }
+                }
+                lines.len()
+            }
+            _ => row,
+        }
+    }
+
+    /// Cells the widest text line takes unwrapped: how far the preview can
+    /// scroll sideways.
+    pub fn widest_line(&self) -> usize {
+        match self {
+            PreviewContent::Text(lines) => lines
+                .iter()
+                .map(|line| {
+                    let layout = LineLayout::new(line, None);
+                    layout.x_of(0, layout.chars.len())
+                })
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+}
+
+/// Where the rows of `line` start, wrapped for a preview `width` cells wide.
+pub fn rows_of(line: &str, width: usize) -> Vec<usize> {
+    LineLayout::new(line, Some(editor::wrap_width_for(width))).starts
 }
 
 pub fn build_preview(pane: &Pane) -> PreviewContent {
@@ -84,16 +152,50 @@ pub fn build_preview(pane: &Pane) -> PreviewContent {
     // Opening a named pipe blocks until something writes to it (and reading
     // a device can block or never end), which froze the whole UI; only
     // regular files get read.
-    match fs::metadata(&path) {
+    let meta = match fs::metadata(&path) {
         Ok(meta) if !meta.is_file() => {
             return PreviewContent::Error(
                 "Special file (pipe, socket or device): not previewed".to_string(),
             );
         }
-        Ok(_) => {}
+        Ok(meta) => meta,
         Err(err) => return PreviewContent::Error(err.to_string()),
+    };
+    read_file(&path, &meta)
+}
+
+/// The file last read for the preview: which one, and as it was then.
+type CachedFile = ((PathBuf, Option<SystemTime>, u64), PreviewContent);
+
+thread_local! {
+    /// The preview of the last file read, while it stays as it was: it's
+    /// asked for on every redraw (and by find, scrolling and the F-key bar),
+    /// and reading up to a megabyte each time for the same answer was a
+    /// waste. A file that changes gets a new modification time or size,
+    /// and is read again — which is how the quick view follows it.
+    static LAST_FILE: RefCell<Option<CachedFile>> = const { RefCell::new(None) };
+}
+
+fn read_file(path: &Path, meta: &fs::Metadata) -> PreviewContent {
+    let key = (path.to_path_buf(), meta.modified().ok(), meta.len());
+    let cached = LAST_FILE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(at, _)| *at == key)
+            .map(|(_, content)| content.shallow_clone())
+    });
+    if let Some(content) = cached {
+        return content;
     }
-    let mut file = match File::open(&path) {
+    let content = read_file_now(path, meta.len());
+    if let Some(copy) = content.shallow_clone_if_cacheable() {
+        LAST_FILE.with(|cell| *cell.borrow_mut() = Some((key, copy)));
+    }
+    content
+}
+
+fn read_file_now(path: &Path, size: u64) -> PreviewContent {
+    let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) => return PreviewContent::Error(err.to_string()),
     };
@@ -105,10 +207,13 @@ pub fn build_preview(pane: &Pane) -> PreviewContent {
     buf.truncate(read);
 
     if buf.contains(&0u8) {
-        PreviewContent::Binary(entry.size)
+        PreviewContent::Binary(size)
     } else {
         let text = String::from_utf8_lossy(&buf).into_owned();
-        PreviewContent::Text(text.lines().map(str::to_string).collect())
+        // An invisible byte order mark, dropped as the editor drops it, so
+        // the text (and find's columns in it) are the same in both.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        PreviewContent::Text(Rc::new(text.lines().map(str::to_string).collect()))
     }
 }
 

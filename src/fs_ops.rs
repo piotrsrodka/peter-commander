@@ -453,13 +453,229 @@ fn mount_topdir<'a>(path: &Path, mounts: &'a [PathBuf]) -> &'a Path {
         .map_or(Path::new("/"), PathBuf::as_path)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn is_writable(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
     unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Saves `contents` as the file at `path` so that a failure part-way (a full
+/// disk, a crash) can't leave it half written: the new text goes to a temp
+/// file beside it (readable by nobody else while it's being written), is
+/// flushed to disk and given the old file's group and permissions, and only
+/// then renamed over it. Where that rename would turn the file into a
+/// different one — a hard link shared with other names, a file owned by
+/// someone else, a group that can't be kept — or no temp file can be made in
+/// its directory, it's written in place instead. A symlink is followed, even
+/// one whose target has gone, so it stays a link. A read-only file is
+/// refused, as Notepad does, rather than quietly replaced.
+pub fn write_file_safely(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let target = link_target(path);
+    let meta = match fs::metadata(&target) {
+        Ok(meta) => meta,
+        // Nothing there (any more): nothing to protect, so just create it.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return write_in_place(&target, contents);
+        }
+        Err(err) => return Err(err),
+    };
+    if meta.permissions().readonly() || !may_write(&target) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the file is read-only",
+        ));
+    }
+    if !meta.is_file() || !replacing_keeps_identity(&meta) {
+        return write_in_place(&target, contents);
+    }
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return write_in_place(&target, contents);
+    };
+    match create_temp(dir, &name.to_string_lossy()) {
+        Ok((temp, file)) => replace_with(&temp, file, &target, &meta, contents),
+        // E.g. a writable file in a read-only directory.
+        Err(_) => write_in_place(&target, contents),
+    }
+}
+
+/// Where `path` really is: symlinks followed all the way, including the
+/// last one of a chain whose target no longer exists (saving then creates
+/// that target, instead of replacing the link with a file).
+fn link_target(path: &Path) -> PathBuf {
+    if let Ok(target) = fs::canonicalize(path) {
+        return target;
+    }
+    let mut target = path.to_path_buf();
+    // A bound, for a loop of links.
+    for _ in 0..40 {
+        let Ok(next) = fs::read_link(&target) else {
+            break;
+        };
+        target = match target.parent() {
+            Some(dir) => dir.join(next),
+            None => next,
+        };
+    }
+    target
+}
+
+/// A new, empty temp file in `dir` for saving the file `name`: hidden, with
+/// a name no other save (another PC, another moment) is using, and on Unix
+/// readable and writable by its owner only until it's done.
+fn create_temp(dir: &Path, name: &str) -> io::Result<(PathBuf, fs::File)> {
+    let mut attempt = 0;
+    loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        let temp = dir.join(format!(
+            ".{name}.pc-save-{}-{nanos:08x}",
+            std::process::id()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists && attempt < 3 => {
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Fills the temp file and renames it over `target`; whatever fails, the
+/// temp file is gone afterwards and `target` is as it was.
+fn replace_with(
+    temp: &Path,
+    mut file: fs::File,
+    target: &Path,
+    meta: &fs::Metadata,
+    contents: &[u8],
+) -> io::Result<()> {
+    let written = (|| {
+        io::Write::write_all(&mut file, contents)?;
+        // The group first: changing it may clear the setgid bit, which the
+        // permissions then put back.
+        if !keep_group(&file, meta)? {
+            return Ok(false);
+        }
+        file.set_permissions(meta.permissions())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(temp, target)?;
+        sync_dir(target);
+        Ok(true)
+    })();
+    match written {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            remove_temp(temp);
+            write_in_place(target, contents)
+        }
+        Err(err) => {
+            remove_temp(temp);
+            Err(err)
+        }
+    }
+}
+
+/// Gives the temp file the group of the file it replaces, so whoever shared
+/// that file through its group still can. `false` when it can't be (a
+/// group the user isn't in): the file is then better written in place.
+#[cfg(unix)]
+fn keep_group(file: &fs::File, meta: &fs::Metadata) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    if file.metadata()?.gid() == meta.gid() {
+        return Ok(true);
+    }
+    Ok(std::os::unix::fs::fchown(file, None, Some(meta.gid())).is_ok())
+}
+
+#[cfg(not(unix))]
+fn keep_group(_file: &fs::File, _meta: &fs::Metadata) -> io::Result<bool> {
+    Ok(true)
+}
+
+/// Makes the rename itself survive a power cut. Best effort: not every
+/// file system lets a directory be synced.
+fn sync_dir(target: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = target.parent()
+        && let Ok(dir) = fs::File::open(dir)
+    {
+        let _ = dir.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = target;
+}
+
+fn remove_temp(temp: &Path) {
+    if fs::remove_file(temp).is_err() {
+        remove_read_only(temp);
+    }
+}
+
+/// Windows won't delete a read-only file: takes that off first.
+#[cfg(windows)]
+fn remove_read_only(temp: &Path) {
+    if let Ok(meta) = fs::metadata(temp) {
+        let mut permissions = meta.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(temp, permissions);
+        let _ = fs::remove_file(temp);
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_read_only(_temp: &Path) {}
+
+/// Whether a file renamed over this one would still be "the same file" to
+/// everyone else.
+#[cfg(unix)]
+fn replacing_keeps_identity(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink() <= 1 && meta.uid() == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn replacing_keeps_identity(_meta: &fs::Metadata) -> bool {
+    true
+}
+
+/// Whether this user may write to `path` — on Unix more than the
+/// permission bits tell (another owner's bits, ACLs, a read-only mount).
+#[cfg(unix)]
+fn may_write(path: &Path) -> bool {
+    is_writable(path)
+}
+
+#[cfg(not(unix))]
+fn may_write(_path: &Path) -> bool {
+    true
+}
+
+/// Writes over the file where it is. The path is already the real file, so
+/// on Unix a symlink put in its place meanwhile is refused, not followed.
+fn write_in_place(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    io::Write::write_all(&mut file, contents)?;
+    file.sync_all()
 }
 
 pub fn delete_recursive(path: &Path) -> Result<()> {
@@ -474,6 +690,185 @@ pub fn delete_recursive(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_replaces_the_contents_and_keeps_permissions() {
+        let dir = std::env::temp_dir().join("pc_test_write_safely");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        fs::write(&path, "old text that is longer").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+        }
+        write_file_safely(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o751);
+        }
+        // No temp file left behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_or_hard_link_keeps_the_link() {
+        let dir = std::env::temp_dir().join("pc_test_write_safely_links");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        fs::write(&real, "old").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_file_safely(&link, b"via symlink").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&real).unwrap(), b"via symlink");
+
+        // Renaming a new file over one name would leave the other name on
+        // the old text.
+        let hard = dir.join("hard.txt");
+        fs::hard_link(&real, &hard).unwrap();
+        write_file_safely(&hard, b"via hard link").unwrap();
+        assert_eq!(fs::read(&real).unwrap(), b"via hard link");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The tests below can't use permissions to make something unwritable
+    /// when run as root, who may write anything.
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saving_refuses_a_read_only_file_and_leaves_it_alone() {
+        let dir = fresh_dir("pc_test_write_safely_readonly");
+        let path = dir.join("a.txt");
+        fs::write(&path, "old").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        let err = write_file_safely(&path, b"new").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("read-only"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_in_a_read_only_directory_writes_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        if is_root() {
+            return;
+        }
+        let dir = fresh_dir("pc_test_write_safely_readonly_dir");
+        let path = dir.join("a.txt");
+        fs::write(&path, "old text").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let saved = write_file_safely(&path, b"new");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        saved.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_files_group() {
+        use std::os::unix::fs::MetadataExt;
+        // Needs a second group of the user's own to give the file.
+        let mut groups = vec![0; 64];
+        let count = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+        let own = unsafe { libc::getegid() };
+        let Some(&other) = groups[..count.max(0) as usize]
+            .iter()
+            .find(|&&gid| gid != own)
+        else {
+            return;
+        };
+        let dir = fresh_dir("pc_test_write_safely_group");
+        let path = dir.join("shared.txt");
+        fs::write(&path, "old").unwrap();
+        std::os::unix::fs::chown(&path, None, Some(other)).unwrap();
+        write_file_safely(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::metadata(&path).unwrap().gid(), other);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_dangling_symlink_keeps_the_link() {
+        let dir = fresh_dir("pc_test_write_safely_dangling");
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink("gone.txt", &link).unwrap();
+        write_file_safely(&link, b"back").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(dir.join("gone.txt")).unwrap(), b"back");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_files_are_private_while_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_dir("pc_test_write_safely_temp_mode");
+        let (temp, _file) = create_temp(&dir, "secret.env").unwrap();
+        let mode = fs::metadata(&temp).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".secret.env.pc-save-"), "{name}");
+        // Another save at the same moment gets a file of its own.
+        let (second, _file) = create_temp(&dir, "secret.env").unwrap();
+        assert_ne!(temp, second);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_replace_leaves_no_temp_file_and_the_target_alone() {
+        let dir = fresh_dir("pc_test_write_safely_fails");
+        // A directory with something in it can't be renamed over.
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside.txt"), "kept").unwrap();
+        let meta = fs::metadata(&target).unwrap();
+        let (temp, file) = create_temp(&dir, "target").unwrap();
+        assert!(replace_with(&temp, file, &target, &meta, b"new").is_err());
+        assert!(!temp.exists());
+        assert_eq!(fs::read(target.join("inside.txt")).unwrap(), b"kept");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn copies_file() {

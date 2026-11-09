@@ -1172,6 +1172,7 @@ dependencies = [
  "shell-words",
  "signal-hook 0.4.4",
  "trash",
+ "unicode-width",
 ]
 
 [[package]]

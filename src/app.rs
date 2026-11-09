@@ -4,15 +4,18 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::bulk_rename::{self, Plan};
+use crate::clipboard::Clipboard;
+use crate::editor::{self, Command as EditorCommand, Editor};
 use crate::fs_ops;
 use crate::image_preview::ImagePreview;
 use crate::job::Job;
 use crate::logging;
-use crate::menu::{Action, MENU_BAR};
+use crate::menu::{self, Action, MenuCategory};
 use crate::pane::{Pane, SortKey};
 use crate::preview;
 use crate::state;
@@ -116,6 +119,14 @@ pub enum Dialog {
         plan: Plan,
     },
     ConfirmQuit,
+    /// Closing the built-in editor (or quitting) with unsaved changes:
+    /// Save, Don't Save or Cancel, as in Notepad — never silently lost.
+    UnsavedChanges {
+        /// Quit once the editor is closed, if this was Quit.
+        quit_after: bool,
+        /// The focused button: 0 Save, 1 Don't Save, 2 Cancel.
+        focused: usize,
+    },
     Settings {
         selected: usize,
         /// Values as they were when the dialog opened, so Esc can revert
@@ -129,6 +140,8 @@ pub enum SettingItem {
     WaitAfterShellCommand,
     HideHiddenFiles,
     InternalPreview,
+    BuiltinEditor,
+    EditorFocusMode,
     MouseCapture,
     ClassicStyle,
     StartLeftInCwd,
@@ -142,6 +155,8 @@ impl SettingItem {
         SettingItem::WaitAfterShellCommand,
         SettingItem::HideHiddenFiles,
         SettingItem::InternalPreview,
+        SettingItem::BuiltinEditor,
+        SettingItem::EditorFocusMode,
         SettingItem::MouseCapture,
         SettingItem::ClassicStyle,
         SettingItem::StartLeftInCwd,
@@ -164,6 +179,12 @@ impl SettingItem {
             }
             SettingItem::InternalPreview => {
                 [("External pager (F3)", false), ("Built-in preview", true)]
+            }
+            SettingItem::BuiltinEditor => {
+                [("Built-in editor (F4)", true), ("External editor", false)]
+            }
+            SettingItem::EditorFocusMode => {
+                [("Regular editor view", false), ("Focus mode editor", true)]
             }
             SettingItem::MouseCapture => [("Terminal mouse", false), ("App mouse clicks", true)],
             SettingItem::ClassicStyle => [
@@ -190,6 +211,8 @@ impl SettingItem {
             SettingItem::WaitAfterShellCommand => "wait_after_shell_command",
             SettingItem::HideHiddenFiles => "hide_hidden_files",
             SettingItem::InternalPreview => "internal_preview",
+            SettingItem::BuiltinEditor => "builtin_editor",
+            SettingItem::EditorFocusMode => "editor_focus_mode",
             SettingItem::MouseCapture => "mouse_capture",
             SettingItem::ClassicStyle => "classic_style",
             SettingItem::StartLeftInCwd => "start_left_in_cwd",
@@ -198,6 +221,45 @@ impl SettingItem {
             SettingItem::ColumnHeaders => "column_headers",
         }
     }
+}
+
+/// Wrap Lines, for the editor and the quick view alike: kept with the
+/// settings but not in the Settings dialog, since it's switched from the
+/// menus (Options, and the editor's Edit).
+const WRAP_LINES_KEY: &str = "wrap_lines";
+
+/// The F1 page about the built-in editor, which F1 opens straight onto from
+/// the editor: an index into `ui::HELP_PAGES` (which checks that it is).
+pub const EDITOR_HELP_PAGE: usize = 2;
+
+/// Ctrl+F in F3's quick view of a text file: the editor's own search, run on
+/// an editor holding the text the preview shows (never shown itself, never
+/// saved) — its find bar, matches and selection are what the preview
+/// highlights.
+pub struct PreviewFind {
+    /// The previewed file this is for; another one starts afresh.
+    pub target: PathBuf,
+    pub text: Editor,
+    /// The preview only loads the start of a big file, and so only that is
+    /// searched.
+    pub truncated: bool,
+    /// The text it searches, as the preview had it: a file that changes
+    /// under the quick view gets a fresh find (see `refresh_from_disk`).
+    source: std::rc::Rc<Vec<String>>,
+}
+
+/// What the other pane showed before F4 put the editor there, brought back
+/// when it closes: typically F3's quick view of the same file, scrolled
+/// where it was.
+#[derive(Debug, Clone, Copy)]
+struct ViewBeforeEditor {
+    quick_view: bool,
+    preview_focus: bool,
+    preview_scroll: usize,
+    preview_scroll_x: usize,
+    /// Wrap Lines then: switched in the editor meanwhile, the scroll is
+    /// brought over to the new rows.
+    wrap_lines: bool,
 }
 
 /// A request to suspend the TUI and hand the terminal to an external
@@ -258,6 +320,9 @@ pub struct App {
     /// keypress to dismiss so it can't be missed. Not shown for routine
     /// confirmations (`set_status`), only real failures (`set_error`).
     pub error_dialog: Option<String>,
+    /// The popup in `error_dialog` is a plain note rather than a failure
+    /// (`set_notice`): drawn like any other dialog, not in alarm red.
+    pub error_dialog_is_notice: bool,
     pub command_line: String,
     /// While Command > Quick Search is active: what's been typed so far
     /// (shown in place of the command line), the cursor jumping to the
@@ -289,6 +354,9 @@ pub struct App {
     pub preview_focus: bool,
     /// Lines scrolled down within the current preview's in-memory buffer.
     pub preview_scroll: usize,
+    /// How far the quick view is scrolled sideways, in cells — only while
+    /// Wrap Lines is off.
+    pub preview_scroll_x: usize,
     /// The path the preview was last built for, so a change in selection
     /// (arrow keys, entering a directory, cd, ...) can reset the scroll
     /// position for the newly previewed entry.
@@ -299,6 +367,28 @@ pub struct App {
     /// $PAGER/less, per the "F3 View uses the internal quick preview"
     /// setting.
     pub internal_preview: bool,
+    /// Whether F4 edits in the built-in editor rather than $EDITOR, per the
+    /// "Built-in editor" setting.
+    pub builtin_editor: bool,
+    /// The "Focus mode editor" setting: the full-screen editor hides the
+    /// menu bar until F9 or Alt+letter calls it up.
+    pub editor_focus_mode: bool,
+    /// Edit > Wrap Lines, for every file the built-in editor opens.
+    pub wrap_lines: bool,
+    /// The file open in the built-in editor, if any. While it's open it has
+    /// the keyboard (after any dialog or the menu on top of it).
+    pub editor: Option<Editor>,
+    /// Find in the quick view, for the file it shows.
+    pub preview_find: Option<PreviewFind>,
+    /// What the quick view's find looked for last, kept from one previewed
+    /// file to the next for F3.
+    preview_last_search: String,
+    view_before_editor: Option<ViewBeforeEditor>,
+    pub clipboard: Clipboard,
+    /// Screen areas of the editor in the last drawn frame — its whole box,
+    /// and just the text inside — for the mouse.
+    pub editor_area: Rect,
+    pub editor_text_area: Rect,
     /// Whether the terminal's mouse reporting should be claimed at all.
     /// When off, scroll/click inside PC do nothing, but the terminal's own
     /// native mouse behavior (its scrollback, text selection, any
@@ -357,7 +447,7 @@ pub struct App {
     /// for F9, which opens the menu instead of running an action).
     pub fn_key_tiles: Vec<(Rect, Option<Action>)>,
     /// Clickable regions of the top menu bar's category labels (File,
-    /// Options, Command), paired with each one's index into `MENU_BAR`.
+    /// Options, Command), paired with each one's index into the menu bar.
     pub menu_bar_tiles: Vec<(Rect, usize)>,
     /// Clickable regions of the open dropdown's items, paired with each
     /// one's index into the current category's item list. Empty unless
@@ -367,6 +457,10 @@ pub struct App {
     /// duplicate events some terminals/compositors emit for a single
     /// physical wheel click (see `debounced_scroll`).
     last_scroll_at: Option<Instant>,
+    /// When the panes were last checked for changes on disk.
+    last_refresh_check: Option<Instant>,
+    /// A note from that check, waiting for whatever's open to close.
+    pending_notice: Option<String>,
 }
 
 /// Directories named on the command line (`pc LEFT [RIGHT]`), already
@@ -379,9 +473,13 @@ pub struct StartDirs {
 }
 
 impl App {
+    /// For tests: with no saved state to start from (see `state::test_dir`)
+    /// and PC's own clipboard, so a test can never touch the desktop's.
     #[cfg(test)]
     pub fn new() -> Result<Self> {
-        Self::with_start_dirs(StartDirs::default())
+        let mut app = Self::with_start_dirs(StartDirs::default())?;
+        app.clipboard = Clipboard::internal();
+        Ok(app)
     }
 
     pub fn with_start_dirs(start_dirs: StartDirs) -> Result<Self> {
@@ -416,6 +514,15 @@ impl App {
             .get(SettingItem::InternalPreview.key())
             .copied()
             .unwrap_or(true);
+        let builtin_editor = saved_settings
+            .get(SettingItem::BuiltinEditor.key())
+            .copied()
+            .unwrap_or(true);
+        let editor_focus_mode = saved_settings
+            .get(SettingItem::EditorFocusMode.key())
+            .copied()
+            .unwrap_or(false);
+        let wrap_lines = saved_settings.get(WRAP_LINES_KEY).copied().unwrap_or(false);
         let mouse_capture = saved_settings
             .get(SettingItem::MouseCapture.key())
             .copied()
@@ -449,6 +556,7 @@ impl App {
             logs_open: false,
             about_open: false,
             error_dialog: None,
+            error_dialog_is_notice: false,
             command_line: String::new(),
             quick_search: None,
             job: None,
@@ -459,9 +567,20 @@ impl App {
             quick_view: false,
             preview_focus: false,
             preview_scroll: 0,
+            preview_scroll_x: 0,
             last_preview_target: None,
             image_preview: ImagePreview::default(),
             internal_preview,
+            builtin_editor,
+            editor_focus_mode,
+            wrap_lines,
+            editor: None,
+            preview_find: None,
+            preview_last_search: String::new(),
+            view_before_editor: None,
+            clipboard: Clipboard::new(),
+            editor_area: Rect::default(),
+            editor_text_area: Rect::default(),
             mouse_capture,
             classic_style,
             start_left_in_cwd,
@@ -480,6 +599,8 @@ impl App {
             menu_bar_tiles: Vec::new(),
             menu_item_tiles: Vec::new(),
             last_scroll_at: None,
+            last_refresh_check: None,
+            pending_notice: None,
         };
         app.restore_sorts();
         Ok(app)
@@ -535,6 +656,17 @@ impl App {
         logging::log_error(&message);
         self.status_message = message.clone();
         self.error_dialog = Some(message);
+        self.error_dialog_is_notice = false;
+    }
+
+    /// Something worth a moment's notice that isn't a failure (a paste cut
+    /// to its first line): the same popup as `set_error`, but titled and
+    /// colored as an ordinary note.
+    pub fn set_notice(&mut self, message: String) {
+        logging::log_info(&message);
+        self.status_message = message.clone();
+        self.error_dialog = Some(message);
+        self.error_dialog_is_notice = true;
     }
 
     /// Records a routine status confirmation (e.g. "Deleted x.txt") to the
@@ -609,6 +741,29 @@ impl App {
         let has_real_selection = entry.is_some_and(|e| e.name != "..");
         let selection_is_file = entry.is_some_and(|e| e.name != ".." && !e.is_dir);
 
+        // While editing, the menus don't offer what would act on the panes
+        // behind the editor (see `menu::EDITOR_MENU_BAR`); this keeps any
+        // other way to it shut as well.
+        if self.editor.is_some()
+            && !matches!(
+                action,
+                Action::Save
+                    | Action::Rename
+                    | Action::Close
+                    | Action::WrapLines
+                    | Action::SelectAll
+                    | Action::Find
+                    | Action::FindNext
+                    | Action::Help
+                    | Action::Settings
+                    | Action::About
+                    | Action::ShowLogs
+                    | Action::Quit
+            )
+        {
+            return false;
+        }
+
         match action {
             // Also enabled for executables: Open runs `open_selected`,
             // which already runs them directly (same as pressing Enter).
@@ -627,6 +782,9 @@ impl App {
             Action::RenameSelected => self.active_pane_ref().marked.len() >= 2,
             Action::ShowProgress => self.job.is_some(),
             Action::Separator => false,
+            Action::Save | Action::Close | Action::SelectAll | Action::Find | Action::FindNext => {
+                self.editor.is_some()
+            }
             Action::MkDir
             | Action::NewFile
             | Action::SelectFiles
@@ -638,6 +796,7 @@ impl App {
             | Action::SortBySize
             | Action::SortByDate
             | Action::Help
+            | Action::WrapLines
             | Action::Settings
             | Action::About
             | Action::ShowTerminal
@@ -672,12 +831,43 @@ impl App {
         is_duplicate
     }
 
-    /// Rows the current preview actually renders to once wrapped to its
-    /// pane's width — the right unit for clamping scroll, since a long
-    /// logical line can span several visual rows.
+    /// Rows the current preview actually renders to (wrapped, with Wrap
+    /// Lines on) — the right unit for clamping scroll, since a long logical
+    /// line can span several visual rows.
     fn preview_wrapped_line_count(&self) -> usize {
         preview::build_preview(self.active_pane_ref())
-            .wrapped_line_count(self.preview_visible_width as u16)
+            .screen_row_count(self.preview_visible_width, self.wrap_lines)
+    }
+
+    /// Left/Right with the focus on a preview that isn't wrapped: scrolls it
+    /// sideways, a tab stop at a time, no further than the widest line
+    /// needs to show its end.
+    pub fn scroll_preview_sideways(&mut self, right: bool) {
+        if self.wrap_lines {
+            return;
+        }
+        let step = crate::editor::TAB_WIDTH;
+        if right {
+            let max = preview::build_preview(self.active_pane_ref())
+                .widest_line()
+                .saturating_sub(self.preview_visible_width);
+            self.preview_scroll_x = (self.preview_scroll_x + step).min(max);
+        } else {
+            self.preview_scroll_x = self.preview_scroll_x.saturating_sub(step);
+        }
+    }
+
+    /// Edit > Wrap Lines or Options > Wrap Lines, while the quick view shows
+    /// text: the same line stays at the top, though the rows above it now
+    /// count differently.
+    fn rescroll_preview_for_wrap(&mut self, was_wrapped: bool, scroll: usize) -> usize {
+        let content = preview::build_preview(self.active_pane_ref());
+        let width = self.preview_visible_width;
+        let line = content.line_at_row(scroll, width, was_wrapped);
+        let max = content
+            .screen_row_count(width, self.wrap_lines)
+            .saturating_sub(self.preview_visible_lines);
+        content.first_row_of(line, width, self.wrap_lines).min(max)
     }
 
     pub fn scroll_preview_up(&mut self) {
@@ -718,6 +908,256 @@ impl App {
         self.preview_scroll = (self.preview_scroll + page).min(max);
     }
 
+    /// The quick view's find, for the file it shows now: made on first use
+    /// (carrying the last search over), and only for text. `false` when
+    /// there's nothing to search.
+    fn ensure_preview_find(&mut self) -> bool {
+        let pane = self.active_pane_ref();
+        let Some(target) = pane.preview_target() else {
+            return false;
+        };
+        if self
+            .preview_find
+            .as_ref()
+            .is_some_and(|find| find.target == target)
+        {
+            return true;
+        }
+        let truncated = pane
+            .selected_entry()
+            .is_some_and(|entry| entry.size > preview::PREVIEW_READ_LIMIT as u64);
+        let preview::PreviewContent::Text(lines) = preview::build_preview(pane) else {
+            return false;
+        };
+        let Ok(mut text) = Editor::from_bytes(target.clone(), lines.join("\n").as_bytes()) else {
+            return false;
+        };
+        text.set_last_search(&self.preview_last_search);
+        self.preview_find = Some(PreviewFind {
+            target,
+            text,
+            truncated,
+            source: lines,
+        });
+        true
+    }
+
+    /// Whether the quick view has the keyboard and something to find, so
+    /// that F3 is Find Next there rather than closing it (and its F-key
+    /// tile says so).
+    pub fn preview_next_mode(&self) -> bool {
+        if self.editor.is_some() || !self.quick_view || !self.preview_focus {
+            return false;
+        }
+        if self.preview_find_bar_open() {
+            return true;
+        }
+        !self.preview_last_search.is_empty()
+            && matches!(
+                preview::build_preview(self.active_pane_ref()),
+                preview::PreviewContent::Text(_)
+            )
+    }
+
+    pub fn preview_find_bar_open(&self) -> bool {
+        self.preview_find
+            .as_ref()
+            .is_some_and(|find| find.text.find.is_some())
+    }
+
+    /// Ctrl+F with the focus on the quick view: its find bar, for a text
+    /// file. Returns whether there was one to open (not for a listing, a
+    /// binary file or a picture).
+    pub fn open_preview_find(&mut self) -> bool {
+        if !self.ensure_preview_find() {
+            return false;
+        }
+        self.run_preview_find(|text| text.apply(EditorCommand::Find));
+        true
+    }
+
+    /// A key while the quick view's find bar is open. Typing and the bar's
+    /// keys go to it; `false` for any other key, for the caller to treat
+    /// as usual (scrolling the preview, say).
+    pub fn preview_find_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if !self.preview_find_bar_open() {
+            return false;
+        }
+        let Some(key) = editor::find_bar_key(code, modifiers) else {
+            return false;
+        };
+        self.run_preview_find(|text| text.find_key(key));
+        true
+    }
+
+    /// F3/Shift+F3 in the quick view: the next/previous match, the bar open
+    /// or not.
+    pub fn preview_find_next(&mut self, forward: bool) {
+        if !self.ensure_preview_find() {
+            return;
+        }
+        let command = if forward {
+            EditorCommand::FindNext
+        } else {
+            EditorCommand::FindPrevious
+        };
+        self.run_preview_find(|text| text.apply(command));
+    }
+
+    /// Esc in the quick view with a match highlighted (the bar closed):
+    /// lets go of it. Returns whether there was one.
+    pub fn clear_preview_match(&mut self) -> bool {
+        let Some(find) = &mut self.preview_find else {
+            return false;
+        };
+        if find.text.selection().is_none() {
+            return false;
+        }
+        find.text.deselect();
+        true
+    }
+
+    /// Runs a find step, then remembers the search and brings the match it
+    /// landed on into view.
+    fn run_preview_find(&mut self, step: impl FnOnce(&mut Editor)) {
+        let Some(find) = &mut self.preview_find else {
+            return;
+        };
+        step(&mut find.text);
+        if !find.text.last_search().is_empty() {
+            self.preview_last_search = find.text.last_search().to_string();
+        }
+        self.scroll_preview_to_match();
+    }
+
+    /// Scrolls the quick view so the current match shows: down or up to its
+    /// row, and — not wrapping — sideways to its columns.
+    fn scroll_preview_to_match(&mut self) {
+        let Some((start, end)) = self
+            .preview_find
+            .as_ref()
+            .and_then(|find| find.text.selection())
+        else {
+            return;
+        };
+        let content = preview::build_preview(self.active_pane_ref());
+        let preview::PreviewContent::Text(lines) = &content else {
+            return;
+        };
+        let width = self.preview_visible_width;
+        // The find bar takes the preview's last row.
+        let bar = usize::from(self.preview_find_bar_open());
+        let rows = self.preview_visible_lines.saturating_sub(bar).max(1);
+        let wrap = self
+            .wrap_lines
+            .then(|| crate::editor::wrap_width_for(width));
+        let layout = crate::editor::LineLayout::new(&lines[start.line], wrap);
+        let sub = layout.starts.partition_point(|&at| at <= start.col) - 1;
+        let row = content.first_row_of(start.line, width, self.wrap_lines) + sub;
+        if row < self.preview_scroll {
+            self.preview_scroll = row;
+        } else if row >= self.preview_scroll + rows {
+            self.preview_scroll = row + 1 - rows;
+        }
+        if !self.wrap_lines {
+            let from = layout.x_of(0, start.col);
+            let to = layout.x_of(
+                0,
+                if end.line == start.line {
+                    end.col
+                } else {
+                    start.col
+                },
+            );
+            if from < self.preview_scroll_x {
+                self.preview_scroll_x = from;
+            } else if to > self.preview_scroll_x + width {
+                self.preview_scroll_x = to.saturating_sub(width).min(from);
+            }
+        }
+    }
+
+    /// Called every loop iteration: twice a second, brings both listings up
+    /// to date with the disk (see `refresh_from_disk`).
+    pub fn auto_refresh(&mut self, now: Instant) {
+        const EVERY: Duration = Duration::from_millis(500);
+        if self
+            .last_refresh_check
+            .is_some_and(|at| now.duration_since(at) < EVERY)
+        {
+            return;
+        }
+        self.last_refresh_check = Some(now);
+        self.refresh_from_disk();
+    }
+
+    /// Lists a pane again when its directory changed since it was listed
+    /// (one look at the directory itself, nothing more, when it hasn't) —
+    /// the cursor on the same name, marks that still exist kept. This goes
+    /// on under dialogs, the menu and quick search too: what they act on was
+    /// taken when they opened (the items to copy or delete, the file to
+    /// rename), and quick search goes on from the entry the cursor is on,
+    /// found again by name.
+    ///
+    /// A directory that's gone sends its pane up to the nearest one that
+    /// isn't, with a note saying so — held back while something else is
+    /// open, so popups don't pile up. Not while a dialog that works in the
+    /// pane's directory when it's confirmed (MkDir, New File, a Copy/Move
+    /// target typed relative to it) is open, though: that would quietly
+    /// move its work up a level, so the pane waits until it closes.
+    pub fn refresh_from_disk(&mut self) {
+        let busy = self.menu_open
+            || self.quick_search.is_some()
+            || self.error_dialog.is_some()
+            || !matches!(self.dialog, Dialog::None);
+        let works_in_pane_dir = matches!(
+            self.dialog,
+            Dialog::TextInput {
+                kind: TextInputKind::MkDir | TextInputKind::NewFile,
+                ..
+            } | Dialog::Transfer(_)
+        );
+        for side in [Side::Left, Side::Right] {
+            match self.pane_mut(side).changed_on_disk() {
+                Ok(false) => {}
+                // A failure is reported once: the listing is then up to
+                // date with what can be seen of the directory.
+                Ok(true) => {
+                    if let Err(err) = self.pane_mut(side).reload_keeping_selection() {
+                        self.set_error(format!("Cannot reload pane: {err}"));
+                    }
+                }
+                Err(_) if works_in_pane_dir => {}
+                Err(_) => {
+                    let gone = self.pane_mut(side).cwd.clone();
+                    if let Some(now) = self.pane_mut(side).leave_for_nearest_existing() {
+                        self.pending_notice = Some(format!(
+                            "{} is gone; showing {} instead",
+                            gone.display(),
+                            now.display()
+                        ));
+                    }
+                }
+            }
+        }
+        if !busy && let Some(note) = self.pending_notice.take() {
+            self.set_notice(note);
+        }
+        // A file changed under the quick view shows anew by itself (see
+        // `preview::read_file`); a search in its old text is dropped.
+        if let Some(find) = &self.preview_find {
+            let same = match preview::build_preview(self.active_pane_ref()) {
+                preview::PreviewContent::Text(lines) => {
+                    std::rc::Rc::ptr_eq(&lines, &find.source) || *lines == *find.source
+                }
+                _ => false,
+            };
+            if !same {
+                self.preview_find = None;
+            }
+        }
+    }
+
     /// Resets the preview scroll position whenever the previewed entry has
     /// changed since the last call (any kind of selection/cwd change).
     /// Called once per input loop iteration rather than at every individual
@@ -726,6 +1166,8 @@ impl App {
         let target = self.active_pane_ref().preview_target();
         if target != self.last_preview_target {
             self.preview_scroll = 0;
+            self.preview_scroll_x = 0;
+            self.preview_find = None;
             self.last_preview_target = target;
         }
     }
@@ -829,8 +1271,15 @@ impl App {
                 outcome.errors.join("; ")
             ));
         }
-        self.left.reload()?;
-        self.right.reload()?;
+        // Not `?`: a pane that can't be listed any more (its directory
+        // deleted meanwhile) mustn't end the program — least of all with
+        // unsaved changes in the editor.
+        if let Err(err) = self.left.reload() {
+            self.set_error(format!("Cannot reload left pane: {err}"));
+        }
+        if let Err(err) = self.right.reload() {
+            self.set_error(format!("Cannot reload right pane: {err}"));
+        }
         if self.quit_when_job_done {
             self.should_quit = true;
         }
@@ -982,6 +1431,47 @@ impl App {
         }
     }
 
+    /// The menu bar as it is now: with the Edit menu while editing, Wrap
+    /// Lines in Options while the quick view is open.
+    pub fn menu_bar(&self) -> &'static [MenuCategory] {
+        menu::menu_bar(self.editor.is_some(), self.quick_view)
+    }
+
+    /// The menu category whose title starts with `letter` (case
+    /// insensitive), if any — used for the Alt+F/E/O/C mnemonic shortcuts.
+    pub fn menu_category_for(&self, letter: char) -> Option<usize> {
+        let lower = letter.to_ascii_lowercase();
+        self.menu_bar()
+            .iter()
+            .position(|category| category.title.to_ascii_lowercase().starts_with(lower))
+    }
+
+    /// The keybinding shown beside `action` in the pulldown. While editing,
+    /// Ctrl+S and Ctrl+F are the editor's (Save, Find), so the panes' own
+    /// uses of them aren't shown.
+    /// Wrap Lines shows its on/off mark there instead, at the right edge
+    /// like the keys.
+    pub fn menu_shortcut(&self, action: Action) -> Option<&'static str> {
+        if action == Action::WrapLines {
+            return Some(if self.wrap_lines { "[x]" } else { "[ ]" });
+        }
+        if self.editor.is_some() && matches!(action, Action::Settings | Action::QuickSearch) {
+            return None;
+        }
+        action.shortcut()
+    }
+
+    /// The menu bar changes as the editor opens or closes (see
+    /// `menu::menu_bar`): no menu stays open across that, and nothing points
+    /// into the other bar's categories or items.
+    fn reset_menu(&mut self) {
+        self.menu_open = false;
+        self.menu_category = 0;
+        self.menu_item = 0;
+        self.menu_bar_tiles.clear();
+        self.menu_item_tiles.clear();
+    }
+
     pub fn open_menu(&mut self) {
         self.open_menu_at(0);
     }
@@ -991,7 +1481,7 @@ impl App {
     /// always starting from File like `open_menu` does.
     pub fn open_menu_at(&mut self, category: usize) {
         self.menu_open = true;
-        self.menu_category = category.min(MENU_BAR.len() - 1);
+        self.menu_category = category.min(self.menu_bar().len() - 1);
         self.menu_item = 0;
         self.snap_menu_item_to_enabled();
     }
@@ -1002,7 +1492,7 @@ impl App {
 
     pub fn menu_left(&mut self) {
         if self.menu_category == 0 {
-            self.menu_category = MENU_BAR.len() - 1;
+            self.menu_category = self.menu_bar().len() - 1;
         } else {
             self.menu_category -= 1;
         }
@@ -1011,7 +1501,7 @@ impl App {
     }
 
     pub fn menu_right(&mut self) {
-        self.menu_category = (self.menu_category + 1) % MENU_BAR.len();
+        self.menu_category = (self.menu_category + 1) % self.menu_bar().len();
         self.menu_item = 0;
         self.snap_menu_item_to_enabled();
     }
@@ -1020,7 +1510,7 @@ impl App {
     /// used whenever the menu/category first opens so the selection never
     /// starts on a grayed-out entry.
     fn snap_menu_item_to_enabled(&mut self) {
-        let items = MENU_BAR[self.menu_category].items;
+        let items = self.menu_bar()[self.menu_category].items;
         if let Some(idx) = items.iter().position(|action| self.action_enabled(*action)) {
             self.menu_item = idx;
         }
@@ -1040,7 +1530,7 @@ impl App {
     /// but MkDir/New File are always enabled so that can't happen in
     /// practice.
     fn step_menu_item(&mut self, forward: bool) {
-        let items = MENU_BAR[self.menu_category].items;
+        let items = self.menu_bar()[self.menu_category].items;
         let len = items.len();
         if len == 0 {
             return;
@@ -1062,7 +1552,7 @@ impl App {
     }
 
     pub fn confirm_menu_selection(&mut self) -> Result<()> {
-        let action = MENU_BAR[self.menu_category].items[self.menu_item];
+        let action = self.menu_bar()[self.menu_category].items[self.menu_item];
         self.menu_open = false;
         self.run_action(action)
     }
@@ -1070,6 +1560,7 @@ impl App {
     pub fn run_action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Open => self.open_selected()?,
+            Action::Rename if self.editor.is_some() => self.request_rename_edited_file(),
             Action::Rename => self.request_rename(),
             Action::Copy => self.request_copy(),
             Action::Move => self.request_move(),
@@ -1087,7 +1578,16 @@ impl App {
             Action::MkDir => self.request_mkdir(),
             Action::NewFile => self.request_new_file(),
             Action::View => self.view_selected(),
+            Action::Edit if self.builtin_editor => self.open_editor(),
             Action::Edit => self.request_external(ExternalRequest::Edit, "edit"),
+            Action::Save => {
+                self.save_editor();
+            }
+            Action::Close => self.close_editor(),
+            Action::WrapLines => self.toggle_wrap_lines(),
+            Action::SelectAll => self.apply_to_editor(EditorCommand::SelectAll),
+            Action::Find => self.apply_to_editor(EditorCommand::Find),
+            Action::FindNext => self.apply_to_editor(EditorCommand::FindNext),
             Action::Help => {
                 self.help_open = true;
                 self.help_page = 0;
@@ -1116,6 +1616,12 @@ impl App {
             Action::InvertSelection => {
                 let marked = self.active_pane().invert_marks();
                 self.set_status(format!("{marked} file(s) selected"));
+            }
+            Action::Quit if self.editor.as_ref().is_some_and(Editor::is_modified) => {
+                self.dialog = Dialog::UnsavedChanges {
+                    quit_after: true,
+                    focused: 0,
+                };
             }
             Action::Quit => {
                 self.dialog = Dialog::ConfirmQuit;
@@ -1146,6 +1652,8 @@ impl App {
             // the current value.
             SettingItem::HideHiddenFiles => self.left.hide_hidden,
             SettingItem::InternalPreview => self.internal_preview,
+            SettingItem::BuiltinEditor => self.builtin_editor,
+            SettingItem::EditorFocusMode => self.editor_focus_mode,
             SettingItem::MouseCapture => self.mouse_capture,
             SettingItem::ClassicStyle => self.classic_style,
             SettingItem::StartLeftInCwd => self.start_left_in_cwd,
@@ -1175,14 +1683,17 @@ impl App {
                 }
             }
             SettingItem::InternalPreview => self.internal_preview = value,
+            SettingItem::BuiltinEditor => self.builtin_editor = value,
+            SettingItem::EditorFocusMode => self.editor_focus_mode = value,
         }
     }
 
     fn persist_settings(&self) {
-        let pairs: Vec<(&str, bool)> = SettingItem::ALL
+        let mut pairs: Vec<(&str, bool)> = SettingItem::ALL
             .iter()
             .map(|item| (item.key(), self.setting_value(*item)))
             .collect();
+        pairs.push((WRAP_LINES_KEY, self.wrap_lines));
         state::save_settings(&pairs);
     }
 
@@ -1356,6 +1867,75 @@ impl App {
         self.dialog_cancel_focused = false;
     }
 
+    /// F2 while editing: the usual Rename dialog, for the file being edited
+    /// (whatever the panes show). The editor goes on with the renamed file —
+    /// its text, cursor, undo and unsaved changes as they were; nothing is
+    /// saved.
+    fn request_rename_edited_file(&mut self) {
+        let Some(editor) = &self.editor else {
+            return;
+        };
+        self.dialog = Dialog::Rename {
+            field: TextField::new(editor.file_name()),
+            editing: true,
+            src: editor.path.clone(),
+        };
+        self.dialog_cancel_focused = false;
+    }
+
+    /// The F-key bar while editing, where it shows (the editor in a pane):
+    /// each key's label and whether it does anything there. F3 is Find
+    /// Next and F4 full screen, so they're labeled that way; the panes'
+    /// own F5–F8 are shown dimmed.
+    pub fn editor_fn_key(&self, key: &menu::FnKey) -> (&'static str, bool) {
+        match key.action {
+            // Only with something to look for (Ctrl+F alone starts that).
+            Some(Action::View) => (
+                "Next",
+                self.editor.as_ref().is_some_and(Editor::can_find_next),
+            ),
+            Some(Action::Edit) => ("Full", true),
+            Some(Action::Copy | Action::Move | Action::MkDir | Action::Delete) => {
+                (key.label, false)
+            }
+            _ => (key.label, true),
+        }
+    }
+
+    /// A click on an F-key tile while editing: what that key does in the
+    /// editor, or nothing for a dimmed one.
+    pub fn click_editor_fn_key(&mut self, action: Option<Action>) -> Result<()> {
+        let command = match action {
+            None => EditorCommand::Menu(None),
+            Some(Action::Help) => EditorCommand::Help,
+            Some(Action::Rename) => EditorCommand::Rename,
+            Some(Action::View) => EditorCommand::FindNext,
+            Some(Action::Edit) => EditorCommand::ToggleFullScreen,
+            Some(Action::Quit) => EditorCommand::Quit,
+            Some(_) => return Ok(()),
+        };
+        self.run_editor_command(command)
+    }
+
+    /// After a rename: a pane whose cursor was on the renamed entry
+    /// (`was_on`, left and right) keeps it there under the new name, and an
+    /// editor with that file open goes on with it there.
+    fn after_rename(&mut self, src: &Path, dest: &Path, was_on: [bool; 2]) {
+        if let Some(name) = dest.file_name() {
+            let name = name.to_string_lossy();
+            for (side, was_on) in [Side::Left, Side::Right].into_iter().zip(was_on) {
+                if was_on {
+                    self.pane_mut(side).select_name(&name);
+                }
+            }
+        }
+        if let Some(editor) = &mut self.editor
+            && editor.path == src
+        {
+            editor.path = dest.to_path_buf();
+        }
+    }
+
     fn request_copy(&mut self) {
         self.request_transfer(DialogKind::Copy);
     }
@@ -1404,6 +1984,7 @@ impl App {
         if self.quick_view {
             self.quick_view = false;
             self.preview_focus = false;
+            self.preview_find = None;
             return;
         }
         if self.active_pane_ref().selected_entry().is_none() {
@@ -1464,6 +2045,258 @@ impl App {
         }
     }
 
+    /// F4 with the built-in editor on: the selected file opens in the other
+    /// pane, where F3 shows its preview (which it replaces). A file the
+    /// editor can't save back exactly — binary, not UTF-8, huge — isn't
+    /// opened at all.
+    fn open_editor(&mut self) {
+        let pane = self.active_pane_ref();
+        let Some(entry) = pane.selected_entry() else {
+            return;
+        };
+        if entry.is_dir {
+            self.set_status("Cannot edit a directory".to_string());
+            return;
+        }
+        let Some(path) = pane.selected_path() else {
+            return;
+        };
+        match Editor::open(&path) {
+            Ok(mut editor) => {
+                editor.set_wrap(self.wrap_lines);
+                self.view_before_editor = Some(ViewBeforeEditor {
+                    quick_view: self.quick_view,
+                    preview_focus: self.preview_focus,
+                    preview_scroll: self.preview_scroll,
+                    preview_scroll_x: self.preview_scroll_x,
+                    wrap_lines: self.wrap_lines,
+                });
+                self.quick_view = false;
+                self.preview_focus = false;
+                self.editor = Some(editor);
+                self.reset_menu();
+            }
+            Err(message) => self.set_error(message),
+        }
+    }
+
+    /// A key while the editor has the keyboard. With the find bar open,
+    /// typing goes there, and of the editor's own keys only those that make
+    /// sense alongside it still work.
+    pub fn editor_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        let Some(editor) = &mut self.editor else {
+            return Ok(());
+        };
+        let command = if editor.find.is_some() {
+            if let Some(key) = editor::find_bar_key(code, modifiers) {
+                editor.find_key(key);
+                return Ok(());
+            }
+            match editor::command_for_key(code, modifiers) {
+                Some(
+                    command @ (EditorCommand::Save
+                    | EditorCommand::ToggleFullScreen
+                    | EditorCommand::Find
+                    | EditorCommand::Paste
+                    | EditorCommand::Help
+                    | EditorCommand::Quit
+                    | EditorCommand::Menu(_)),
+                ) => command,
+                _ => return Ok(()),
+            }
+        } else {
+            match editor::command_for_key(code, modifiers) {
+                Some(command) => command,
+                None => return Ok(()),
+            }
+        };
+        self.run_editor_command(command)
+    }
+
+    fn run_editor_command(&mut self, command: EditorCommand) -> Result<()> {
+        let Some(editor) = &mut self.editor else {
+            return Ok(());
+        };
+        match command {
+            EditorCommand::Copy => {
+                if let Some(text) = editor.selected_text() {
+                    self.clipboard.copy(text);
+                }
+            }
+            EditorCommand::Cut => {
+                if let Some(text) = editor.cut() {
+                    self.clipboard.copy(text);
+                }
+            }
+            EditorCommand::Paste => {
+                let text = self.clipboard.paste();
+                self.editor_paste(&text);
+            }
+            EditorCommand::Save => {
+                self.save_editor();
+            }
+            // Esc goes back a step at a time: a selection (a match F3 found,
+            // or one made by hand) is let go of first, and only with nothing
+            // selected does Esc close the editor.
+            EditorCommand::Close if editor.selection().is_some() => editor.deselect(),
+            EditorCommand::Close => self.close_editor(),
+            EditorCommand::ToggleFullScreen => editor.full_screen = !editor.full_screen,
+            EditorCommand::Help => {
+                self.help_open = true;
+                self.help_page = EDITOR_HELP_PAGE;
+            }
+            EditorCommand::Rename => self.request_rename_edited_file(),
+            EditorCommand::Quit => self.run_action(Action::Quit)?,
+            EditorCommand::Menu(None) => self.open_menu(),
+            EditorCommand::Menu(Some(letter)) => {
+                if let Some(idx) = self.menu_category_for(letter) {
+                    self.open_menu_at(idx);
+                }
+            }
+            other => editor.apply(other),
+        }
+        Ok(())
+    }
+
+    fn apply_to_editor(&mut self, command: EditorCommand) {
+        if let Some(editor) = &mut self.editor {
+            editor.apply(command);
+        }
+    }
+
+    /// Ctrl+V, or text the terminal pasted (bracketed paste).
+    pub fn editor_paste(&mut self, text: &str) {
+        if let Some(editor) = &mut self.editor {
+            editor.insert_text(text);
+        }
+    }
+
+    /// Edit > Wrap Lines, or Options > Wrap Lines: switches it for the open
+    /// file and the quick view alike, and remembers it.
+    fn toggle_wrap_lines(&mut self) {
+        self.wrap_lines = !self.wrap_lines;
+        if self.quick_view {
+            self.preview_scroll =
+                self.rescroll_preview_for_wrap(!self.wrap_lines, self.preview_scroll);
+            self.preview_scroll_x = 0;
+        }
+        if let Some(editor) = &mut self.editor {
+            editor.set_wrap(self.wrap_lines);
+        }
+        self.persist_settings();
+    }
+
+    /// Ctrl+S: writes the file back. A failure is reported and the editor
+    /// stays open with the changes still marked unsaved. Returns whether it
+    /// saved.
+    pub fn save_editor(&mut self) -> bool {
+        let Some(editor) = &mut self.editor else {
+            return false;
+        };
+        let path = editor.path.clone();
+        match fs_ops::write_file_safely(&path, &editor.to_bytes()) {
+            Ok(()) => {
+                editor.mark_saved();
+                editor.message = Some("Saved".to_string());
+                self.set_status(format!("Saved {}", path.display()));
+                // The new size and date, in whichever pane shows the file —
+                // on the same entry, even if sorting by size or date moved it.
+                if let Err(err) = self.left.reload_keeping_selection() {
+                    self.set_error(format!("Cannot reload left pane: {err}"));
+                }
+                if let Err(err) = self.right.reload_keeping_selection() {
+                    self.set_error(format!("Cannot reload right pane: {err}"));
+                }
+                true
+            }
+            Err(err) => {
+                editor.message = Some("Not saved".to_string());
+                self.set_error(format!("Cannot save {}: {err}", path.display()));
+                false
+            }
+        }
+    }
+
+    /// Esc in the editor: closes it, first asking about unsaved changes.
+    fn close_editor(&mut self) {
+        if self.editor.as_ref().is_some_and(Editor::is_modified) {
+            self.dialog = Dialog::UnsavedChanges {
+                quit_after: false,
+                focused: 0,
+            };
+        } else {
+            self.drop_editor();
+        }
+    }
+
+    /// The editor goes, and the pane it took shows again what it showed
+    /// before — the quick view of the selected entry, if that was open (its
+    /// scroll resets by itself should the selection have moved meanwhile;
+    /// see `sync_preview_scroll`).
+    fn drop_editor(&mut self) {
+        self.editor = None;
+        self.reset_menu();
+        if let Some(view) = self.view_before_editor.take() {
+            let entry_there = self.active_pane_ref().selected_entry().is_some();
+            self.quick_view = view.quick_view && entry_there;
+            self.preview_focus = view.preview_focus && self.quick_view;
+            self.preview_scroll = if view.wrap_lines == self.wrap_lines {
+                view.preview_scroll
+            } else {
+                self.rescroll_preview_for_wrap(view.wrap_lines, view.preview_scroll)
+            };
+            self.preview_scroll_x = if self.wrap_lines {
+                0
+            } else {
+                view.preview_scroll_x
+            };
+        }
+    }
+
+    pub fn dialog_is_unsaved_changes(&self) -> bool {
+        matches!(self.dialog, Dialog::UnsavedChanges { .. })
+    }
+
+    /// Left/Right (or Tab) across Save / Don't Save / Cancel.
+    pub fn step_unsaved_focus(&mut self, forward: bool) {
+        if let Dialog::UnsavedChanges { focused, .. } = &mut self.dialog {
+            *focused = if forward {
+                (*focused + 1) % 3
+            } else {
+                (*focused + 2) % 3
+            };
+        }
+    }
+
+    /// Enter in the unsaved-changes prompt. Save that fails keeps the editor
+    /// open (the error says why), and doesn't quit either.
+    pub fn activate_unsaved_button(&mut self) {
+        let Dialog::UnsavedChanges {
+            quit_after,
+            focused,
+        } = self.dialog
+        else {
+            return;
+        };
+        self.dialog = Dialog::None;
+        match focused {
+            0 if !self.save_editor() => return,
+            0 | 1 => {}
+            _ => return,
+        }
+        self.drop_editor();
+        if quit_after {
+            // The file was the question; a running copy is still worth
+            // the usual warning.
+            if self.job.is_some() {
+                self.dialog = Dialog::ConfirmQuit;
+                self.dialog_cancel_focused = false;
+            } else {
+                self.quit();
+            }
+        }
+    }
+
     /// F8 (`Trash` or `Delete`, per the setting) and Shift+F8 (always
     /// `Delete`).
     fn request_delete(&mut self, kind: DialogKind) {
@@ -1493,6 +2326,9 @@ impl App {
             }
             Dialog::Transfer(_) => self.confirm_transfer(),
             Dialog::Rename { field, src, .. } => {
+                let mut renamed = None;
+                let was_on = [&self.left, &self.right]
+                    .map(|pane| pane.selected_path().as_deref() == Some(src.as_path()));
                 let new_name = field.text().to_string();
                 let src = src.clone();
                 if new_name.trim().is_empty() {
@@ -1507,7 +2343,10 @@ impl App {
                             self.set_error(format!("Rename failed: \"{new_name}\" already exists"));
                         } else {
                             match fs_ops::move_path(&src, &dest) {
-                                Ok(()) => self.set_status(format!("Renamed to {new_name}")),
+                                Ok(()) => {
+                                    self.set_status(format!("Renamed to {new_name}"));
+                                    renamed = Some((src.clone(), dest));
+                                }
                                 Err(err) => self.set_error(format!("Rename failed: {err}")),
                             }
                         }
@@ -1516,8 +2355,15 @@ impl App {
                 }
 
                 self.dialog = Dialog::None;
-                self.left.reload()?;
-                self.right.reload()?;
+                // Not `?`: the editor may be open with unsaved changes.
+                for side in [Side::Left, Side::Right] {
+                    if let Err(err) = self.pane_mut(side).reload() {
+                        self.set_error(format!("Cannot reload pane: {err}"));
+                    }
+                }
+                if let Some((src, dest)) = renamed {
+                    self.after_rename(&src, &dest, was_on);
+                }
             }
             Dialog::TextInput { kind, field, .. }
                 if matches!(
@@ -1583,6 +2429,7 @@ impl App {
                 self.dialog = Dialog::None;
                 self.quit();
             }
+            Dialog::UnsavedChanges { .. } => self.activate_unsaved_button(),
             Dialog::Settings { .. } | Dialog::None => {}
         }
         Ok(())
@@ -2271,6 +3118,645 @@ mod tests {
         app.activate_dialog_button().unwrap();
 
         assert!(dir.join("abc").is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An app on a fresh temp directory holding `files`, the first one
+    /// selected, with the built-in editor on.
+    fn app_with_files(name: &str, files: &[(&str, &[u8])]) -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pc_test_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for (file, contents) in files {
+            std::fs::write(dir.join(file), contents).unwrap();
+        }
+        let mut app = app_with_panes(&dir, &dir);
+        app.builtin_editor = true;
+        app.wrap_lines = false;
+        if let Some((first, _)) = files.first() {
+            select(&mut app, first);
+        }
+        (app, dir)
+    }
+
+    fn keys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.editor_key(KeyCode::Char(c), KeyModifiers::NONE)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn f4_edits_in_the_other_pane_and_esc_asks_before_dropping_changes() {
+        let (mut app, dir) = app_with_files("editor_close", &[("a.txt", b"hello\n")]);
+        app.quick_view = true;
+        app.run_action(Action::Edit).unwrap();
+        assert!(app.editor.is_some());
+        assert!(!app.quick_view, "the editor replaces the quick view");
+
+        app.editor_key(KeyCode::F(4), KeyModifiers::NONE).unwrap();
+        assert!(app.editor.as_ref().unwrap().full_screen);
+        app.editor_key(KeyCode::F(4), KeyModifiers::NONE).unwrap();
+        assert!(!app.editor.as_ref().unwrap().full_screen);
+
+        keys(&mut app, "ą");
+        app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(matches!(
+            app.dialog,
+            Dialog::UnsavedChanges {
+                quit_after: false,
+                focused: 0
+            }
+        ));
+        // Cancel keeps editing; Don't Save closes without touching the file.
+        app.step_unsaved_focus(false);
+        app.activate_unsaved_button();
+        assert!(app.editor.is_some());
+        app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        app.step_unsaved_focus(true);
+        app.activate_unsaved_button();
+        assert!(app.editor.is_none());
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"hello\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_s_saves_and_the_pane_shows_the_new_size() {
+        let (mut app, dir) = app_with_files("editor_save", &[("a.txt", b"one\r\ntwo\r\n")]);
+        app.run_action(Action::Edit).unwrap();
+        app.editor_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+        keys(&mut app, " więcej");
+        app.editor_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            .unwrap();
+        let saved = "one więcej\r\ntwo\r\n";
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), saved);
+        let editor = app.editor.as_ref().unwrap();
+        assert!(!editor.is_modified());
+        let entry = &app.left.entries[app.left.selected];
+        assert_eq!(entry.size, saved.len() as u64);
+        // Nothing left to ask about.
+        app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(app.editor.is_none());
+        assert!(matches!(app.dialog, Dialog::None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn quitting_with_unsaved_changes_offers_to_save_first() {
+        let (mut app, dir) = app_with_files("editor_quit", &[("a.txt", b"x")]);
+        app.run_action(Action::Edit).unwrap();
+        keys(&mut app, "y");
+        app.editor_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert!(matches!(
+            app.dialog,
+            Dialog::UnsavedChanges {
+                quit_after: true,
+                ..
+            }
+        ));
+        app.activate_unsaved_button();
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"yx");
+        assert!(app.should_quit);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_editor_open_and_modified() {
+        let (mut app, dir) = app_with_files("editor_save_fails", &[("a.txt", b"x")]);
+        app.run_action(Action::Edit).unwrap();
+        keys(&mut app, "y");
+        // The file's place is taken by a directory: neither writing in place
+        // nor renaming over it can work.
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        std::fs::create_dir(dir.join("a.txt")).unwrap();
+        app.run_action(Action::Quit).unwrap();
+        app.activate_unsaved_button();
+        assert!(!app.should_quit);
+        assert!(app.error_dialog.is_some());
+        assert!(app.editor.as_ref().unwrap().is_modified());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn files_the_editor_cannot_round_trip_are_not_opened() {
+        let (mut app, dir) = app_with_files(
+            "editor_refuse",
+            &[("bin.dat", b"\x7fELF\0\0"), ("latin2.txt", b"\xb1\xea")],
+        );
+        app.run_action(Action::Edit).unwrap();
+        assert!(app.editor.is_none());
+        assert!(app.error_dialog.take().unwrap().contains("External editor"));
+        select(&mut app, "latin2.txt");
+        app.run_action(Action::Edit).unwrap();
+        assert!(app.editor.is_none());
+        assert!(app.error_dialog.take().unwrap().contains("UTF-8"));
+        select(&mut app, "sub");
+        app.run_action(Action::Edit).unwrap();
+        assert!(app.editor.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn external_editor_setting_keeps_f4_on_editor_env() {
+        let (mut app, dir) = app_with_files("editor_external", &[("a.txt", b"x")]);
+        app.builtin_editor = false;
+        app.run_action(Action::Edit).unwrap();
+        assert!(app.editor.is_none());
+        assert!(matches!(
+            app.external_request,
+            Some(ExternalRequest::Edit(_))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn menu_opens_over_the_editor_but_altgr_letters_are_typed() {
+        let (mut app, dir) = app_with_files("editor_menu", &[("a.txt", b"")]);
+        app.run_action(Action::Edit).unwrap();
+        assert_eq!(app.menu_bar()[1].title, "Edit");
+        app.editor_key(KeyCode::Char('e'), KeyModifiers::ALT)
+            .unwrap();
+        assert!(app.menu_open);
+        assert_eq!(app.menu_category, 1);
+        app.close_menu();
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            app.editor_key(KeyCode::Char('ł'), modifiers).unwrap();
+        }
+        assert!(!app.menu_open);
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["łłł"]);
+        app.editor_key(KeyCode::F(9), KeyModifiers::NONE).unwrap();
+        assert!(app.menu_open);
+        // Pane actions are grayed out behind the editor; its own aren't.
+        assert!(!app.action_enabled(Action::Copy));
+        assert!(app.action_enabled(Action::Save));
+        app.close_menu();
+        app.editor = None;
+        assert_eq!(app.menu_bar()[1].title, "Options");
+        assert!(!app.action_enabled(Action::Save));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Gives this test thread a settings directory of its own (empty), in
+    /// place of none at all; see `state::test_dir`.
+    fn own_settings_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pc_test_cfg_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        state::test_dir::set(Some(dir.clone()));
+        dir
+    }
+
+    #[test]
+    fn wrap_lines_menu_item_switches_wrapping_and_is_remembered() {
+        let config = own_settings_dir("wrap");
+        let (mut app, dir) = app_with_files("editor_wrap", &[("a.txt", b"")]);
+        app.run_action(Action::Edit).unwrap();
+        assert_eq!(app.menu_shortcut(Action::WrapLines), Some("[ ]"));
+        app.run_action(Action::WrapLines).unwrap();
+        assert_eq!(app.menu_shortcut(Action::WrapLines), Some("[x]"));
+        let saved = std::fs::read_to_string(config.join("settings")).unwrap();
+        assert!(saved.contains("wrap_lines=true"), "{saved}");
+        // The next start, and the next file opened, wrap too.
+        let mut again = App::new().unwrap();
+        assert!(again.wrap_lines);
+        again.left = Pane::new(dir.clone(), false).unwrap();
+        select(&mut again, "a.txt");
+        again.run_action(Action::Edit).unwrap();
+        assert_eq!(again.menu_shortcut(Action::WrapLines), Some("[x]"));
+        state::test_dir::set(None);
+        std::fs::remove_dir_all(&config).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn editor_settings_default_and_persist() {
+        let config = own_settings_dir("editor_settings");
+        let mut app = App::new().unwrap();
+        assert!(app.builtin_editor, "the built-in editor is the default");
+        assert!(!app.editor_focus_mode, "the regular view is the default");
+        assert!(!app.wrap_lines, "no wrapping by default, as in Notepad");
+        app.set_setting_value(SettingItem::BuiltinEditor, false);
+        app.set_setting_value(SettingItem::EditorFocusMode, true);
+        app.persist_settings();
+        let saved = std::fs::read_to_string(config.join("settings")).unwrap();
+        for line in [
+            "builtin_editor=false",
+            "editor_focus_mode=true",
+            "wrap_lines=false",
+        ] {
+            assert!(saved.lines().any(|l| l == line), "{line} in {saved}");
+        }
+        let app = App::new().unwrap();
+        assert!(!app.builtin_editor);
+        assert!(app.editor_focus_mode);
+        state::test_dir::set(None);
+        std::fs::remove_dir_all(&config).unwrap();
+    }
+
+    #[test]
+    fn with_the_find_bar_open_only_its_keys_and_a_few_commands_work() {
+        let (mut app, dir) = app_with_files("editor_find_keys", &[("a.txt", b"kot pies\n")]);
+        app.run_action(Action::Edit).unwrap();
+        keys(&mut app, "x");
+        app.editor_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .unwrap();
+        keys(&mut app, "pies");
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.find.as_ref().unwrap().field.text(), "pies");
+        assert_eq!(editor.lines(), ["xkot pies"], "letters go to the bar");
+        let selection = editor.selection();
+        // Undo and Select All belong to the text, not to the bar.
+        for letter in ['z', 'a', 'y', 'x', 'v'] {
+            app.editor_key(KeyCode::Char(letter), KeyModifiers::CONTROL)
+                .unwrap();
+        }
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.lines(), ["xkot pies"]);
+        assert_eq!(editor.selection(), selection);
+        assert!(editor.find.is_some());
+        // Saving does work.
+        app.editor_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"xkot pies\n");
+        assert!(!app.editor.as_ref().unwrap().is_modified());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_cut_and_paste_go_through_the_apps_clipboard() {
+        let (mut app, dir) = app_with_files("editor_clipboard", &[("a.txt", b"ala ma")]);
+        app.run_action(Action::Edit).unwrap();
+        let ctrl = |app: &mut App, letter| {
+            app.editor_key(KeyCode::Char(letter), KeyModifiers::CONTROL)
+                .unwrap();
+        };
+        ctrl(&mut app, 'a');
+        ctrl(&mut app, 'c');
+        app.editor_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+        keys(&mut app, " ");
+        ctrl(&mut app, 'v');
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["ala ma ala ma"]);
+        // Cut with nothing selected keeps the clipboard as it was.
+        ctrl(&mut app, 'x');
+        assert_eq!(app.clipboard.paste(), "ala ma");
+        app.editor_key(KeyCode::Home, KeyModifiers::SHIFT).unwrap();
+        ctrl(&mut app, 'x');
+        assert_eq!(app.editor.as_ref().unwrap().lines(), [""]);
+        assert_eq!(app.clipboard.paste(), "ala ma ala ma");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_the_editor_brings_back_the_quick_view_it_replaced() {
+        let (mut app, dir) = app_with_files("editor_back_to_view", &[("a.txt", b"x\n")]);
+        app.run_action(Action::View).unwrap();
+        app.preview_focus = true;
+        app.preview_scroll = 3;
+        app.run_action(Action::Edit).unwrap();
+        assert!(!app.quick_view && !app.preview_focus);
+        // Closed full screen, Esc goes back to the view all the same.
+        app.editor_key(KeyCode::F(4), KeyModifiers::NONE).unwrap();
+        app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(app.editor.is_none());
+        assert!(app.quick_view && app.preview_focus);
+        assert_eq!(app.preview_scroll, 3);
+
+        // Through the unsaved-changes prompt, with either answer.
+        for (button, saved) in [(1, "x\n"), (0, "yx\n")] {
+            app.run_action(Action::Edit).unwrap();
+            keys(&mut app, "y");
+            app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+            for _ in 0..button {
+                app.step_unsaved_focus(true);
+            }
+            app.activate_unsaved_button();
+            assert!(app.editor.is_none());
+            assert!(app.quick_view && app.preview_focus, "button {button}");
+            assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), saved);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_the_editor_opened_from_the_listing_goes_back_to_it() {
+        let (mut app, dir) = app_with_files("editor_back_to_list", &[("a.txt", b"x")]);
+        app.run_action(Action::Edit).unwrap();
+        app.editor_key(KeyCode::F(4), KeyModifiers::NONE).unwrap();
+        keys(&mut app, "y");
+        app.run_action(Action::Close).unwrap();
+        assert!(matches!(app.dialog, Dialog::UnsavedChanges { .. }));
+        app.activate_unsaved_button();
+        assert!(app.editor.is_none());
+        assert!(!app.quick_view && !app.preview_focus);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// F2 in the editor, the field cleared and `name` typed in its place.
+    fn rename_edited_file_to(app: &mut App, name: &str) {
+        app.editor_key(KeyCode::F(2), KeyModifiers::NONE).unwrap();
+        assert!(matches!(app.dialog, Dialog::Rename { .. }));
+        while matches!(&app.dialog, Dialog::Rename { field, .. } if !field.text().is_empty()) {
+            app.dialog_field_backspace();
+        }
+        type_text(app, name);
+        app.confirm_dialog().unwrap();
+    }
+
+    #[test]
+    fn f2_renames_the_edited_file_keeping_its_unsaved_changes() {
+        for full_screen in [false, true] {
+            let (mut app, dir) =
+                app_with_files("editor_rename", &[("a.txt", b"one\n"), ("b.txt", b"x")]);
+            app.run_action(Action::Edit).unwrap();
+            app.editor.as_mut().unwrap().full_screen = full_screen;
+            app.editor_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+            keys(&mut app, " two");
+            app.editor_key(KeyCode::F(2), KeyModifiers::NONE).unwrap();
+            match &app.dialog {
+                Dialog::Rename { field, .. } => assert_eq!(field.text(), "a.txt"),
+                _ => panic!("no Rename dialog"),
+            }
+            app.cancel_dialog();
+
+            rename_edited_file_to(&mut app, "c.txt");
+            assert!(app.error_dialog.is_none(), "{:?}", app.error_dialog);
+            assert!(!dir.join("a.txt").exists());
+            // Renamed, not saved: the file still has the old text.
+            assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"one\n");
+            let editor = app.editor.as_ref().unwrap();
+            assert_eq!(editor.path, dir.join("c.txt"));
+            assert_eq!(editor.lines(), ["one two"]);
+            assert!(editor.is_modified());
+            assert_eq!(editor.cursor(), crate::editor::Pos::new(0, 7));
+            assert_eq!(editor.full_screen, full_screen);
+            let left = &app.left;
+            assert_eq!(left.entries[left.selected].name, "c.txt");
+            // Undo still knows the edits; saving writes the new name.
+            app.editor_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+                .unwrap();
+            assert_eq!(app.editor.as_ref().unwrap().lines(), ["one "]);
+            app.editor_key(KeyCode::Char('y'), KeyModifiers::CONTROL)
+                .unwrap();
+            app.editor_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+                .unwrap();
+            assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"one two\n");
+            assert!(!dir.join("a.txt").exists());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn renaming_the_edited_file_onto_another_is_refused() {
+        let (mut app, dir) =
+            app_with_files("editor_rename_taken", &[("a.txt", b"a"), ("b.txt", b"b")]);
+        app.run_action(Action::Edit).unwrap();
+        keys(&mut app, "x");
+        rename_edited_file_to(&mut app, "b.txt");
+        assert!(app.error_dialog.take().unwrap().contains("already exists"));
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.path, dir.join("a.txt"));
+        assert!(editor.is_modified());
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"b");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn after_a_rename_closing_returns_to_the_quick_view_of_the_new_name() {
+        let (mut app, dir) = app_with_files("editor_rename_view", &[("a.txt", b"x")]);
+        app.run_action(Action::View).unwrap();
+        app.run_action(Action::Edit).unwrap();
+        rename_edited_file_to(&mut app, "renamed.txt");
+        app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(app.editor.is_none());
+        assert!(app.quick_view);
+        assert_eq!(app.left.preview_target(), Some(dir.join("renamed.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_f_key_bar_while_editing_has_what_the_editor_does() {
+        let (mut app, dir) = app_with_files("editor_fn_keys", &[("a.txt", b"kot kot")]);
+        app.run_action(Action::Edit).unwrap();
+        let state = |app: &App, key: &str| {
+            let fn_key = menu::FN_KEYS.iter().find(|k| k.key == key).unwrap();
+            app.editor_fn_key(fn_key)
+        };
+        for key in ["F5", "F6", "F7", "F8"] {
+            assert!(!state(&app, key).1, "{key} is dimmed");
+        }
+        for key in ["F1", "F2", "F9", "F10"] {
+            assert!(state(&app, key).1, "{key} is active");
+        }
+        assert_eq!(state(&app, "F4"), ("Full", true));
+        // Next only once there's something to look for.
+        assert_eq!(state(&app, "F3"), ("Next", false));
+        app.editor_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert_eq!(state(&app, "F3"), ("Next", true));
+        keys(&mut app, "kot");
+        app.editor_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert_eq!(state(&app, "F3"), ("Next", true));
+
+        // Clicked: a dimmed key does nothing, the others what they say.
+        app.click_editor_fn_key(Some(Action::Copy)).unwrap();
+        assert!(app.job.is_none() && matches!(app.dialog, Dialog::None));
+        app.click_editor_fn_key(Some(Action::View)).unwrap();
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.selected_text().as_deref(), Some("kot"));
+        app.click_editor_fn_key(Some(Action::Edit)).unwrap();
+        assert!(app.editor.as_ref().unwrap().full_screen);
+        app.click_editor_fn_key(Some(Action::Rename)).unwrap();
+        assert!(matches!(app.dialog, Dialog::Rename { .. }));
+
+        // File > Rename renames the edited file too, not the pane's entry.
+        app.dialog = Dialog::None;
+        assert!(app.action_enabled(Action::Rename));
+        app.run_action(Action::Rename).unwrap();
+        let edited = app.editor.as_ref().unwrap().path.clone();
+        assert!(matches!(&app.dialog, Dialog::Rename { src, .. } if *src == edited));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Gives `path` (a file or a directory) a modification time of its own,
+    /// `seconds` from now: a change the panes notice, with no waiting.
+    fn touch(path: &Path, seconds: u64) {
+        let at = std::time::SystemTime::now() + Duration::from_secs(seconds);
+        std::fs::File::open(path).unwrap().set_modified(at).unwrap();
+    }
+
+    #[test]
+    fn a_changed_directory_is_listed_again_keeping_cursor_and_marks() {
+        let (mut app, dir) = app_with_files(
+            "refresh_changed",
+            &[("b.txt", b"b"), ("c.txt", b"c"), ("d.txt", b"d")],
+        );
+        select(&mut app, "c.txt");
+        app.left.marked.insert("d.txt".to_string());
+        app.left.marked.insert("b.txt".to_string());
+        // Unchanged: nothing is read (a stand-in entry would vanish).
+        app.left.entries.push(app.left.entries[1].clone());
+        let listed = app.left.entries.len();
+        app.refresh_from_disk();
+        assert_eq!(app.left.entries.len(), listed, "no change, no reload");
+        app.left.entries.pop();
+
+        std::fs::write(dir.join("a.txt"), "new").unwrap();
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        touch(&dir, 10);
+        app.refresh_from_disk();
+        let names: Vec<&str> = app.left.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"a.txt") && !names.contains(&"b.txt"),
+            "{names:?}"
+        );
+        assert_eq!(app.left.entries[app.left.selected].name, "c.txt");
+        assert_eq!(
+            app.left.marked,
+            std::collections::HashSet::from(["d.txt".to_string()])
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn listings_follow_the_disk_under_dialogs_and_the_menu() {
+        let (mut app, dir) = app_with_files("refresh_dialog", &[("a.txt", b"a")]);
+        app.request_mkdir();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        touch(&dir, 10);
+        app.refresh_from_disk();
+        assert!(app.left.entries.iter().any(|e| e.name == "b.txt"));
+        assert!(matches!(app.dialog, Dialog::TextInput { .. }), "still open");
+        app.cancel_dialog();
+
+        app.open_menu_at(2);
+        std::fs::write(dir.join("c.txt"), "c").unwrap();
+        touch(&dir, 20);
+        app.refresh_from_disk();
+        assert!(app.left.entries.iter().any(|e| e.name == "c.txt"));
+        assert!(app.menu_open && app.menu_category == 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn quick_search_goes_on_from_its_match_after_a_reload() {
+        let (mut app, dir) = app_with_files(
+            "refresh_quick_search",
+            &[("kot.txt", b"k"), ("pies.txt", b"p"), ("zebra.txt", b"z")],
+        );
+        app.run_action(Action::QuickSearch).unwrap();
+        app.quick_search_push('p');
+        assert_eq!(app.left.entries[app.left.selected].name, "pies.txt");
+        // A file listed before it shifts every row.
+        std::fs::write(dir.join("aaa.txt"), "a").unwrap();
+        touch(&dir, 10);
+        app.refresh_from_disk();
+        assert_eq!(app.left.entries[app.left.selected].name, "pies.txt");
+        assert_eq!(app.quick_search.as_deref(), Some("p"));
+        app.quick_search_push('i');
+        assert_eq!(app.left.entries[app.left.selected].name, "pies.txt");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_vanished_directory_under_a_dialog_is_left_with_the_note_held_back() {
+        let (mut app, dir) = app_with_files("refresh_gone_dialog", &[("a.txt", b"a")]);
+        app.left.change_dir(&dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/x.txt"), "x").unwrap();
+        app.left.reload().unwrap();
+        select(&mut app, "x.txt");
+        app.run_action(Action::Delete).unwrap();
+        assert!(matches!(app.dialog, Dialog::Confirm { .. }));
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
+        app.refresh_from_disk();
+        assert_eq!(app.left.cwd, dir, "moved up at once");
+        assert!(app.error_dialog.is_none(), "but no popup over the dialog");
+        app.cancel_dialog();
+        app.refresh_from_disk();
+        assert!(app.error_dialog.take().unwrap().contains("is gone"));
+
+        // MkDir confirmed in a directory moved away under it would land a
+        // level up: the pane waits for it to close.
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        app.left.change_dir(&dir.join("sub")).unwrap();
+        app.request_mkdir();
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
+        app.refresh_from_disk();
+        assert_eq!(app.left.cwd, dir.join("sub"));
+        app.cancel_dialog();
+        app.refresh_from_disk();
+        assert_eq!(app.left.cwd, dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_directory_that_is_gone_sends_its_pane_up_saying_so_once() {
+        let (mut app, dir) = app_with_files("refresh_gone", &[("a.txt", b"a")]);
+        let gone = dir.join("sub").join("deeper");
+        std::fs::create_dir_all(&gone).unwrap();
+        app.left.change_dir(&gone).unwrap();
+        std::fs::remove_dir_all(dir.join("sub")).unwrap();
+        app.refresh_from_disk();
+        // Up past every directory that went with it.
+        assert_eq!(app.left.cwd, dir);
+        assert!(!app.should_quit);
+        assert!(app.error_dialog_is_notice);
+        assert!(app.error_dialog.take().unwrap().contains("is gone"));
+        app.refresh_from_disk();
+        assert!(app.error_dialog.is_none(), "said once");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_quick_view_follows_a_file_that_changes() {
+        let (mut app, dir) = app_with_files("refresh_preview", &[("a.txt", b"kot\n")]);
+        app.run_action(Action::View).unwrap();
+        app.preview_focus = true;
+        assert!(app.open_preview_find());
+        app.preview_find_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        let read = |app: &App| match preview::build_preview(app.active_pane_ref()) {
+            preview::PreviewContent::Text(lines) => lines,
+            _ => panic!("not text"),
+        };
+        // Asked again, the same text comes back without reading the file.
+        let first = read(&app);
+        assert!(std::rc::Rc::ptr_eq(&first, &read(&app)));
+        // Unchanged, the search stays.
+        app.refresh_from_disk();
+        assert!(app.preview_find.is_some());
+
+        std::fs::write(dir.join("a.txt"), "pies\n").unwrap();
+        touch(&dir.join("a.txt"), 10);
+        app.refresh_from_disk();
+        assert_eq!(read(&app)[0], "pies");
+        assert!(app.preview_find.is_none(), "a search in the old text goes");
+        assert!(app.quick_view);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_finished_job_whose_pane_has_gone_does_not_end_the_program() {
+        let dir =
+            std::env::temp_dir().join(format!("pc_test_job_pane_gone_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("dest")).unwrap();
+        std::fs::write(dir.join("src/a"), "x").unwrap();
+        let mut app = app_with_panes(&dir.join("src"), &dir.join("dest"));
+        select(&mut app, "a");
+        app.request_copy();
+        app.confirm_dialog().unwrap();
+        while !app.job.as_ref().unwrap().is_finished() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(dir.join("dest")).unwrap();
+        app.poll_job().unwrap();
+        assert!(!app.should_quit);
+        assert!(app.error_dialog.take().unwrap().contains("right pane"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

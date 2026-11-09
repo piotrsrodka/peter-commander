@@ -23,6 +23,7 @@ ratatui-image = { version = "11.1.0", default-features = false, features = ["cro
 shell-words = "1.1.1"
 signal-hook = "0.4.4"
 trash = "5.2.9"
+unicode-width = "0.2.2"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.190"

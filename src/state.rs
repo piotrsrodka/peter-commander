@@ -11,7 +11,30 @@ pub struct LastDirs {
 }
 
 fn config_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    return test_dir::get();
+    #[cfg(not(test))]
     Some(dirs::config_dir()?.join("peter-commander"))
+}
+
+/// Under test, no settings or last directories at all — never the user's
+/// own — unless a test hands its thread a directory of its own for them.
+#[cfg(test)]
+pub mod test_dir {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub fn set(dir: Option<PathBuf>) {
+        DIR.with(|cell| *cell.borrow_mut() = dir);
+    }
+
+    pub(super) fn get() -> Option<PathBuf> {
+        DIR.with(|cell| cell.borrow().clone())
+    }
 }
 
 fn state_file() -> Option<PathBuf> {

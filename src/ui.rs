@@ -12,16 +12,80 @@ use ratatui::widgets::{
 
 use crate::app::{App, Dialog, DialogKind, SettingItem, Side};
 use crate::bulk_rename::Plan;
+use crate::editor::{self, Editor, Pos, ScreenRow};
 use crate::image_preview::{ImagePreview, ImageState};
 use crate::job::Job;
 use crate::logging;
-use crate::menu::{Action, FN_KEYS, MENU_BAR};
+use crate::menu::{Action, FN_KEYS};
 use crate::pane::{Pane, SortKey};
 use crate::preview::{self, PreviewContent};
 use crate::transfer::{TextField, Transfer};
 use ratatui_image::Image;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    if app.editor.as_ref().is_some_and(|editor| editor.full_screen) {
+        draw_full_screen_editor(frame, app);
+    } else {
+        draw_panels(frame, app);
+    }
+    draw_overlays(frame, app);
+}
+
+/// Whether anything is open over the panes (or the editor), which then
+/// can't have the cursor or a picture showing through.
+fn overlay_open(app: &App) -> bool {
+    app.menu_open
+        || app.help_open
+        || app.logs_open
+        || app.about_open
+        || app.job_visible
+        || app.error_dialog.is_some()
+        || !matches!(app.dialog, Dialog::None)
+}
+
+/// F4 a second time: the editor on the whole screen, under the menu bar as
+/// everywhere else — or, with the "Focus mode editor" setting, alone, the
+/// menu bar showing only while F9/Alt+letter has it open, over the
+/// editor's title.
+fn draw_full_screen_editor(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    app.left_pane_area = Rect::default();
+    app.right_pane_area = Rect::default();
+    app.fn_key_tiles.clear();
+    app.menu_bar_tiles.clear();
+    app.menu_item_tiles.clear();
+    let bar = Rect { height: 1, ..area };
+    if app.editor_focus_mode {
+        draw_editor_in(frame, area, app);
+        if app.menu_open {
+            draw_menu_bar(frame, bar, app);
+        }
+    } else {
+        let below = Rect {
+            y: area.y + bar.height.min(area.height),
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        draw_menu_bar(frame, bar, app);
+        draw_editor_in(frame, below, app);
+    }
+    if app.menu_open {
+        draw_menu_dropdown(frame, bar, app);
+    }
+}
+
+/// `draw_editor` with what it needs from `app`, recording where it went for
+/// the mouse.
+fn draw_editor_in(frame: &mut Frame, area: Rect, app: &mut App) {
+    let show_cursor = !overlay_open(app);
+    let classic_style = app.classic_style;
+    if let Some(editor) = app.editor.as_mut() {
+        app.editor_text_area = draw_editor(frame, area, editor, classic_style, show_cursor);
+        app.editor_area = area;
+    }
+}
+
+fn draw_panels(frame: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -51,16 +115,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.left_pane_area = panes[0];
     app.right_pane_area = panes[1];
 
-    if app.quick_view {
+    if app.editor.is_some() {
+        // The editor takes the other pane, like the quick view; the listing
+        // beside it has no highlight, since the keyboard is in the editor.
+        let (list_area, editor_area) = match app.active {
+            Side::Left => (panes[0], panes[1]),
+            Side::Right => (panes[1], panes[0]),
+        };
+        let (pane, list_state) = match app.active {
+            Side::Left => (&app.left, &mut app.left_list_state),
+            Side::Right => (&app.right, &mut app.right_list_state),
+        };
+        draw_pane(frame, list_area, pane, false, list_state, look);
+        draw_editor_in(frame, editor_area, app);
+    } else if app.quick_view {
         // Graphics sit on top of the text grid and don't mix with anything
         // drawn over them, so a picture steps aside for the duration.
-        let covered = app.menu_open
-            || app.help_open
-            || app.logs_open
-            || app.about_open
-            || app.job_visible
-            || app.error_dialog.is_some()
-            || !matches!(app.dialog, Dialog::None);
+        let covered = overlay_open(app);
         match app.active {
             Side::Left => {
                 app.preview_visible_lines = panes[1].height.saturating_sub(2) as usize;
@@ -79,6 +150,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &app.left,
                     PreviewLook::of(app, covered),
                     &mut app.image_preview,
+                    app.preview_find.as_ref(),
                 );
             }
             Side::Right => {
@@ -90,6 +162,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &app.right,
                     PreviewLook::of(app, covered),
                     &mut app.image_preview,
+                    app.preview_find.as_ref(),
                 );
                 draw_pane(
                     frame,
@@ -126,7 +199,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.menu_open {
         draw_menu_dropdown(frame, root[0], app);
     }
+}
 
+/// Dialogs and boxes over everything else, in either layout.
+fn draw_overlays(frame: &mut Frame, app: &mut App) {
     match &app.dialog {
         Dialog::Confirm { kind, items } => {
             draw_confirm_dialog(
@@ -188,6 +264,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.dialog_cancel_focused,
             );
         }
+        Dialog::UnsavedChanges { focused, .. } => {
+            let name = app
+                .editor
+                .as_ref()
+                .map_or_else(|| "the file".to_string(), Editor::file_name);
+            draw_unsaved_dialog(frame, app.classic_style, &name, *focused);
+        }
         Dialog::ConfirmQuit => {
             draw_quit_dialog(
                 frame,
@@ -221,7 +304,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(message) = &app.error_dialog {
-        draw_error_dialog(frame, app.classic_style, message);
+        if app.error_dialog_is_notice {
+            draw_notice_dialog(frame, app.classic_style, message);
+        } else {
+            draw_error_dialog(frame, app.classic_style, message);
+        }
     }
 }
 
@@ -231,7 +318,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// Same double-bordered box as every other dialog, in the classic red of
 /// Norton Commander's error boxes.
 fn draw_error_dialog(frame: &mut Frame, classic_style: bool, message: &str) {
-    let pal = error_palette(classic_style);
+    draw_message_box(frame, &error_palette(classic_style), "Error", message);
+}
+
+/// `App::set_notice`: the error box's shape, in the ordinary dialog colors.
+fn draw_notice_dialog(frame: &mut Frame, classic_style: bool, message: &str) {
+    draw_message_box(frame, &dialog_palette(classic_style), "Note", message);
+}
+
+fn draw_message_box(frame: &mut Frame, pal: &DialogPalette, title: &str, message: &str) {
     let wrap_width = (frame.area().width as usize)
         .saturating_sub(16)
         .clamp(20, 64);
@@ -244,8 +339,8 @@ fn draw_error_dialog(frame: &mut Frame, classic_style: bool, message: &str) {
             )))
         })
         .collect();
-    let sections = vec![lines, vec![button_row(&[("OK", true)], &pal)]];
-    draw_dialog_box(frame, &pal, "Error", sections, 0);
+    let sections = vec![lines, vec![button_row(&[("OK", true)], pal)]];
+    draw_dialog_box(frame, pal, title, sections, 0);
 }
 
 /// Greedy word-wrap to at most `width` columns per line — good enough for
@@ -279,7 +374,7 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
             "F1        Help          This screen",
             "F2        Rename        Rename the selected entry",
             "F3        View          Quick view (or $PAGER, per Settings)",
-            "F4        Edit          Edit the selected file in $EDITOR",
+            "F4        Edit          Edit the file (built-in, or $EDITOR)",
             "Shift+F4  New File      Create a new empty file",
             "F5        Copy          Copy selection/marked to the other pane",
             "F6        Move          Move selection/marked to the other pane",
@@ -315,11 +410,35 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "Built-in editor",
+        &[
+            "F4 opens the file in the other pane; F4 again: full screen.",
+            "Esc clears a selection, or else closes it; F10/Ctrl+Q quits.",
+            "Closing and quitting ask first about unsaved changes.",
+            "",
+            "Ctrl+S        Save           Ctrl+Z/Y      Undo/redo",
+            "F2            Rename the file (keeps your unsaved changes)",
+            "Ctrl+A        Select all     Ctrl+C/X/V    Copy/cut/paste",
+            "Shift+arrows  Select         Ctrl+\u{2190}/\u{2192}      Move by word",
+            "Home/End      Line start/end Ctrl+Home/End File start/end",
+            "Tab           4 spaces       Shift+Tab     Remove 4 spaces",
+            "Ctrl+Bksp/Del Delete a word  F9, Alt+E     Menu, Edit menu",
+            "Ctrl+F        Find           F3/Shift+F3   Next/previous",
+            "In Find, typing searches as you go (case doesn't matter);",
+            "Enter keeps the match selected, Esc clears it; F3 goes on.",
+            "Wrap Lines (Edit or Options) wraps long lines, F3's as well.",
+            "Line endings are kept (a stray CR shows as \u{240d}). Settings:",
+            "External editor sends F4 to $EDITOR; Focus mode editor",
+            "hides the menu bar full screen until F9.",
+        ],
+    ),
+    (
         "Tips",
         &[
             "Type anywhere to fill the command line; Enter runs it in the",
             "active pane's directory, or opens the selection if it's empty.",
-            "Esc clears the command line.",
+            "Esc clears the command line. A paste never runs it: only its",
+            "first line goes in, for you to check and run with Enter.",
             "",
             "Command > Sort by Name/Type/Size/Date sorts the active pane;",
             "picking the same sort again reverses it. Each pane keeps its",
@@ -331,8 +450,9 @@ const HELP_PAGES: &[(&str, &[&str])] = &[
             "Copy/Move show a progress window: Esc or [ Background ] lets it",
             "run while you work; Ctrl+B shows it again.",
             "",
-            "Mouse: scroll the active pane/preview, click the menu bar or an",
-            "F-key tile.",
+            "Tab onto the F3 preview: \u{2190}/\u{2192} scroll it sideways (unwrapped),",
+            "Ctrl+F finds in it, F3/Shift+F3 next/previous, Esc clears.",
+            "Mouse: scroll a pane or the preview, click the menu or a key.",
         ],
     ),
 ];
@@ -992,6 +1112,26 @@ fn draw_quit_dialog(
     draw_dialog_frame(frame, classic_style, "Quit", sections, false);
 }
 
+/// Closing the editor (or quitting) with unsaved changes, as Notepad asks.
+fn draw_unsaved_dialog(frame: &mut Frame, classic_style: bool, name: &str, focused: usize) {
+    let pal = dialog_palette(classic_style);
+    let sections = vec![
+        vec![DialogLine::Text(Line::from(Span::styled(
+            format!("Save changes to \"{name}\"?"),
+            Style::default().fg(pal.fg),
+        )))],
+        vec![button_row(
+            &[
+                ("Save", focused == 0),
+                ("Don't Save", focused == 1),
+                ("Cancel", focused == 2),
+            ],
+            &pal,
+        )],
+    ];
+    draw_dialog_frame(frame, classic_style, "Unsaved Changes", sections, false);
+}
+
 /// How many `old → new` lines the bulk-rename prompt shows before summing
 /// up the rest.
 const BULK_RENAME_LIST_LIMIT: usize = 5;
@@ -1284,7 +1424,7 @@ fn draw_menu_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut x = area.x + 1; // the leading raw space
     let mut spans = Vec::new();
     spans.push(Span::raw(" "));
-    for (idx, category) in MENU_BAR.iter().enumerate() {
+    for (idx, category) in app.menu_bar().iter().enumerate() {
         let is_selected = app.menu_open && idx == app.menu_category;
         let style = match (app.classic_style, is_selected) {
             (true, true) => Style::default()
@@ -1413,16 +1553,17 @@ fn draw_shadow_for(frame: &mut Frame, area: Rect) {
 fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
     // Compute the x offset of the selected category so the dropdown appears under it.
     let mut x = menu_bar_area.x + 1;
-    for category in &MENU_BAR[..app.menu_category] {
+    let menu_bar = app.menu_bar();
+    for category in &menu_bar[..app.menu_category] {
         x += category.title.len() as u16 + 2;
     }
 
-    let category = &MENU_BAR[app.menu_category];
+    let category = &menu_bar[app.menu_category];
     let row_text_width = category
         .items
         .iter()
         .map(|action| {
-            let shortcut_width = action.shortcut().map_or(0, |s| s.len() + 3);
+            let shortcut_width = app.menu_shortcut(*action).map_or(0, |s| s.len() + 3);
             app.menu_label(*action).chars().count() + shortcut_width
         })
         .max()
@@ -1496,7 +1637,7 @@ fn draw_menu_dropdown(frame: &mut Frame, menu_bar_area: Rect, app: &mut App) {
                 style
             };
             let label = app.menu_label(*action);
-            let (label_part, shortcut_part) = match action.shortcut() {
+            let (label_part, shortcut_part) = match app.menu_shortcut(*action) {
                 Some(shortcut) => (
                     format!(
                         "{label:<label_width$}",
@@ -2192,6 +2333,10 @@ fn column_header_line(pane: &Pane, name_width: usize) -> Line<'static> {
 struct PreviewLook {
     focused: bool,
     scroll: usize,
+    /// Sideways, in cells, for text that isn't wrapped.
+    scroll_x: usize,
+    /// Wrap Lines, shared with the editor.
+    wrap: bool,
     classic_style: bool,
     covered: bool,
 }
@@ -2201,6 +2346,8 @@ impl PreviewLook {
         PreviewLook {
             focused: app.preview_focus,
             scroll: app.preview_scroll,
+            scroll_x: app.preview_scroll_x,
+            wrap: app.wrap_lines,
             classic_style: app.classic_style,
             covered,
         }
@@ -2215,10 +2362,13 @@ fn draw_preview_pane(
     source: &Pane,
     look: PreviewLook,
     images: &mut ImagePreview,
+    find: Option<&crate::app::PreviewFind>,
 ) {
     let PreviewLook {
         focused,
         scroll,
+        scroll_x,
+        wrap,
         classic_style,
         covered,
     } = look;
@@ -2244,10 +2394,14 @@ fn draw_preview_pane(
         Style::default().fg(Color::DarkGray)
     };
 
-    let mut block = Block::default()
-        .title(format!("Preview: {title}"))
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let mut block = titled_with_label(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style),
+        &title,
+        "Preview",
+        area.width,
+    );
     if classic_style {
         block = block.style(Style::default().bg(classic::BG).fg(classic::FILE_FG));
     }
@@ -2266,13 +2420,30 @@ fn draw_preview_pane(
         return;
     }
 
-    // For everything except Text, the scroll offset is applied by
-    // skipping whole (never-wrapped) entries up front. Text is different:
-    // it's word-wrapped, so a scroll offset in *logical* lines would be
-    // wrong once a long line spans multiple visual rows — instead all
-    // lines are kept and `paragraph_scroll` is handed to Ratatui's own
-    // `.scroll()`, which operates in post-wrap visual rows.
-    let mut paragraph_scroll: u16 = 0;
+    // The scroll offset is in screen rows: whole entries for a listing,
+    // and for text the rows it's laid out in — the editor's own, so a file
+    // looks the same in F3 as in F4 (wrapped where it wraps, or cut at the
+    // edge and scrolled sideways, tabs and odd characters drawn alike).
+    let text_style = if classic_style {
+        Style::default().fg(classic::FILE_FG)
+    } else {
+        Style::default().fg(Color::Reset)
+    };
+    let mut inner = block.inner(area);
+    // The find bar, if open, takes the last row (searching this file).
+    let find = find.filter(|find| source.preview_target().as_ref() == Some(&find.target));
+    let bar_area = find
+        .filter(|find| find.text.find.is_some() && inner.height > 1)
+        .map(|_| {
+            inner.height -= 1;
+            Rect {
+                y: inner.y + inner.height,
+                height: 1,
+                ..inner
+            }
+        });
+    let editor_look = EditorLook::of(classic_style);
+    let mut is_text = false;
     let lines: Vec<Line> = match preview::build_preview(source) {
         PreviewContent::Empty => Vec::new(),
         PreviewContent::Directory(entries) => entries
@@ -2303,16 +2474,91 @@ fn draw_preview_pane(
             Style::default().fg(Color::Red),
         ))],
         PreviewContent::Text(text_lines) => {
-            paragraph_scroll = scroll as u16;
-            text_lines.into_iter().map(Line::from).collect()
+            is_text = true;
+            let cols = inner.width as usize;
+            let height = inner.height as usize;
+            let wrap_at = wrap.then(|| editor::wrap_width_for(cols));
+            let scroll_x = if wrap { 0 } else { scroll_x };
+            let mut rows = Vec::with_capacity(height);
+            let mut skip = scroll;
+            // As in the editor: the current match is the selection.
+            let selection = find.and_then(|find| find.text.selection());
+            let find_style = |line: usize, col: usize| {
+                let pos = Pos::new(line, col);
+                if selection.is_some_and(|(start, end)| start <= pos && pos < end) {
+                    return editor_look.selected;
+                }
+                let found = find
+                    .and_then(|find| find.text.find.as_ref())
+                    .is_some_and(|bar| {
+                        bar.matches_on(line)
+                            .iter()
+                            .any(|(start, end)| start.col <= col && col < end.col)
+                    });
+                if found { editor_look.found } else { text_style }
+            };
+            for (line_idx, line) in text_lines.iter().enumerate() {
+                if rows.len() == height {
+                    break;
+                }
+                // Unwrapped, a line is one row: no need to lay it out to
+                // pass it by.
+                if wrap_at.is_none() && skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                let layout = editor::LineLayout::new(line, wrap_at);
+                let count = layout.starts.len();
+                if skip >= count {
+                    skip -= count;
+                    continue;
+                }
+                for idx in skip..count {
+                    if rows.len() == height {
+                        break;
+                    }
+                    let end = layout
+                        .starts
+                        .get(idx + 1)
+                        .copied()
+                        .unwrap_or(layout.chars.len());
+                    rows.push(text_row_line(
+                        &layout,
+                        (layout.starts[idx], end),
+                        scroll_x,
+                        cols,
+                        |col| find_style(line_idx, col),
+                        None,
+                    ));
+                }
+                skip = 0;
+            }
+            rows
         }
     };
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((paragraph_scroll, 0));
-    frame.render_widget(paragraph, area);
+    // The text inside, the frame round it: the find bar's row is the
+    // frame's to keep clear.
+    frame.render_widget(block, area);
+    let mut paragraph = Paragraph::new(lines);
+    // Listings and notes may wrap as they always did; text is already laid
+    // out to fit.
+    if !is_text {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(paragraph, inner);
+    if let (Some(bar_area), Some(find)) = (bar_area, find)
+        && let Some(bar) = &find.text.find
+    {
+        let note = if find.truncated { " (first 1 MB)" } else { "" };
+        let cursor = draw_find_bar(frame, bar_area, bar, note, classic_style, editor_look);
+        if focused
+            && !covered
+            && let Some(cursor) = cursor
+        {
+            frame.set_cursor_position(cursor);
+        }
+    }
 }
 
 /// The picture centered in `area`, or a line saying why it isn't there.
@@ -2344,6 +2590,401 @@ fn draw_preview_image(
         ImageState::Failed(err) => {
             frame.render_widget(note(format!("Cannot preview: {err}"), Color::Red), area);
         }
+    }
+}
+
+/// The editor's selection — the find bar's current match included, which is
+/// selected — in both palettes: the marked-files yellow, under dark text.
+const SELECTION_BG: Color = MARKED_FG;
+
+/// The find bar's other matches: turquoise, under dark text, so they can't
+/// be taken for the selection.
+const FIND_MATCH_BG: Color = Color::Rgb(0x55, 0xdd, 0xdd);
+
+/// The colors the editor draws its text in — and the quick view its find.
+#[derive(Clone, Copy)]
+struct EditorLook {
+    text: Style,
+    selected: Style,
+    found: Style,
+}
+
+impl EditorLook {
+    fn of(classic_style: bool) -> Self {
+        // Black, not the terminal's own dark color, which some themes make
+        // too light to read on these.
+        let selected = Style::default().fg(Color::Rgb(0, 0, 0)).bg(SELECTION_BG);
+        let found = Style::default().fg(Color::Rgb(0, 0, 0)).bg(FIND_MATCH_BG);
+        let text = if classic_style {
+            Style::default().fg(classic::FILE_FG).bg(classic::BG)
+        } else {
+            // Like the file names: the terminal's own text color.
+            Style::default().fg(Color::Reset)
+        };
+        EditorLook {
+            text,
+            selected,
+            found,
+        }
+    }
+}
+
+/// The built-in editor in `area`: a framed text area titled with the file's
+/// path, the find bar while it's open, and a status line. The cursor is the
+/// terminal's own (unless `show_cursor` is off because something covers
+/// the editor). Returns the text area, for the mouse.
+fn draw_editor(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &mut Editor,
+    classic_style: bool,
+    show_cursor: bool,
+) -> Rect {
+    let border_style = if classic_style {
+        Style::default()
+            .fg(classic::ACTIVE_BORDER_FG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let look = EditorLook::of(classic_style);
+
+    let mut block = titled_with_label(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style),
+        &editor.path.display().to_string(),
+        // Marked as Notepad marks its title, on the border where the eye
+        // goes first.
+        if editor.is_modified() {
+            "Editing*"
+        } else {
+            "Editing"
+        },
+        area.width,
+    );
+    if classic_style {
+        block = block.style(look.text);
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // From the bottom up: the status line, the find bar, and a divider
+    // between them and the text like the panes' own footer.
+    let mut text_area = inner;
+    let take_bottom_row = |text_area: &mut Rect| {
+        (text_area.height > 0).then(|| {
+            text_area.height -= 1;
+            Rect {
+                y: text_area.y + text_area.height,
+                height: 1,
+                ..*text_area
+            }
+        })
+    };
+    let status_area = take_bottom_row(&mut text_area);
+    let find_area = if editor.find.is_some() {
+        take_bottom_row(&mut text_area)
+    } else {
+        None
+    };
+    let divider_area = if text_area.height >= 3 {
+        take_bottom_row(&mut text_area)
+    } else {
+        None
+    };
+
+    editor.scroll_into_view(text_area.height as usize, text_area.width as usize);
+    let lines: Vec<Line> = editor
+        .screen_rows(text_area.height as usize)
+        .iter()
+        .map(|row| editor_row_line(editor, row, text_area.width as usize, look))
+        .collect();
+    frame.render_widget(Paragraph::new(lines).style(look.text), text_area);
+
+    if let Some(divider) = divider_area {
+        frame.render_widget(
+            Paragraph::new("\u{2500}".repeat(divider.width as usize)).style(border_style),
+            divider,
+        );
+        let buf = frame.buffer_mut();
+        if let Some(cell) = buf.cell_mut((area.x, divider.y)) {
+            cell.set_symbol("\u{251c}").set_style(border_style);
+        }
+        if let Some(cell) = buf.cell_mut((area.x + area.width.saturating_sub(1), divider.y)) {
+            cell.set_symbol("\u{2524}").set_style(border_style);
+        }
+    }
+
+    let mut cursor = editor.cursor_in_view().map(|(row, x)| {
+        ratatui::layout::Position::new(text_area.x + x as u16, text_area.y + row as u16)
+    });
+    if let (Some(find_area), Some(bar)) = (find_area, &editor.find) {
+        cursor = draw_find_bar(frame, find_area, bar, "", classic_style, look);
+    }
+    if let Some(status_area) = status_area {
+        frame.render_widget(
+            Paragraph::new(editor_status_text(editor, status_area.width as usize)).style(look.text),
+            status_area,
+        );
+    }
+    if show_cursor && let Some(position) = cursor {
+        frame.set_cursor_position(position);
+    }
+    text_area
+}
+
+/// Cells of path a pane keeps before its label gives way to it.
+const MIN_TITLE_PATH: usize = 8;
+
+/// The top border of a box `width` cells wide showing `path` and what it
+/// is (`label`: "Preview", "Editing"): the path on the left, cut from the
+/// left to fit, and the label on the right, a space apart so the two can
+/// never run into each other. Where there isn't room for the label and a
+/// useful bit of the path, the label goes.
+fn titled_with_label<'a>(block: Block<'a>, path: &str, label: &'a str, width: u16) -> Block<'a> {
+    let inside = width.saturating_sub(2) as usize;
+    let label_width = label.chars().count();
+    if inside >= label_width + 1 + MIN_TITLE_PATH {
+        block
+            .title(fit_path_title(path, inside - label_width - 1))
+            .title_top(Line::from(label).right_aligned())
+    } else {
+        block.title(fit_path_title(path, inside))
+    }
+}
+
+/// `path` in at most `width` cells: cut from the left (`…/src/main.rs`) when
+/// it's too long, so the file's own name is what stays in sight.
+fn fit_path_title(path: &str, width: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if Span::raw(path).width() <= width {
+        return path.to_string();
+    }
+    let mut tail = String::new();
+    let mut used = 1;
+    for &c in chars.iter().rev() {
+        let w = Span::raw(c.to_string()).width();
+        if used + w > width {
+            break;
+        }
+        used += w;
+        tail.insert(0, c);
+    }
+    format!("\u{2026}{tail}")
+}
+
+/// One screen row of the editor's text, `cols` cells wide from the view's
+/// horizontal scroll, with the selection and find matches highlighted and a
+/// selected line break as one highlighted cell after the text.
+fn editor_row_line(
+    editor: &Editor,
+    row: &ScreenRow,
+    cols: usize,
+    look: EditorLook,
+) -> Line<'static> {
+    // Shared by every screen row of the line, and kept between frames.
+    let layout = editor.line_layout(row.line);
+    let selection = editor.selection();
+    let matches = editor
+        .find
+        .as_ref()
+        .map_or(&[][..], |bar| bar.matches_on(row.line));
+    let mut next_match = 0;
+    let is_selected = |pos: Pos| selection.is_some_and(|(start, end)| start <= pos && pos < end);
+    let style_at = |col: usize| {
+        while next_match < matches.len() && matches[next_match].1.col <= col {
+            next_match += 1;
+        }
+        if is_selected(Pos::new(row.line, col)) {
+            look.selected
+        } else if matches
+            .get(next_match)
+            .is_some_and(|(start, _)| start.col <= col)
+        {
+            look.found
+        } else {
+            look.text
+        }
+    };
+    let line_break =
+        (row.last && is_selected(Pos::new(row.line, layout.chars.len()))).then_some(look.selected);
+    text_row_line(
+        &layout,
+        (row.start, row.end),
+        editor.scroll_x(),
+        cols,
+        style_at,
+        line_break,
+    )
+}
+
+/// A screen row of text — characters `start..end` of the line laid out in
+/// `layout` — as the editor draws it, and the quick view too, so a file
+/// looks the same in both: `cols` cells from column `scroll_x`, tabs as
+/// spaces to the next stop, control and direction marks as visible glyphs,
+/// a wide letter cut by either edge as blank cells. `style_at` colors each
+/// character (asked in order); `line_break`, if given, is one cell of that
+/// style after the text.
+fn text_row_line(
+    layout: &editor::LineLayout,
+    (start, end): (usize, usize),
+    scroll_x: usize,
+    cols: usize,
+    mut style_at: impl FnMut(usize) -> Style,
+    line_break: Option<Style>,
+) -> Line<'static> {
+    let chars = &layout.chars;
+    let end_x = scroll_x + cols;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let push = |spans: &mut Vec<Span<'static>>, text: String, style: Style| match spans.last_mut() {
+        Some(last) if last.style == style => last.content.to_mut().push_str(&text),
+        _ => spans.push(Span::styled(text, style)),
+    };
+    // Scrolled far along a long line, start near the first cell shown.
+    let (from, mut x) = layout.seek(start, scroll_x);
+    for (col, &c) in chars.iter().enumerate().take(end).skip(from) {
+        let width = editor::char_width(c, x);
+        if width == 0 {
+            // A combining mark goes with the letter before it.
+            if x > scroll_x && x <= end_x {
+                let style = spans
+                    .last()
+                    .map_or_else(|| style_at(col), |span| span.style);
+                push(&mut spans, c.to_string(), style);
+            }
+            continue;
+        }
+        if x + width <= scroll_x {
+            x += width;
+            continue;
+        }
+        if x >= end_x {
+            break;
+        }
+        let style = style_at(col);
+        let text = if c == '\t' || x < scroll_x || x + width > end_x {
+            " ".repeat((x + width).min(end_x) - x.max(scroll_x))
+        } else {
+            editor::display_glyph(c).to_string()
+        };
+        push(&mut spans, text, style);
+        x += width;
+    }
+    if let Some(style) = line_break
+        && x >= scroll_x
+        && x < end_x
+    {
+        push(&mut spans, " ".to_string(), style);
+    }
+    Line::from(spans)
+}
+
+/// The find bar: the search text in a field (preselected text shown as
+/// such, so it's clear typing replaces it) and the match count. Returns
+/// where the cursor goes, in the field.
+fn draw_find_bar(
+    frame: &mut Frame,
+    area: Rect,
+    bar: &editor::FindBar,
+    note: &str,
+    classic_style: bool,
+    look: EditorLook,
+) -> Option<ratatui::layout::Position> {
+    let pal = dialog_palette(classic_style);
+    let field_style = Style::default().bg(pal.field_bg).fg(pal.field_fg);
+    const LABEL: &str = " Find: ";
+    // `note` qualifies the count ("3/12 (first 1 MB)"), once there is one.
+    let status = bar.status();
+    let note = if status.is_empty() { "" } else { note };
+    let status = format!(" {status}{note} ");
+    let label_width = LABEL.chars().count();
+    let status_width = Span::raw(status.as_str()).width();
+    let field_width = (area.width as usize).saturating_sub(label_width + status_width);
+
+    let chars: Vec<char> = bar.field.text().chars().collect();
+    let cursor = bar.field.cursor();
+    // One cell to spare at the end, for the cursor after the last letter.
+    let (start, end) = visible_chars(&chars, cursor, field_width.saturating_sub(1).max(1));
+    let shown: String = chars[start..end].iter().collect();
+    let shown_width = Span::raw(shown.as_str()).width();
+    let text_style = if bar.fresh {
+        look.selected
+    } else {
+        field_style
+    };
+    let line = Line::from(vec![
+        Span::styled(LABEL, look.text),
+        Span::styled(shown, text_style),
+        Span::styled(
+            " ".repeat(field_width.saturating_sub(shown_width)),
+            field_style,
+        ),
+        Span::styled(status, look.text),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(look.text), area);
+
+    let before: String = chars[start..cursor.max(start)].iter().collect();
+    let x = label_width + Span::raw(before.as_str()).width();
+    (x < area.width as usize).then(|| ratatui::layout::Position::new(area.x + x as u16, area.y))
+}
+
+/// "Ln 3, Col 14  Modified" on the left — plus a note like "Saved" —
+/// and the main keys on the right, as room allows.
+fn editor_status_text(editor: &Editor, width: usize) -> String {
+    let cursor = editor.cursor();
+    let mut left = format!(" Ln {}, Col {}", cursor.line + 1, cursor.col + 1);
+    if editor.is_modified() {
+        left.push_str("  Modified");
+    }
+    if let Some(message) = &editor.message {
+        left.push_str("  ");
+        left.push_str(message);
+    }
+    // Longest first; the first that fits is shown. Full screen, with no
+    // menu bar or F-key bar in sight, F1 and F9 lead, so it's clear where
+    // help and the menu are, and F1 and the way out are the last to go. In
+    // the pane the F-key bar below says all that, so only what it doesn't.
+    // With something selected, Esc only lets go of it (see
+    // `App::run_editor_command`), so that's what the hint says.
+    let selected = editor.selection().is_some();
+    let hints: &[&str] = match (editor.full_screen, editor.find.is_some(), selected) {
+        (false, true, _) => &[
+            "F3 Next  Shift+F3 Previous  Enter Select ",
+            "F3 Next  Enter Select ",
+            "F3 Next ",
+        ],
+        (false, false, _) => &["Ctrl+S Save  F4 Full screen ", "Ctrl+S Save "],
+        (true, true, _) => &[
+            "F1 Help  F9 Menu  F3 Next  Shift+F3 Previous  Enter Select  Esc Done ",
+            "F1 Help  F9 Menu  F3 Next  Enter Select  Esc Done ",
+            "F1 Help  Esc Done ",
+        ],
+        (true, false, true) => &[
+            "F1 Help  F9 Menu  Ctrl+S Save  Esc Done  F4 Pane ",
+            "F1 Help  F9 Menu  Ctrl+S Save  Esc Done ",
+            "F1 Help  F9 Menu  Esc Done ",
+            "F1 Help  Esc Done ",
+        ],
+        (true, false, false) => &[
+            "F1 Help  F9 Menu  Ctrl+S Save  Esc Close  F4 Pane ",
+            "F1 Help  F9 Menu  Ctrl+S Save  Esc Close ",
+            "F1 Help  F9 Menu  Esc Close ",
+            "F1 Help  Esc Close ",
+        ],
+    };
+    let left_width = Span::raw(left.as_str()).width();
+    match hints
+        .iter()
+        .find(|hint| left_width + 2 + hint.chars().count() <= width)
+    {
+        Some(hint) => format!(
+            "{left}{}{hint}",
+            " ".repeat(width - left_width - hint.chars().count())
+        ),
+        None => left,
     }
 }
 
@@ -2498,6 +3139,17 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
         ));
         x += tile_widths[idx];
 
+        // While editing, each key as the editor has it: relabeled where it
+        // does something else there, dimmed (like a grayed menu item)
+        // where it does nothing.
+        let (label, active) = if app.editor.is_some() {
+            app.editor_fn_key(fn_key)
+        } else if fn_key.action == Some(Action::View) && app.preview_next_mode() {
+            // F3 is Find Next in a quick view being searched.
+            ("Next", true)
+        } else {
+            (fn_key.label, true)
+        };
         let (num_fg, num_bg, label_fg, label_bg) = if app.classic_style {
             (
                 classic::FN_KEY_NUM_FG,
@@ -2508,16 +3160,23 @@ fn draw_fn_key_bar(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             (Color::Yellow, Color::Black, Color::Black, Color::Cyan)
         };
+        let (num_fg, label_fg) = match (active, app.classic_style) {
+            (true, _) => (num_fg, label_fg),
+            (false, true) => (classic::MENU_DISABLED_FG, classic::MENU_DISABLED_FG),
+            (false, false) => (Color::DarkGray, Color::DarkGray),
+        };
+        let num_style = Style::default().fg(num_fg).bg(num_bg);
         spans.push(Span::styled(
             fn_key.key,
-            Style::default()
-                .fg(num_fg)
-                .bg(num_bg)
-                .add_modifier(Modifier::BOLD),
+            if active {
+                num_style.add_modifier(Modifier::BOLD)
+            } else {
+                num_style
+            },
         ));
         let label_width = tile_widths[idx].saturating_sub(fn_key.key.len() as u16) as usize;
         spans.push(Span::styled(
-            format!("{:<label_width$}", fn_key.label),
+            format!("{label:<label_width$}"),
             Style::default().fg(label_fg).bg(label_bg),
         ));
     }
@@ -2589,7 +3248,7 @@ mod tests {
         // Recompute the same area/shadow_area the real code computes, to
         // find a cell that should be shadow-only (outside the dropdown's
         // own area, inside shadow_area).
-        let category = &MENU_BAR[0];
+        let category = &crate::menu::MENU_BAR[0];
         let row_text_width = category
             .items
             .iter()
@@ -2888,6 +3547,673 @@ mod tests {
         assert!(corners.windows(2).all(|w| w[0] == w[1]), "{corners:?}");
     }
 
+    /// An app editing a file holding `text`, drawn on an 80x24 screen.
+    fn editing_app(name: &str, text: &str) -> (App, PathBuf) {
+        use crate::pane::Pane;
+        let dir = std::env::temp_dir().join(format!("pc_test_ui_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), text).unwrap();
+        let mut app = App::new().unwrap();
+        app.classic_style = false;
+        app.left = Pane::new(dir.clone(), false).unwrap();
+        app.active = Side::Left;
+        app.left.selected = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "notes.txt")
+            .unwrap();
+        app.editor = Some(Editor::open(&dir.join("notes.txt")).unwrap());
+        (app, dir)
+    }
+
+    fn draw_app(app: &mut App) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+    }
+
+    fn cursor_of(terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>) -> (u16, u16) {
+        use ratatui::backend::Backend;
+        let position = terminal.backend_mut().get_cursor_position().unwrap();
+        (position.x, position.y)
+    }
+
+    #[test]
+    fn editor_shows_in_the_other_pane_with_its_cursor_and_status() {
+        let (mut app, dir) = editing_app("editor_pane", "zażółć\n\tgęślą\n");
+        if let Some(editor) = &mut app.editor {
+            editor.apply(editor::Command::Move {
+                motion: editor::Motion::Down,
+                select: false,
+            });
+            editor.apply(editor::Command::Move {
+                motion: editor::Motion::Right,
+                select: false,
+            });
+        }
+        let mut terminal = draw_app(&mut app);
+        let text = buffer_text(terminal.backend().buffer());
+        let rows: Vec<&str> = text.lines().collect();
+        // The listing stays on the left; the editor is the right pane.
+        // A long path is cut from the left, so the file name stays in sight.
+        let right_title = &rows[1][rows[1].find('\u{2510}').unwrap()..];
+        assert!(right_title.contains("\u{2026}"), "{text}");
+        // What the pane is, on the right of the same border.
+        assert!(
+            right_title.contains("/notes.txt\u{2500}Editing\u{2510}"),
+            "{text}"
+        );
+        assert!(rows[2].contains("\u{2502}zażółć"), "{text}");
+        assert!(rows[3].contains("\u{2502}    gęślą"), "{text}");
+        assert!(text.contains("Ln 2, Col 2"), "{text}");
+        // In the pane the F-key bar below has help, the menu and the rest;
+        // the status line only what it doesn't.
+        assert!(text.contains("Ctrl+S Save"), "{text}");
+        assert!(
+            !text.contains("F1 Help") && !text.contains("Esc Close"),
+            "{text}"
+        );
+        assert!(text.contains("F1Help"), "the F-key bar is still there");
+        assert!(text.contains("F3Next") && text.contains("F4Full"), "{text}");
+        // After the tab: four cells in, on the right pane's text.
+        let editor_x = app.editor_text_area.x;
+        assert_eq!(cursor_of(&mut terminal), (editor_x + 4, 3));
+        assert!(editor_x >= 40);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn full_screen_editor_takes_the_whole_screen_in_both_styles() {
+        for classic_style in [false, true] {
+            let (mut app, dir) = editing_app("editor_full", "first line\n");
+            app.classic_style = classic_style;
+            app.editor_focus_mode = false;
+            app.editor.as_mut().unwrap().full_screen = true;
+            let mut terminal = draw_app(&mut app);
+            let buf = terminal.backend().buffer().clone();
+            let text = buffer_text(&buf);
+            let rows: Vec<&str> = text.lines().collect();
+            // The menu bar stays on top, as everywhere else in the app.
+            assert!(rows[0].contains("File  Edit  Options  Command"), "{text}");
+            assert!(rows[1].contains("notes.txt"), "{text}");
+            assert!(rows[2].starts_with("\u{2502}first line"), "{text}");
+            assert!(text.contains("F1 Help  F9 Menu"), "{text}");
+            assert!(text.contains("F4 Pane"), "{text}");
+            assert!(!text.contains("F1Help"), "{text}");
+            assert_eq!(cursor_of(&mut terminal), (1, 2));
+            assert!(!app.menu_bar_tiles.is_empty(), "the bar takes clicks");
+            if classic_style {
+                assert_eq!(buf[(20, 10)].bg, classic::BG);
+            }
+
+            app.menu_open = true;
+            app.menu_category = 1;
+            let terminal = draw_app(&mut app);
+            let text = buffer_text(terminal.backend().buffer());
+            assert!(text.contains("Wrap Lines      [ ]"), "{text}");
+            assert!(text.contains("Find..."), "{text}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn focus_mode_hides_the_menu_bar_until_it_is_called_up() {
+        let (mut app, dir) = editing_app("editor_focus", "first line\n");
+        app.editor_focus_mode = true;
+        app.editor.as_mut().unwrap().full_screen = true;
+        let mut terminal = draw_app(&mut app);
+        let text = buffer_text(terminal.backend().buffer());
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(!rows[0].contains("Options"), "{text}");
+        assert!(rows[0].contains("notes.txt"), "{text}");
+        assert!(rows[1].starts_with("\u{2502}first line"), "{text}");
+        // The way to the menu (and help) is still written down.
+        assert!(text.contains("F1 Help  F9 Menu"), "{text}");
+        assert_eq!(cursor_of(&mut terminal), (1, 1));
+
+        // F9 brings the menu bar up over the title, with the Edit menu.
+        app.menu_open = true;
+        app.menu_category = 1;
+        let terminal = draw_app(&mut app);
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.lines().next().unwrap().contains("Edit"), "{text}");
+        assert!(text.contains("Wrap Lines      [ ]"), "{text}");
+
+        // In the pane the setting changes nothing: the bar is always there.
+        app.menu_open = false;
+        app.editor.as_mut().unwrap().full_screen = false;
+        let terminal = draw_app(&mut app);
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.lines().next().unwrap().contains("Options"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The open dropdown's text: the rows under the menu bar, from its
+    /// left edge on.
+    fn dropdown_text(app: &mut App) -> String {
+        let terminal = draw_app(app);
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn menus_follow_the_editor_opening_and_closing() {
+        let (mut app, dir) = editing_app("editor_menu_switch", "x\n");
+        app.editor = None;
+        // Outside the editor, last on Command (the third menu).
+        app.open_menu_at(2);
+        assert!(dropdown_text(&mut app).contains("Sort by Name"));
+        app.close_menu();
+        app.run_action(Action::Edit).unwrap();
+        assert!(app.editor.is_some());
+        app.editor_key(
+            crossterm::event::KeyCode::F(9),
+            crossterm::event::KeyModifiers::NONE,
+        )
+        .unwrap();
+        assert_eq!(app.menu_category, 0);
+        let text = dropdown_text(&mut app);
+        assert!(text.contains("Save") && text.contains("Close"), "{text}");
+        assert!(!text.contains("Quit "), "Quit is under Command: {text}");
+        assert!(
+            !text.contains("Sort by Name") && !text.contains("Invert Selection"),
+            "{text}"
+        );
+
+        // And back: last on the editor's Command (the fourth), then closed.
+        app.close_menu();
+        app.open_menu_at(3);
+        let text = dropdown_text(&mut app);
+        assert!(
+            text.contains("Show Logs") && text.contains("Quit "),
+            "{text}"
+        );
+        app.close_menu();
+        app.run_action(Action::Close).unwrap();
+        assert!(app.editor.is_none());
+        app.open_menu();
+        let text = dropdown_text(&mut app);
+        assert!(text.contains("Invert Selection"), "{text}");
+        assert!(!text.contains("Close"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The colors of the text area's cells, row by row.
+    fn text_area_backgrounds(app: &mut App) -> Vec<Color> {
+        let terminal = draw_app(app);
+        let buf = terminal.backend().buffer().clone();
+        let area = app.editor_text_area;
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].bg)
+            .collect()
+    }
+
+    /// The text in `area` of a freshly drawn screen, row by row, without
+    /// trailing spaces.
+    fn rows_in(app: &mut App, area: Rect) -> Vec<String> {
+        let terminal = draw_app(app);
+        let text = buffer_text(terminal.backend().buffer());
+        text.lines()
+            .skip(area.y as usize)
+            .take(area.height as usize)
+            .map(|row| {
+                row.chars()
+                    .skip(area.x as usize)
+                    .take(area.width as usize)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The right pane's inside on the 80x24 screen: where the quick view
+    /// shows (with the left pane active), and the editor's text.
+    const RIGHT_INSIDE: Rect = Rect {
+        x: 41,
+        y: 2,
+        width: 38,
+        height: 8,
+    };
+
+    /// An app with the quick view of a file holding `text` open on the
+    /// right.
+    fn previewing_app(name: &str, text: &str) -> (App, PathBuf) {
+        let (mut app, dir) = editing_app(name, text);
+        app.editor = None;
+        app.run_action(Action::View).unwrap();
+        assert!(app.quick_view);
+        draw_app(&mut app);
+        (app, dir)
+    }
+
+    const LONG_TEXT: &str =
+        "slowo slowo slowo slowo slowo slowo slowo slowo slowo slowo\n\tx\u{1b}\n";
+
+    #[test]
+    fn find_in_the_preview_highlights_its_matches_with_a_bar_below() {
+        // Past the 1 MB the preview reads, which the counter mentions.
+        let mut text = String::from("kot i kot\n");
+        text.push_str(&"x".repeat(crate::preview::PREVIEW_READ_LIMIT));
+        let (mut app, dir) = previewing_app("preview_find_render", &text);
+        app.preview_focus = true;
+        assert!(app.open_preview_find());
+        for c in "kot".chars() {
+            app.preview_find_key(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            );
+        }
+        let terminal = draw_app(&mut app);
+        let buf = terminal.backend().buffer().clone();
+        let text = buffer_text(&buf);
+        let (x, y) = (RIGHT_INSIDE.x, RIGHT_INSIDE.y);
+        assert_eq!(buf[(x, y)].bg, SELECTION_BG, "the current match");
+        assert_eq!(buf[(x + 4, y)].bg, Color::Reset);
+        assert_eq!(buf[(x + 6, y)].bg, FIND_MATCH_BG, "another match");
+        assert!(text.contains("Find: kot"), "{text}");
+        assert!(text.contains("1/2 (first 1 MB)"), "{text}");
+        assert!(text.contains("F3Next"), "F3 is Next on the bar: {text}");
+        // Esc: the bar and every highlight go; F3 is View again only once
+        // there's nothing to look for — here there still is.
+        app.preview_find_key(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let terminal = draw_app(&mut app);
+        let buf = terminal.backend().buffer().clone();
+        let text = buffer_text(&buf);
+        assert!(!text.contains("Find:"), "{text}");
+        assert_eq!(buf[(x, y)].bg, Color::Reset);
+        assert_eq!(buf[(x + 6, y)].bg, Color::Reset);
+        assert!(text.contains("F3Next"), "{text}");
+        app.preview_focus = false;
+        let text = buffer_text(draw_app(&mut app).backend().buffer());
+        assert!(text.contains("F3View"), "the listing has the keys: {text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unwrapped_preview_cuts_long_lines_and_scrolls_sideways() {
+        let (mut app, dir) = previewing_app("preview_nowrap", LONG_TEXT);
+        app.wrap_lines = false;
+        let rows = rows_in(&mut app, RIGHT_INSIDE);
+        assert_eq!(rows[0], "slowo slowo slowo slowo slowo slowo sl");
+        // A tab to the next stop and a control character as its picture,
+        // as in the editor.
+        assert_eq!(rows[1], "    x\u{241b}");
+        assert_eq!(rows[2], "");
+        // Tab on the preview, then Right: a tab stop at a time.
+        app.preview_focus = true;
+        app.scroll_preview_sideways(true);
+        app.scroll_preview_sideways(true);
+        let rows = rows_in(&mut app, RIGHT_INSIDE);
+        assert_eq!(rows[0], "owo slowo slowo slowo slowo slowo slow");
+        assert_eq!(rows[1], "");
+        // No further than the longest line needs.
+        for _ in 0..20 {
+            app.scroll_preview_sideways(true);
+        }
+        assert_eq!(app.preview_scroll_x, 59 - 38);
+        app.scroll_preview_sideways(false);
+        assert_eq!(app.preview_scroll_x, 59 - 38 - 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wrapped_preview_breaks_lines_exactly_as_the_editor_does() {
+        let (mut app, dir) = previewing_app("preview_wrap", LONG_TEXT);
+        app.wrap_lines = true;
+        let preview = rows_in(&mut app, RIGHT_INSIDE);
+        assert!(preview[0].starts_with("slowo slowo"), "{preview:?}");
+        assert!(preview[1].starts_with("slowo"), "{preview:?}");
+        // Sideways scrolling is for unwrapped text only.
+        app.scroll_preview_sideways(true);
+        assert_eq!(app.preview_scroll_x, 0);
+
+        app.run_action(Action::Edit).unwrap();
+        let editor = rows_in(&mut app, RIGHT_INSIDE);
+        assert_eq!(preview[..4], editor[..4]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wrap_lines_in_options_switches_the_open_preview_keeping_its_place() {
+        let text: String = (0..30)
+            .map(|n| format!("line {n} {}\n", "word ".repeat(12)))
+            .collect();
+        let (mut app, dir) = previewing_app("preview_toggle", &text);
+        app.wrap_lines = false;
+        app.preview_focus = true;
+        for _ in 0..5 {
+            app.scroll_preview_down();
+        }
+        assert!(rows_in(&mut app, RIGHT_INSIDE)[0].starts_with("line 5 "));
+        app.open_menu_at(1);
+        assert_eq!(app.menu_bar()[1].items[0], Action::WrapLines);
+        assert!(app.action_enabled(Action::WrapLines));
+        app.confirm_menu_selection().unwrap();
+        assert!(app.wrap_lines);
+        let rows = rows_in(&mut app, RIGHT_INSIDE);
+        assert!(rows[0].starts_with("line 5 "), "{rows:?}");
+        assert!(!rows[1].starts_with("line 6 "), "now wrapped: {rows:?}");
+        assert_eq!(app.menu_shortcut(Action::WrapLines), Some("[x]"));
+
+        // Switched back in the editor, F3 shows the same again on Esc.
+        app.run_action(Action::Edit).unwrap();
+        app.run_action(Action::WrapLines).unwrap();
+        app.run_action(Action::Close).unwrap();
+        assert!(app.quick_view && !app.wrap_lines);
+        let rows = rows_in(&mut app, RIGHT_INSIDE);
+        assert!(rows[0].starts_with("line 5 "), "{rows:?}");
+        assert!(rows[1].starts_with("line 6 "), "unwrapped again: {rows:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pane_titles_put_the_path_left_and_what_it_is_right() {
+        let top = |width: u16, path: &str, label: &'static str| {
+            let block =
+                titled_with_label(Block::default().borders(Borders::ALL), path, label, width);
+            let mut buf = Buffer::empty(Rect::new(0, 0, width, 3));
+            ratatui::widgets::Widget::render(block, buf.area, &mut buf);
+            buffer_text(&buf).lines().next().unwrap().to_string()
+        };
+        assert_eq!(
+            top(30, "/home/pit/a.txt", "Preview"),
+            "┌/home/pit/a.txt──────Preview┐"
+        );
+        // A long path gives way first, from the left, a cell short of the
+        // label.
+        assert_eq!(
+            top(30, "/home/pit/projects/peter/notes.txt", "Editing"),
+            "┌…cts/peter/notes.txt─Editing┐"
+        );
+        // Too narrow for both: the label goes, the file name stays.
+        assert_eq!(
+            top(16, "/home/pit/notes.txt", "Preview"),
+            "┌…pit/notes.txt┐"
+        );
+        assert_eq!(top(4, "/a/b", "Preview"), "┌…b┐");
+    }
+
+    #[test]
+    fn quick_view_title_is_the_path_with_preview_on_the_right() {
+        let (mut app, dir) = previewing_app("preview_title", "x\n");
+        let terminal = draw_app(&mut app);
+        let text = buffer_text(terminal.backend().buffer());
+        let right = text.lines().nth(1).unwrap();
+        let right = &right[right.find('\u{2510}').unwrap()..];
+        assert!(right.contains("/notes.txt\u{2500}"), "{text}");
+        assert!(right.ends_with("Preview\u{2510}"), "{text}");
+        assert!(!text.contains("Preview:"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_f_key_bar_dims_what_does_nothing_in_the_editor() {
+        for classic_style in [false, true] {
+            let (mut app, dir) = editing_app("editor_fn_bar", "kot\n");
+            app.classic_style = classic_style;
+            let dim = if classic_style {
+                classic::MENU_DISABLED_FG
+            } else {
+                Color::DarkGray
+            };
+            let label_fg = |app: &mut App, label: &str| {
+                let terminal = draw_app(app);
+                let buf = terminal.backend().buffer().clone();
+                let row = buf.area.height - 1;
+                let text: String = (0..buf.area.width)
+                    .map(|x| buf[(x, row)].symbol())
+                    .collect();
+                let x = text
+                    .find(label)
+                    .unwrap_or_else(|| panic!("{label} in {text}")) as u16;
+                buf[(x, row)].fg
+            };
+            for label in ["Copy", "Move", "MkDir", "Delete", "Next"] {
+                assert_eq!(
+                    label_fg(&mut app, label),
+                    dim,
+                    "{label}, classic {classic_style}"
+                );
+            }
+            for label in ["Help", "Rename", "Full", "Menu"] {
+                assert_ne!(
+                    label_fg(&mut app, label),
+                    dim,
+                    "{label}, classic {classic_style}"
+                );
+            }
+            assert!(!buffer_text(draw_app(&mut app).backend().buffer()).contains("View"));
+            app.editor.as_mut().unwrap().apply(editor::Command::Find);
+            assert_ne!(label_fg(&mut app, "Next"), dim, "with something to find");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_title_follows_a_rename_of_the_edited_file() {
+        let (mut app, dir) = editing_app("editor_title_rename", "x\n");
+        app.editor_key(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        )
+        .unwrap();
+        for _ in 0.."notes.txt".len() {
+            app.dialog_field_backspace();
+        }
+        for c in "nowe.md".chars() {
+            app.dialog_field_insert(c);
+        }
+        app.confirm_dialog().unwrap();
+        let text = buffer_text(draw_app(&mut app).backend().buffer());
+        let title = text.lines().nth(1).unwrap();
+        assert!(title.contains("/nowe.md\u{2500}"), "{text}");
+        assert!(dir.join("nowe.md").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_editing_label_marks_unsaved_changes() {
+        let (mut app, dir) = editing_app("editor_label_modified", "x\n");
+        let title = |app: &mut App| {
+            let terminal = draw_app(app);
+            buffer_text(terminal.backend().buffer())
+                .lines()
+                .nth(1)
+                .unwrap()
+                .to_string()
+        };
+        assert!(title(&mut app).ends_with("Editing\u{2510}"));
+        app.editor
+            .as_mut()
+            .unwrap()
+            .apply(editor::Command::Insert('y'));
+        assert!(title(&mut app).ends_with("Editing*\u{2510}"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_selection_is_yellow_in_both_palettes() {
+        for classic_style in [false, true] {
+            let (mut app, dir) = editing_app("editor_selection_color", "kot i kot\n");
+            app.classic_style = classic_style;
+            app.editor.as_mut().unwrap().apply(editor::Command::Move {
+                motion: editor::Motion::End,
+                select: true,
+            });
+            let terminal = draw_app(&mut app);
+            let buf = terminal.backend().buffer();
+            let area = app.editor_text_area;
+            let cell = &buf[(area.x, area.y)];
+            assert_eq!(cell.bg, SELECTION_BG, "classic {classic_style}");
+            assert_eq!(cell.fg, Color::Rgb(0, 0, 0), "classic {classic_style}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn wrap_lines_is_in_options_only_with_the_quick_view_open() {
+        let (mut app, dir) = editing_app("options_wrap", "x\n");
+        app.editor = None;
+        let options = |app: &App| {
+            let bar = app.menu_bar();
+            let options = bar.iter().find(|c| c.title == "Options").unwrap();
+            options.items.to_vec()
+        };
+        assert_eq!(options(&app), [Action::Settings]);
+        app.run_action(Action::View).unwrap();
+        assert_eq!(options(&app), [Action::WrapLines, Action::Settings]);
+        // Drawn open, its items' click areas follow the bar shown.
+        app.open_menu_at(1);
+        draw_app(&mut app);
+        assert_eq!(app.menu_item_tiles.len(), 2);
+        app.close_menu();
+        app.run_action(Action::Edit).unwrap();
+        assert_eq!(options(&app), [Action::Settings], "the editor's is in Edit");
+        app.run_action(Action::Close).unwrap();
+        app.run_action(Action::View).unwrap();
+        assert!(!app.quick_view);
+        assert_eq!(options(&app), [Action::Settings]);
+        app.open_menu_at(1);
+        draw_app(&mut app);
+        assert_eq!(app.menu_item_tiles.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_hint_says_what_esc_will_do() {
+        let (mut app, dir) = editing_app("editor_esc_hint", "kot\n");
+        app.editor.as_mut().unwrap().full_screen = true;
+        let text = buffer_text(draw_app(&mut app).backend().buffer());
+        assert!(text.contains("Esc Close"), "{text}");
+        app.editor
+            .as_mut()
+            .unwrap()
+            .apply(editor::Command::SelectAll);
+        let text = buffer_text(draw_app(&mut app).backend().buffer());
+        assert!(
+            text.contains("Esc Done") && !text.contains("Esc Close"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_find_leaves_no_highlights_behind() {
+        let (mut app, dir) = editing_app("editor_find_closed", "kot i kot\n");
+        let find = |app: &mut App, key| app.editor.as_mut().unwrap().find_key(key);
+        app.editor.as_mut().unwrap().apply(editor::Command::Find);
+        for c in "kot".chars() {
+            find(&mut app, editor::FindKey::Insert(c));
+        }
+        let backgrounds = text_area_backgrounds(&mut app);
+        assert!(backgrounds.contains(&FIND_MATCH_BG));
+
+        // Esc: neither the matches nor the selection show any more.
+        find(&mut app, editor::FindKey::Close);
+        let backgrounds = text_area_backgrounds(&mut app);
+        assert!(
+            backgrounds
+                .iter()
+                .all(|&bg| bg != FIND_MATCH_BG && bg != SELECTION_BG),
+            "{backgrounds:?}"
+        );
+        assert!(!buffer_text(draw_app(&mut app).backend().buffer()).contains("Find:"));
+
+        // Enter: the match stays selected, the other one isn't marked.
+        app.editor.as_mut().unwrap().apply(editor::Command::Find);
+        find(&mut app, editor::FindKey::Accept);
+        let backgrounds = text_area_backgrounds(&mut app);
+        assert!(backgrounds.contains(&SELECTION_BG));
+        assert!(!backgrounds.contains(&FIND_MATCH_BG));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn selection_and_find_matches_are_highlighted() {
+        let (mut app, dir) = editing_app("editor_highlight", "kot i kot\n");
+        app.editor.as_mut().unwrap().apply(editor::Command::Find);
+        for c in "kot".chars() {
+            app.editor
+                .as_mut()
+                .unwrap()
+                .find_key(editor::FindKey::Insert(c));
+        }
+        let mut terminal = draw_app(&mut app);
+        let buf = terminal.backend().buffer().clone();
+        let text = buffer_text(&buf);
+        assert!(text.contains("Find: kot"), "{text}");
+        assert!(text.contains("1/2"), "{text}");
+        let area = app.editor_text_area;
+        // The current match is the selection; the other one is yellow.
+        assert_eq!(buf[(area.x, area.y)].bg, SELECTION_BG);
+        assert_eq!(buf[(area.x + 4, area.y)].bg, Color::Reset);
+        assert_eq!(buf[(area.x + 6, area.y)].bg, FIND_MATCH_BG);
+        // The cursor is in the find bar, after "kot".
+        let (x, y) = cursor_of(&mut terminal);
+        assert!(y > area.y + 1, "{y}");
+        assert_eq!(x, area.x + " Find: kot".len() as u16);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wrapped_lines_continue_on_the_next_row() {
+        let (mut app, dir) = editing_app("editor_wrap", &"slowo ".repeat(20));
+        app.editor.as_mut().unwrap().set_wrap(true);
+        let terminal = draw_app(&mut app);
+        let text = buffer_text(terminal.backend().buffer());
+        let area = app.editor_text_area;
+        let rows: Vec<String> = text
+            .lines()
+            .skip(area.y as usize)
+            .take(4)
+            .map(|row| {
+                row.chars()
+                    .skip(area.x as usize)
+                    .take(area.width as usize)
+                    .collect()
+            })
+            .collect();
+        assert!(rows[0].starts_with("slowo slowo"), "{rows:?}");
+        assert!(rows[1].starts_with("slowo"), "{rows:?}");
+        assert!(rows.iter().all(|row| !row.ends_with("slo")), "{rows:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unsaved_changes_dialog_names_the_file() {
+        let (mut app, dir) = editing_app("editor_unsaved", "x");
+        app.dialog = Dialog::UnsavedChanges {
+            quit_after: false,
+            focused: 0,
+        };
+        let terminal = draw_app(&mut app);
+        let text = buffer_text(terminal.backend().buffer());
+        for expected in [
+            "Save changes to \"notes.txt\"?",
+            "[ Save ]",
+            "[ Don't Save ]",
+            "[ Cancel ]",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn f1_opens_the_editor_help_page() {
+        assert_eq!(
+            HELP_PAGES[crate::app::EDITOR_HELP_PAGE].0,
+            "Built-in editor"
+        );
+    }
+
     #[test]
     fn exact_width_name_is_unchanged() {
         let result = fit_name("1234567890", 10);
@@ -2912,5 +4238,65 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(job_fraction(&two_items), 0.75);
+    }
+
+    /// Not a check but a measurement (`cargo test --release -- --ignored
+    /// --nocapture huge_line`): how long a frame takes with a 10 MB file on
+    /// one line, wrapped and not, idle and right after typing a letter.
+    #[test]
+    #[ignore]
+    fn huge_line_frame_timings() {
+        let text = "abc defgh ".repeat(1024 * 1024);
+        let (mut app, dir) = editing_app("editor_huge_line", &text);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        for wrap in [false, true] {
+            app.editor.as_mut().unwrap().set_wrap(wrap);
+            for (place, motion) in [
+                ("start", editor::Motion::DocStart),
+                ("end", editor::Motion::DocEnd),
+            ] {
+                app.editor.as_mut().unwrap().apply(editor::Command::Move {
+                    motion,
+                    select: false,
+                });
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let started = std::time::Instant::now();
+                for _ in 0..5 {
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                }
+                let idle = started.elapsed() / 5;
+                let started = std::time::Instant::now();
+                for _ in 0..5 {
+                    app.editor
+                        .as_mut()
+                        .unwrap()
+                        .apply(editor::Command::Insert('x'));
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                }
+                let typing = started.elapsed() / 5;
+
+                let started = std::time::Instant::now();
+                for _ in 0..5 {
+                    app.editor.as_mut().unwrap().apply(editor::Command::Move {
+                        motion: editor::Motion::Left,
+                        select: false,
+                    });
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                }
+                let moving = started.elapsed() / 5;
+                println!(
+                    "wrap {wrap}, cursor at {place}: idle frame {idle:?}, key + frame {typing:?}, arrow + frame {moving:?}"
+                );
+            }
+        }
+        let editor = app.editor.as_mut().unwrap();
+        editor.apply(editor::Command::Find);
+        let started = std::time::Instant::now();
+        for c in "defg".chars() {
+            editor.find_key(editor::FindKey::Insert(c));
+        }
+        println!("find: {:?} per letter typed", started.elapsed() / 4);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

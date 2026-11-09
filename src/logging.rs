@@ -10,7 +10,14 @@ use chrono::Local;
 /// hardcoded `/tmp` path.
 fn log_path_cell() -> &'static PathBuf {
     static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-    LOG_PATH.get_or_init(|| std::env::temp_dir().join("peter-commander.log"))
+    // The test suite saves files, fails on purpose and so on: that goes to
+    // a log of its own, not into the one Show Logs reads for real use.
+    let name = if cfg!(test) {
+        "peter-commander-test.log"
+    } else {
+        "peter-commander.log"
+    };
+    LOG_PATH.get_or_init(|| std::env::temp_dir().join(name))
 }
 
 /// Appends a timestamped line to the log file. Best-effort: if the log file

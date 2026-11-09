@@ -3,7 +3,30 @@
 
 use std::path::{Path, PathBuf, is_separator};
 
+use crossterm::event::KeyModifiers;
+
 use crate::app::DialogKind;
+
+/// Whether a key with `modifiers` types `c` rather than being a shortcut —
+/// in every text field alike: the dialogs', the editor's and its find bar's.
+/// AltGr — how Polish letters are typed — reaches the app in several
+/// disguises: usually as the bare letter (`ą`, no modifiers), but on Windows
+/// as Ctrl+Alt+letter, and with some keyboard protocols as Alt+letter. So
+/// plain Ctrl+letter is a shortcut, Ctrl+Alt+anything is AltGr text, and
+/// Alt+letter is text only when the letter isn't plain ASCII (Alt+F stays
+/// the File menu; an `ó` can't be a menu shortcut anyway).
+pub fn is_text_input(c: char, modifiers: KeyModifiers) -> bool {
+    if c.is_control() || modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::HYPER) {
+        return false;
+    }
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    match (ctrl, alt) {
+        (false, false) | (true, true) => true,
+        (false, true) => !c.is_ascii(),
+        (true, false) => false,
+    }
+}
 
 /// Single-line text with a cursor, counted in characters so multi-byte names
 /// can't split.

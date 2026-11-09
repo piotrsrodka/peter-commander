@@ -1,5 +1,9 @@
 mod app;
 mod bulk_rename;
+mod clipboard;
+mod editor;
+#[cfg(test)]
+mod editor_spec_tests;
 mod fs_ops;
 mod image_preview;
 mod job;
@@ -27,8 +31,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -40,9 +44,10 @@ use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 
 use app::{App, Dialog, ExternalRequest, SettingItem, StartDirs};
-use menu::{Action, FN_KEYS, MENU_BAR};
+use menu::{Action, FN_KEYS};
 
 fn restore_terminal() {
+    let _ = io::stdout().execute(DisableBracketedPaste);
     let _ = disable_raw_mode();
     let _ = io::stdout().execute(DisableMouseCapture);
     let _ = io::stdout().execute(LeaveAlternateScreen);
@@ -196,6 +201,7 @@ fn main() -> Result<()> {
             .execute(EnableMouseCapture)
             .context("EnableMouseCapture")?;
     }
+    enable_bracketed_paste();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal::new")?;
 
@@ -264,12 +270,14 @@ fn run(
                     handle_key(&mut app, key.code, key.modifiers)?;
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut app, mouse)?,
+                Event::Paste(text) => handle_paste(&mut app, &text),
                 _ => {}
             }
         }
         app.sync_preview_scroll();
         app.reap_finished_children();
         app.poll_job()?;
+        app.auto_refresh(std::time::Instant::now());
 
         if let Some(request) = app.external_request.take() {
             run_external(terminal, request, &mut app, should_exit)?;
@@ -283,6 +291,14 @@ fn run(
     app.cancel_job_and_wait();
     app.save_state();
     Ok(())
+}
+
+/// A paste then arrives as one `Event::Paste` instead of a stream of key
+/// presses: the editor gets it as a single undoable insert, and a newline in
+/// it can't run a half-typed command line. Best-effort: a terminal (or the
+/// legacy Windows console) that doesn't do it just goes on typing the text.
+fn enable_bracketed_paste() {
+    let _ = io::stdout().execute(EnableBracketedPaste);
 }
 
 fn set_mouse_capture(enabled: bool) -> Result<()> {
@@ -480,6 +496,7 @@ fn run_pager_or_editor(
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
     set_mouse_capture(app.mouse_capture)?;
+    enable_bracketed_paste();
     terminal.clear()?;
 
     let succeeded = matches!(&status, Ok(status) if status.success());
@@ -556,6 +573,7 @@ fn run_shell_command(
         .execute(EnterAlternateScreen)
         .context("EnterAlternateScreen")?;
     set_mouse_capture(app.mouse_capture)?;
+    enable_bracketed_paste();
     terminal.clear()?;
 
     match status {
@@ -644,6 +662,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
         return Ok(());
     }
 
+    if app.editor.is_some() && !app.menu_open {
+        return handle_editor_mouse(app, mouse);
+    }
+
     match mouse.kind {
         // Only the active pane has a visible highlight, so scrolling the
         // inactive one would move its selection with no visible feedback.
@@ -689,18 +711,83 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     Ok(())
 }
 
-fn handle_mouse_click(app: &mut App, column: u16, row: u16) -> Result<()> {
-    let pos = Position::new(column, row);
+/// The mouse while editing: the wheel scrolls the editor, a click places its
+/// cursor (Shift+click or a drag selects), the menu bar opens the menu, and
+/// an F-key tile does what that key does in the editor (nothing, for the
+/// dimmed ones).
+fn handle_editor_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
+    let pos = Position::new(mouse.column, mouse.row);
+    let area = app.editor_text_area;
+    // Where in the text a press or drag lands, held to the text area so a
+    // drag past its edge selects up to it.
+    let column = mouse
+        .column
+        .clamp(area.x, area.right().saturating_sub(1).max(area.x));
+    let row = mouse
+        .row
+        .clamp(area.y, area.bottom().saturating_sub(1).max(area.y));
+    let (row, x) = ((row - area.y) as usize, (column - area.x) as usize);
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if app.debounced_scroll() || !app.editor_area.contains(pos) {
+                return Ok(());
+            }
+            const WHEEL_EDITOR_ROWS: isize = 3;
+            let rows = if mouse.kind == MouseEventKind::ScrollUp {
+                -WHEEL_EDITOR_ROWS
+            } else {
+                WHEEL_EDITOR_ROWS
+            };
+            if let Some(editor) = &mut app.editor {
+                editor.scroll_view(rows);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) if area.contains(pos) => {
+            let extend = mouse.modifiers.contains(KeyModifiers::SHIFT);
+            if let Some(editor) = &mut app.editor
+                && editor.find.is_none()
+            {
+                editor.click(row, x, extend);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(editor) = &mut app.editor
+                && editor.find.is_none()
+            {
+                editor.click(row, x, true);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !click_menu_bar(app, pos)
+                && let Some(&(_, action)) =
+                    app.fn_key_tiles.iter().find(|(rect, _)| rect.contains(pos))
+            {
+                app.click_editor_fn_key(action)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
-    // A menu bar label is clickable whether or not the menu is already
-    // open — either opens it fresh on that category, or switches to it.
-    let bar_category = app
+/// A click on a menu bar title opens that menu, whether or not one is
+/// already open (it then switches to it). Returns whether it was on one.
+fn click_menu_bar(app: &mut App, pos: Position) -> bool {
+    let category = app
         .menu_bar_tiles
         .iter()
         .find(|(rect, _)| rect.contains(pos))
         .map(|&(_, category)| category);
-    if let Some(category) = bar_category {
+    if let Some(category) = category {
         app.open_menu_at(category);
+    }
+    category.is_some()
+}
+
+fn handle_mouse_click(app: &mut App, column: u16, row: u16) -> Result<()> {
+    let pos = Position::new(column, row);
+
+    if click_menu_bar(app, pos) {
         return Ok(());
     }
 
@@ -711,7 +798,7 @@ fn handle_mouse_click(app: &mut App, column: u16, row: u16) -> Result<()> {
             .find(|(rect, _)| rect.contains(pos))
             .map(|&(_, idx)| idx);
         if let Some(idx) = item {
-            let action = MENU_BAR[app.menu_category].items[idx];
+            let action = app.menu_bar()[app.menu_category].items[idx];
             if app.action_enabled(action) {
                 app.menu_item = idx;
                 app.confirm_menu_selection()?;
@@ -731,6 +818,7 @@ fn handle_mouse_click(app: &mut App, column: u16, row: u16) -> Result<()> {
         .map(|(_, action)| *action);
     if let Some(clicked_action) = clicked {
         match clicked_action {
+            Some(Action::View) if app.preview_next_mode() => app.preview_find_next(true),
             Some(action) => app.run_action(action)?,
             None => app.open_menu(),
         }
@@ -738,13 +826,61 @@ fn handle_mouse_click(app: &mut App, column: u16, row: u16) -> Result<()> {
     Ok(())
 }
 
-/// The `MENU_BAR` category whose title starts with `letter` (case
-/// insensitive), if any — used for the Alt+F/O/C mnemonic shortcuts.
-fn menu_category_for(letter: char) -> Option<usize> {
-    let lower = letter.to_ascii_lowercase();
-    MENU_BAR
-        .iter()
-        .position(|category| category.title.to_ascii_lowercase().starts_with(lower))
+/// Text the terminal pasted in one go (see `enable_bracketed_paste`): into
+/// the editor (lines and all), a dialog's field, quick search or the command
+/// line — whichever would get it typed. Nothing is ever run by a paste: a
+/// one-line field takes just the first line (see `first_pasted_line`), and
+/// says so when that left the rest out.
+fn handle_paste(app: &mut App, text: &str) {
+    if app.error_dialog.is_some()
+        || app.job_visible
+        || app.help_open
+        || app.logs_open
+        || app.about_open
+        || app.menu_open
+        || app.dialog_is_settings()
+    {
+        return;
+    }
+    if !app.dialog_has_field() && !matches!(app.dialog, Dialog::None) {
+        return;
+    }
+    if app.editor.is_some() && !app.dialog_has_field() {
+        app.editor_paste(text);
+        return;
+    }
+    let (line, count) = first_pasted_line(text);
+    for c in line.chars() {
+        if app.dialog_has_field() {
+            app.dialog_field_insert(c);
+        } else if app.quick_search.is_some() {
+            app.quick_search_push(c);
+        } else {
+            app.command_line_push(c);
+        }
+    }
+    if count > 1 {
+        app.set_notice(format!(
+            "Pasted 1 of {count} lines: only the first goes into a one-line field"
+        ));
+    }
+}
+
+/// What a paste leaves for a one-line field: its first line, without the
+/// line break a copied line usually ends with, tabs as spaces and other
+/// control characters dropped — and how many lines it had.
+fn first_pasted_line(text: &str) -> (String, usize) {
+    let text = text.trim_end_matches(['\n', '\r']);
+    let count = text.replace("\r\n", "\n").split(['\n', '\r']).count();
+    let line = text
+        .split(['\n', '\r'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c == '\t' { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    (line, count)
 }
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
@@ -799,10 +935,6 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
     }
 
     if app.dialog_has_field() {
-        // AltGr letters arrive as Ctrl+Alt on Windows, so only one of the
-        // two marks a shortcut rather than text.
-        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-        let alt = modifiers.contains(KeyModifiers::ALT);
         match code {
             KeyCode::Esc => app.cancel_dialog(),
             KeyCode::Enter => app.activate_dialog_button()?,
@@ -814,7 +946,19 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             KeyCode::End => app.dialog_field_end(),
             KeyCode::Backspace => app.dialog_field_backspace(),
             KeyCode::Delete => app.dialog_field_delete(),
-            KeyCode::Char(c) if ctrl == alt => app.dialog_field_insert(c),
+            // AltGr letters arrive in several disguises (see there).
+            KeyCode::Char(c) if transfer::is_text_input(c, modifiers) => app.dialog_field_insert(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if app.dialog_is_unsaved_changes() {
+        match code {
+            KeyCode::Esc => app.cancel_dialog(),
+            KeyCode::Left | KeyCode::BackTab => app.step_unsaved_focus(false),
+            KeyCode::Right | KeyCode::Tab => app.step_unsaved_focus(true),
+            KeyCode::Enter => app.activate_unsaved_button(),
             _ => {}
         }
         return Ok(());
@@ -849,13 +993,19 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
             // is already open (with or without Alt still held), so Alt+F
             // then Alt+O jumps straight from File to Options.
             KeyCode::Char(c) => {
-                if let Some(idx) = menu_category_for(c) {
+                if let Some(idx) = app.menu_category_for(c) {
                     app.open_menu_at(idx);
                 }
             }
             _ => {}
         }
         return Ok(());
+    }
+
+    // The editor has the keyboard while it's open — after any dialog or
+    // the menu on top of it, so those still work as usual.
+    if app.editor.is_some() {
+        return app.editor_key(code, modifiers);
     }
 
     if app.quick_search.is_some() {
@@ -888,6 +1038,38 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         }
     }
 
+    // Find in the quick view, with the keyboard on it (Tab).
+    if app.quick_view && app.preview_focus {
+        if app.preview_find_bar_open() {
+            if app.preview_find_key(code, modifiers) {
+                return Ok(());
+            }
+            // With the bar open, the rest only scrolls the preview.
+            if !matches!(
+                code,
+                KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+            ) {
+                return Ok(());
+            }
+        } else {
+            match code {
+                // Not a text preview: Ctrl+F is the listing's quick search,
+                // as with the focus there.
+                KeyCode::Char('f')
+                    if modifiers.contains(KeyModifiers::CONTROL) && app.open_preview_find() =>
+                {
+                    return Ok(());
+                }
+                KeyCode::F(3) if app.preview_next_mode() => {
+                    app.preview_find_next(!modifiers.contains(KeyModifiers::SHIFT));
+                    return Ok(());
+                }
+                KeyCode::Esc if app.clear_preview_match() => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+
     match code {
         KeyCode::Tab => {
             if app.quick_view {
@@ -898,6 +1080,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         }
         KeyCode::Up if app.quick_view && app.preview_focus => app.scroll_preview_up(),
         KeyCode::Down if app.quick_view && app.preview_focus => app.scroll_preview_down(),
+        // Sideways only without Wrap Lines; Home/End stay top and bottom.
+        KeyCode::Left if app.quick_view && app.preview_focus => app.scroll_preview_sideways(false),
+        KeyCode::Right if app.quick_view && app.preview_focus => app.scroll_preview_sideways(true),
         KeyCode::Up => app.active_pane().move_up(),
         KeyCode::Down => app.active_pane().move_down(),
         // Classic Norton Commander: Insert tags the entry under the cursor
@@ -945,9 +1130,9 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
         // Alt+<first letter> jumps straight to that menu category — Alt+F
         // for File, Alt+O for Options, Alt+C for Command — matching each
         // category's title rather than hardcoding the letters, so this
-        // stays correct if MENU_BAR is ever relabeled.
+        // stays correct if the menu bar is ever relabeled.
         KeyCode::Char(c) if modifiers.contains(KeyModifiers::ALT) => {
-            if let Some(idx) = menu_category_for(c) {
+            if let Some(idx) = app.menu_category_for(c) {
                 app.open_menu_at(idx);
             }
         }
@@ -1105,5 +1290,382 @@ mod tests {
             version_text(),
             format!("peter-commander {}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    /// An app with the left pane on a fresh directory holding `a.txt`
+    /// (`text`), selected — and, with `edit`, open in the editor.
+    fn app_on_a_file(name: &str, text: &str, edit: bool) -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pc_test_main_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), text).unwrap();
+        let mut app = App::new().unwrap();
+        app.left = pane::Pane::new(dir.clone(), false).unwrap();
+        app.left.select_name("a.txt");
+        app.active = app::Side::Left;
+        if edit {
+            app.run_action(Action::Edit).unwrap();
+            assert!(app.editor.is_some());
+        }
+        (app, dir)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, code, KeyModifiers::NONE).unwrap();
+    }
+
+    fn mkdir_field(app: &App) -> String {
+        match &app.dialog {
+            Dialog::TextInput { field, .. } => field.text().to_string(),
+            _ => panic!("no MkDir dialog"),
+        }
+    }
+
+    #[test]
+    fn a_paste_onto_the_command_line_never_runs_it() {
+        let (mut app, dir) = app_on_a_file("paste_command", "", false);
+        handle_paste(&mut app, "ls\n");
+        assert_eq!(app.command_line, "ls");
+        assert!(app.error_dialog.is_none(), "one line: nothing to say");
+        assert!(app.external_request.is_none());
+
+        app.command_line.clear();
+        handle_paste(&mut app, "ls\r\nrm x\n");
+        assert_eq!(app.command_line, "ls");
+        assert!(app.external_request.is_none());
+        assert!(app.error_dialog_is_notice);
+        assert!(app.error_dialog.take().unwrap().contains("1 of 2 lines"));
+
+        app.command_line.clear();
+        handle_paste(&mut app, "echo\ta\u{1b}b");
+        assert_eq!(app.command_line, "echo ab");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_paste_into_a_dialog_field_takes_its_first_line() {
+        let (mut app, dir) = app_on_a_file("paste_dialog", "", false);
+        app.request_mkdir();
+        handle_paste(&mut app, "nowy\nkatalog\n");
+        assert_eq!(mkdir_field(&app), "nowy");
+        assert!(app.error_dialog.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_paste_into_the_editor_keeps_its_lines_and_a_dialog_without_a_field_ignores_it() {
+        let (mut app, dir) = app_on_a_file("paste_editor", "", true);
+        handle_paste(&mut app, "one\ntwo\n");
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["one", "two", ""]);
+        assert!(app.error_dialog.is_none());
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.dialog_is_unsaved_changes());
+        handle_paste(&mut app, "three");
+        assert_eq!(app.editor.as_ref().unwrap().lines(), ["one", "two", ""]);
+        assert!(app.dialog_is_unsaved_changes());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_unsaved_prompt_takes_the_keys_before_the_editor() {
+        let (mut app, dir) = app_on_a_file("unsaved_keys", "x", true);
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.dialog_is_unsaved_changes());
+        // Typed with the prompt up, a letter reaches neither it nor the text.
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.dialog, Dialog::None));
+        let editor = app.editor.as_ref().expect("Esc cancels: still editing");
+        assert_eq!(editor.lines(), ["yx"]);
+        assert!(editor.is_modified());
+
+        // Esc, Right to Don't Save, Enter: closed, the file untouched.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.editor.is_none());
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn altgr_letters_type_into_dialog_fields_in_every_disguise() {
+        let (mut app, dir) = app_on_a_file("altgr_dialog", "", false);
+        app.request_mkdir();
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            handle_key(&mut app, KeyCode::Char('ó'), modifiers).unwrap();
+        }
+        // Alt+ASCII and Ctrl+letter stay shortcuts, not text.
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::ALT).unwrap();
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL).unwrap();
+        assert_eq!(mkdir_field(&app), "óóó");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        let event = MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(app, event).unwrap();
+    }
+
+    #[test]
+    fn the_mouse_places_the_cursor_in_the_editor_and_drags_select() {
+        let (mut app, dir) = app_on_a_file("editor_mouse", "hello\nworld\n", true);
+        // As drawn: the text from (41, 2), 30 by 10 cells.
+        app.editor_area = ratatui::layout::Rect::new(40, 1, 32, 14);
+        app.editor_text_area = ratatui::layout::Rect::new(41, 2, 30, 10);
+        app.menu_bar_tiles = vec![(ratatui::layout::Rect::new(1, 0, 6, 1), 1)];
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let cursor = |app: &App| app.editor.as_ref().unwrap().cursor();
+
+        mouse(&mut app, down, 43, 3);
+        assert_eq!(cursor(&app), editor::Pos::new(1, 2));
+        // Dragged past the text area's left and top edges: held to them.
+        mouse(&mut app, drag, 5, 0);
+        assert_eq!(cursor(&app), editor::Pos::new(0, 0));
+        assert_eq!(
+            app.editor.as_ref().unwrap().selected_text().as_deref(),
+            Some("hello\nwo")
+        );
+        // Far right and below: the end of the text.
+        mouse(&mut app, drag, 79, 23);
+        assert_eq!(cursor(&app), editor::Pos::new(1, 5));
+        // Outside the text, a press only counts on the menu bar.
+        mouse(&mut app, down, 79, 23);
+        assert_eq!(cursor(&app), editor::Pos::new(1, 5));
+        mouse(&mut app, down, 2, 0);
+        assert!(app.menu_open);
+        assert_eq!(app.menu_category, 1);
+        app.close_menu();
+
+        // With the find bar open, clicks leave the found text selected.
+        mouse(&mut app, down, 41, 2);
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL).unwrap();
+        for c in "wor".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let found = app.editor.as_ref().unwrap().selection();
+        mouse(&mut app, down, 45, 2);
+        mouse(&mut app, drag, 46, 3);
+        assert_eq!(app.editor.as_ref().unwrap().selection(), found);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn left_and_right_scroll_an_unwrapped_preview_with_the_focus_on_it() {
+        let (mut app, dir) = app_on_a_file("preview_keys", &"x".repeat(100), false);
+        app.run_action(Action::View).unwrap();
+        app.preview_visible_width = 38;
+        app.wrap_lines = false;
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.preview_scroll_x, 0, "the listing has the focus");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.preview_scroll_x, 8);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.preview_scroll_x, 4);
+        // Home stays "to the top", as before.
+        press(&mut app, KeyCode::Home);
+        assert_eq!((app.preview_scroll, app.preview_scroll_x), (0, 4));
+        app.wrap_lines = true;
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.preview_scroll_x, 4,
+            "wrapped text doesn't scroll sideways"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_f_key_bar_while_editing_does_what_the_editor_does() {
+        let (mut app, dir) = app_on_a_file("editor_fn_clicks", "x\n", true);
+        app.editor_text_area = ratatui::layout::Rect::new(41, 2, 30, 10);
+        let tile = |x| ratatui::layout::Rect::new(x, 23, 7, 1);
+        app.fn_key_tiles = vec![
+            (tile(32), Some(Action::Copy)),
+            (tile(24), Some(Action::Edit)),
+        ];
+        let down = MouseEventKind::Down(MouseButton::Left);
+        mouse(&mut app, down, 33, 23);
+        assert!(app.job.is_none() && matches!(app.dialog, Dialog::None));
+        assert!(!app.editor.as_ref().unwrap().full_screen);
+        mouse(&mut app, down, 25, 23);
+        assert!(app.editor.as_ref().unwrap().full_screen);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The quick view of `a.txt` (holding `text`) open, the keyboard on it.
+    fn previewing(name: &str, text: &str) -> (App, PathBuf) {
+        let (mut app, dir) = app_on_a_file(name, text, false);
+        std::fs::write(dir.join("b.txt"), "kot b\n").unwrap();
+        app.left.reload().unwrap();
+        app.left.select_name("a.txt");
+        press(&mut app, KeyCode::F(3));
+        assert!(app.quick_view);
+        app.sync_preview_scroll();
+        app.preview_visible_lines = 10;
+        app.preview_visible_width = 38;
+        press(&mut app, KeyCode::Tab);
+        assert!(app.preview_focus);
+        (app, dir)
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        handle_key(app, KeyCode::Char(c), KeyModifiers::CONTROL).unwrap();
+    }
+
+    fn preview_selection(app: &App) -> Option<(editor::Pos, editor::Pos)> {
+        app.preview_find
+            .as_ref()
+            .and_then(|find| find.text.selection())
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn ctrl_f_on_the_preview_finds_in_it_and_on_the_listing_searches_names() {
+        let (mut app, dir) = previewing("preview_find_keys", "kot pies\nKOT\nkot\n");
+        ctrl(&mut app, 'f');
+        assert!(app.preview_find_bar_open());
+        assert!(app.quick_search.is_none());
+        typed(&mut app, "kot");
+        assert_eq!(app.command_line, "", "typing goes to the bar");
+        let status = |app: &App| {
+            app.preview_find
+                .as_ref()
+                .unwrap()
+                .text
+                .find
+                .as_ref()
+                .unwrap()
+                .status()
+        };
+        assert_eq!(status(&app), "1/3");
+        press(&mut app, KeyCode::F(3));
+        assert_eq!(status(&app), "2/3");
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::SHIFT).unwrap();
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::SHIFT).unwrap();
+        assert_eq!(status(&app), "3/3", "wraps backwards");
+        // Enter keeps the match; F3 goes on with the bar closed.
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.preview_find_bar_open());
+        assert_eq!(preview_selection(&app).unwrap().0, editor::Pos::new(2, 0));
+        press(&mut app, KeyCode::F(3));
+        assert_eq!(preview_selection(&app).unwrap().0, editor::Pos::new(0, 0));
+        assert!(app.quick_view, "F3 is Next here, not closing the view");
+        // Esc in steps: the match first, then as before (the command line).
+        app.command_line = "ls".to_string();
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(preview_selection(&app), None);
+        assert_eq!(app.command_line, "ls");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.command_line, "");
+        // On the listing Ctrl+F is the quick search, and F3 closes the view.
+        press(&mut app, KeyCode::Tab);
+        ctrl(&mut app, 'f');
+        assert!(app.quick_search.is_some());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::F(3));
+        assert!(!app.quick_view);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_in_the_preview_find_bar_clears_everything() {
+        let (mut app, dir) = previewing("preview_find_esc", "kot\n");
+        ctrl(&mut app, 'f');
+        typed(&mut app, "kot");
+        assert!(preview_selection(&app).is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.preview_find_bar_open());
+        assert_eq!(preview_selection(&app), None);
+        // Up/Down don't belong to the bar: they scroll the preview.
+        ctrl(&mut app, 'f');
+        press(&mut app, KeyCode::Down);
+        assert!(app.preview_find_bar_open());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn f3_on_the_preview_with_nothing_searched_closes_it_as_before() {
+        let (mut app, dir) = previewing("preview_find_f3", "kot\n");
+        assert!(!app.preview_next_mode());
+        press(&mut app, KeyCode::F(3));
+        assert!(!app.quick_view);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn another_previewed_file_drops_the_find_but_f3_still_knows_the_query() {
+        let (mut app, dir) = previewing("preview_find_other", "kot\n");
+        ctrl(&mut app, 'f');
+        typed(&mut app, "kot");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        app.sync_preview_scroll();
+        assert!(app.preview_find.is_none());
+        press(&mut app, KeyCode::Tab);
+        assert!(app.preview_next_mode());
+        press(&mut app, KeyCode::F(3));
+        let find = app.preview_find.as_ref().unwrap();
+        assert_eq!(find.target, dir.join("b.txt"));
+        assert_eq!(
+            find.text.selection(),
+            Some((editor::Pos::new(0, 0), editor::Pos::new(0, 3)))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_preview_scrolls_to_the_match_down_and_sideways() {
+        let mut text = "x\n".repeat(80);
+        text.push_str(&format!("{}kot\n", " ".repeat(200)));
+        for wrap in [false, true] {
+            let (mut app, dir) = previewing("preview_find_scroll", &text);
+            app.wrap_lines = wrap;
+            ctrl(&mut app, 'f');
+            typed(&mut app, "kot");
+            if wrap {
+                // Line 80 starts at row 80; its match is some rows on.
+                assert!(app.preview_scroll > 80 - 9, "{}", app.preview_scroll);
+                assert_eq!(app.preview_scroll_x, 0);
+            } else {
+                // Nine rows show above the bar; the match's on the last.
+                assert_eq!(app.preview_scroll, 80 - 8);
+                assert!(app.preview_scroll_x > 200 - 38 && app.preview_scroll_x <= 200);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn ctrl_f_on_a_preview_that_is_not_text_is_the_quick_search() {
+        let (mut app, dir) = app_on_a_file("preview_find_dir", "", false);
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        app.left.reload().unwrap();
+        app.left.select_name("sub");
+        press(&mut app, KeyCode::F(3));
+        press(&mut app, KeyCode::Tab);
+        ctrl(&mut app, 'f');
+        assert!(app.preview_find.is_none());
+        assert!(app.quick_search.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

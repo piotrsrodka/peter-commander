@@ -35,7 +35,8 @@ cargo install peter-commander
 
 ## Features
 
-- Dual-pane file browsing
+- Dual-pane file browsing; the panes (and the F3 preview) follow changes
+  made on disk by other programs
 - File operations: rename, copy, move, mkdir, new file, delete
 - Delete to the desktop trash (optional, on by default); Shift+F8 deletes permanently
 - Copy/move with a progress bar, cancellable, can be sent to the background
@@ -43,14 +44,25 @@ cargo install peter-commander
 - Quick search: jump to a file by typing part of its name (Command menu)
 - Rename selected files together in your `$EDITOR`, with a warning before anything is overwritten
 - Respects theme selection in Omarchy
-- Quick preview (F3) for text, directories, binaries and images (Sixel, Kitty or iTerm2 graphics, colored half blocks elsewhere)
-- Edit (F4) with your `$EDITOR`
+- Quick preview (F3) for text, directories, binaries and images (Sixel, Kitty or iTerm2 graphics, colored half blocks elsewhere);
+  Tab onto it and Ctrl+F finds in the text (F3/Shift+F3 next/previous, first 1 MB of big files)
+- Built-in text editor (F4) in the other pane, or full screen with F4 again:
+  Notepad keys (Shift to select, Ctrl+arrows by word, Ctrl+S/Z/Y/A/C/X/V,
+  Ctrl+F find with F3/Shift+F3 for the next/previous match), optional
+  line wrap (Edit or Options menu, shared with the F3 preview, which is
+  scrolled sideways with ←/→ when unwrapped), keeps line endings and tabs
+  as they are, F2 renames the file being edited, asks before unsaved
+  changes are lost, and Esc goes back to the quick view you came from; full screen can
+  hide the menu bar (focus mode, Settings); or edit in your `$EDITOR`
+  instead (Settings)
 - Runs executable scripts and binaries directly
 - Opens images, PDFs, audio, video, and HTML in your system's default app
 - On a bare Linux console (tty), shows images full-screen itself, with F3 or Enter (←/→ next image, Esc to return)
-- Built-in command-line prompt, with `cd` support
+- Built-in command-line prompt, with `cd` support; pasting into it never
+  runs anything (only the first line goes in)
 - Ctrl+O shows previous command output
-- Configurable settings: hidden files, F3 preview mode, trash
+- Configurable settings: hidden files, F3 preview mode, F4 editor and its
+  focus mode, trash
 
 ## Usage
 

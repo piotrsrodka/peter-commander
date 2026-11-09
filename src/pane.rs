@@ -171,6 +171,34 @@ pub struct Pane {
     /// Flips `sort_key`'s natural direction (see
     /// `SortKey::descending_by_default`).
     pub sort_reversed: bool,
+    /// How the directory looked when it was last listed, to tell when it
+    /// has changed since (see `changed_on_disk`).
+    listed_as: Option<DirStamp>,
+}
+
+/// What changes when a directory's contents do — its modification time —
+/// or when it's been replaced by another one (its device and inode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirStamp {
+    modified: Option<std::time::SystemTime>,
+    id: (u64, u64),
+}
+
+impl DirStamp {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        let meta = fs::metadata(path)?;
+        #[cfg(unix)]
+        let id = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let id = (0, 0);
+        Ok(DirStamp {
+            modified: meta.modified().ok(),
+            id,
+        })
+    }
 }
 
 impl Pane {
@@ -183,12 +211,16 @@ impl Pane {
             marked: HashSet::new(),
             sort_key: SortKey::Name,
             sort_reversed: false,
+            listed_as: None,
         };
         pane.reload()?;
         Ok(pane)
     }
 
     pub fn reload(&mut self) -> Result<()> {
+        // Taken before reading, so a change made while reading still shows
+        // as one next time.
+        self.listed_as = DirStamp::of(&self.cwd).ok();
         let mut entries = Vec::new();
 
         if self.cwd.parent().is_some() {
@@ -316,6 +348,47 @@ impl Pane {
             }
         }
         self.marked.len()
+    }
+
+    /// Whether the directory has changed since it was listed: one look at
+    /// the directory itself (not its files), cheap enough to ask twice a
+    /// second. An error means it can't be looked at any more (deleted,
+    /// say).
+    pub fn changed_on_disk(&self) -> std::io::Result<bool> {
+        Ok(Some(DirStamp::of(&self.cwd)?) != self.listed_as)
+    }
+
+    /// The directory shown is gone (deleted or moved away, here or by
+    /// another program): goes up to the nearest one still there, as other
+    /// file managers do, the cursor on the way back down. Returns where it
+    /// went, or `None` when nothing above could be listed either.
+    pub fn leave_for_nearest_existing(&mut self) -> Option<PathBuf> {
+        let gone = self.cwd.clone();
+        for dir in gone.ancestors().skip(1) {
+            if !dir.is_dir() {
+                continue;
+            }
+            let child = gone
+                .strip_prefix(dir)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .map(|first| first.as_os_str().to_string_lossy().into_owned());
+            if let Ok(None) = self.set_cwd_selecting(dir.to_path_buf(), child.as_deref()) {
+                return Some(dir.to_path_buf());
+            }
+        }
+        None
+    }
+
+    /// `reload`, with the cursor kept on the same entry rather than the same
+    /// row — which, sorted by size or date, a file just written may leave.
+    pub fn reload_keeping_selection(&mut self) -> Result<()> {
+        let selected_name = self.selected_entry().map(|e| e.name.clone());
+        self.reload()?;
+        if let Some(name) = selected_name {
+            self.select_name(&name);
+        }
+        Ok(())
     }
 
     /// Moves the cursor onto the entry called `name`, if it's listed.
