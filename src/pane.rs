@@ -174,6 +174,8 @@ pub struct Pane {
     /// How the directory looked when it was last listed, to tell when it
     /// has changed since (see `changed_on_disk`).
     listed_as: Option<DirStamp>,
+    /// See `Pane::unlisted`.
+    unlisted: bool,
 }
 
 /// What changes when a directory's contents do — its modification time —
@@ -212,12 +214,32 @@ impl Pane {
             sort_key: SortKey::Name,
             sort_reversed: false,
             listed_as: None,
+            unlisted: false,
         };
         pane.reload()?;
         Ok(pane)
     }
 
+    /// A pane that's never shown, so never lists anything (`pce`'s, behind
+    /// the editor): it only says where `cwd` is.
+    pub fn unlisted(cwd: PathBuf) -> Self {
+        Pane {
+            cwd,
+            entries: Vec::new(),
+            selected: 0,
+            hide_hidden: false,
+            marked: HashSet::new(),
+            sort_key: SortKey::Name,
+            sort_reversed: false,
+            listed_as: None,
+            unlisted: true,
+        }
+    }
+
     pub fn reload(&mut self) -> Result<()> {
+        if self.unlisted {
+            return Ok(());
+        }
         // Taken before reading, so a change made while reading still shows
         // as one next time.
         self.listed_as = DirStamp::of(&self.cwd).ok();
@@ -355,6 +377,9 @@ impl Pane {
     /// second. An error means it can't be looked at any more (deleted,
     /// say).
     pub fn changed_on_disk(&self) -> std::io::Result<bool> {
+        if self.unlisted {
+            return Ok(false);
+        }
         Ok(Some(DirStamp::of(&self.cwd)?) != self.listed_as)
     }
 

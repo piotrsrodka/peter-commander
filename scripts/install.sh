@@ -18,12 +18,19 @@ cargo build --release
 
 bin_dir="$HOME/.local/bin"
 mkdir -p "$bin_dir"
-cp target/release/peter-commander "$bin_dir/"
+# Through a temp file and a rename: copying straight over a binary that's
+# running (pce as $EDITOR, say) fails with "Text file busy".
+cp target/release/peter-commander "$bin_dir/.peter-commander.new"
+mv -f "$bin_dir/.peter-commander.new" "$bin_dir/peter-commander"
 echo "Installed peter-commander to $bin_dir/peter-commander"
 # pce, the editor alone (usable as $EDITOR): a link, as the binary notices
-# the name it was run under.
-ln -sf peter-commander "$bin_dir/pce"
-echo "Linked $bin_dir/pce (the editor alone) to it"
+# the name it was run under. Only ours is replaced, never another program.
+if [ ! -e "$bin_dir/pce" ] || [ -L "$bin_dir/pce" ]; then
+    ln -sf peter-commander "$bin_dir/pce"
+    echo "Linked $bin_dir/pce (the editor alone) to it"
+else
+    echo "Warning: $bin_dir/pce is another program; left it alone (no pce link)." >&2
+fi
 
 case ":${PATH:-}:" in
     *":$bin_dir:"*) ;;

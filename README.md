@@ -103,7 +103,10 @@ just like `peter-commander DIR`.
 Esc, F10 or Ctrl+Q close it, asking first about unsaved changes. It
 comes with `cargo install peter-commander` (a small launcher for the
 main binary), the Arch package and `scripts/install.sh`;
-`peter-commander --edit [+N] [FILE]` is the same thing.
+`peter-commander --edit [+N] [FILE]` is the same thing. (`cargo install`
+puts `pce` in `~/.cargo/bin` too; if another crate's `pce` is already
+there, use `cargo install --force peter-commander`, or
+`cargo install peter-commander --bin peter-commander` to skip it.)
 
 ## Installing
 

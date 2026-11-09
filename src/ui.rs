@@ -80,9 +80,16 @@ fn draw_editor_in(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = !app.list_focus;
     let show_cursor = focused && !overlay_open(app);
     let classic_style = app.classic_style;
+    let standalone = app.editor_only;
     if let Some(editor) = app.editor.as_mut() {
-        app.editor_text_area =
-            draw_editor(frame, area, editor, classic_style, focused, show_cursor);
+        app.editor_text_area = draw_editor(
+            frame,
+            area,
+            editor,
+            classic_style,
+            (focused, show_cursor),
+            standalone,
+        );
         app.editor_area = area;
     }
 }
@@ -2663,8 +2670,8 @@ fn draw_editor(
     area: Rect,
     editor: &mut Editor,
     classic_style: bool,
-    focused: bool,
-    show_cursor: bool,
+    (focused, show_cursor): (bool, bool),
+    standalone: bool,
 ) -> Rect {
     // Without the keyboard (Tab gave it to the file list), framed like an
     // inactive pane, the selection still there but dimmed.
@@ -2768,6 +2775,7 @@ fn draw_editor(
                 editor,
                 status_area.width as usize,
                 focused,
+                standalone,
             ))
             .style(look.text),
             status_area,
@@ -2978,12 +2986,13 @@ fn draw_find_bar(
 /// and the main keys on the right, as room allows.
 #[cfg(test)]
 fn editor_status_text(editor: &Editor, width: usize) -> String {
-    editor_status_line(editor, width, true)
+    editor_status_line(editor, width, true, false)
 }
 
 /// The editor's status line; `focused`: whether it has the keyboard (the
-/// keys it offers are its own only then).
-fn editor_status_line(editor: &Editor, width: usize, focused: bool) -> String {
+/// keys it offers are its own only then); `standalone`: `pce`, which has
+/// no pane for F4 to go back to.
+fn editor_status_line(editor: &Editor, width: usize, focused: bool, standalone: bool) -> String {
     let cursor = editor.cursor();
     let mut left = format!(" Ln {}, Col {}", cursor.line + 1, cursor.col + 1);
     // The code of the character under the cursor, as Unicode writes it;
@@ -3049,7 +3058,7 @@ fn editor_status_line(editor: &Editor, width: usize, focused: bool) -> String {
     match hints
         .iter()
         // `pce` has no pane for F4 to go back to.
-        .filter(|hint| !(editor.standalone && hint.contains("F4")))
+        .filter(|hint| !(standalone && hint.contains("F4")))
         .find(|hint| left_width + 2 + hint.chars().count() <= width)
     {
         Some(hint) => format!(

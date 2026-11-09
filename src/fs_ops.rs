@@ -482,12 +482,7 @@ pub fn write_file_safely(path: &Path, contents: &[u8]) -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
-    if meta.permissions().readonly() || !may_write(&target) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the file is read-only",
-        ));
-    }
+    refuse_read_only(&target, &meta)?;
     if !meta.is_file() || !replacing_keeps_identity(&meta) {
         return write_in_place(&target, contents);
     }
@@ -501,10 +496,22 @@ pub fn write_file_safely(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
 }
 
+/// A read-only file isn't saved over, as Notepad won't — not even by root,
+/// who could: the read-only mark is the file owner's word.
+fn refuse_read_only(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
+    if meta.permissions().readonly() || !may_write(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the file is read-only",
+        ));
+    }
+    Ok(())
+}
+
 /// Where `path` really is: symlinks followed all the way, including the
 /// last one of a chain whose target no longer exists (saving then creates
 /// that target, instead of replacing the link with a file).
-fn link_target(path: &Path) -> PathBuf {
+pub fn link_target(path: &Path) -> PathBuf {
     if let Ok(target) = fs::canonicalize(path) {
         return target;
     }
@@ -666,31 +673,59 @@ fn may_write(_path: &Path) -> bool {
 /// Writes over the file where it is. The path is already the real file, so
 /// on Unix a symlink put in its place meanwhile is refused, not followed.
 fn write_in_place(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    io::Write::write_all(&mut file, contents)?;
-    file.sync_all()
+    write_over(path, contents, false).map_err(|failed| failed.error)
 }
 
 /// Saves `contents` over the file at `path` where it is — the same file,
 /// same inode, links followed — as programs that hand a file to `$EDITOR`
 /// and read it back by its open descriptor need: `crontab -e`, for one,
 /// refuses a file that was replaced ("temp file must be edited in
-/// place"). Unlike `write_file_safely`, a crash part-way can leave it half
-/// written.
-pub fn overwrite_in_place(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    io::Write::write_all(&mut file, contents)?;
-    file.sync_all()
+/// place"). A read-only file is refused, as by `write_file_safely`.
+/// Unlike that, a failure part-way (a full disk) can leave the file
+/// damaged: the error says whether it got that far.
+pub fn overwrite_in_place(path: &Path, contents: &[u8]) -> Result<(), InPlaceError> {
+    let untouched = |error| InPlaceError {
+        error,
+        touched: false,
+    };
+    let meta = fs::metadata(path).map_err(untouched)?;
+    refuse_read_only(path, &meta).map_err(untouched)?;
+    write_over(path, contents, true)
+}
+
+/// Why `overwrite_in_place` failed, and whether the file was already being
+/// written then — so may now be damaged.
+#[derive(Debug)]
+pub struct InPlaceError {
+    pub error: io::Error,
+    pub touched: bool,
+}
+
+/// The one way both kinds of in-place save write: the new text over the
+/// old from its start, and only then the file cut to its length, so it's
+/// never shorter than what got written of the new text. With
+/// `follow_links` off, a symlink at `path` is refused (Unix).
+fn write_over(path: &Path, contents: &[u8], follow_links: bool) -> Result<(), InPlaceError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    if !follow_links {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    let _ = follow_links;
+    let mut file = options.open(path).map_err(|error| InPlaceError {
+        error,
+        touched: false,
+    })?;
+    let touched = |error| InPlaceError {
+        error,
+        touched: true,
+    };
+    io::Write::write_all(&mut file, contents).map_err(touched)?;
+    file.set_len(contents.len() as u64).map_err(touched)?;
+    file.sync_all().map_err(touched)
 }
 
 /// Which file a path is, to tell it from another one put in its place
@@ -992,6 +1027,37 @@ mod tests {
         let err = write_new_file(&path, b"second", None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&path).unwrap(), b"first");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_in_place_keeps_the_file_and_refuses_a_read_only_one() {
+        let dir = fresh_dir("pc_test_overwrite_in_place");
+        let path = dir.join("crontab.txt");
+        fs::write(&path, "a much longer old text").unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).unwrap().ino()
+        };
+        overwrite_in_place(&path, b"short").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"short");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        }
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        let err = overwrite_in_place(&path, b"new").unwrap_err();
+        assert_eq!(err.error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!err.touched);
+        assert_eq!(fs::read(&path).unwrap(), b"short");
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

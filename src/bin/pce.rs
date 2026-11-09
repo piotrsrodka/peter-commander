@@ -18,6 +18,9 @@ fn main() {
         eprintln!("pce: cannot find where pce is: {err}");
         std::process::exit(1);
     });
+    // Where the launcher really is: on macOS `current_exe` can be a link to
+    // it, put somewhere `peter-commander` isn't.
+    let launcher = launcher.canonicalize().unwrap_or(launcher);
     let target = main_binary(&launcher);
     let mut command = Command::new(&target);
     command.arg("--edit").args(std::env::args_os().skip(1));
@@ -46,12 +49,11 @@ mod tests {
 
     #[test]
     fn the_editor_is_the_binary_beside_the_launcher() {
-        let launcher =
-            Path::new("/home/u/.cargo/bin").join(format!("pce{}", std::env::consts::EXE_SUFFIX));
+        let bin = std::env::temp_dir().join("cargo").join("bin");
+        let launcher = bin.join(format!("pce{}", std::env::consts::EXE_SUFFIX));
         assert_eq!(
             main_binary(&launcher),
-            Path::new("/home/u/.cargo/bin")
-                .join(format!("peter-commander{}", std::env::consts::EXE_SUFFIX))
+            bin.join(format!("peter-commander{}", std::env::consts::EXE_SUFFIX))
         );
     }
 }

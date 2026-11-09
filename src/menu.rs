@@ -188,10 +188,7 @@ pub const PREVIEW_MENU_BAR: &[MenuCategory] = &[FILE, PREVIEW_OPTIONS, COMMAND];
 /// "Saved" lands), About and Quit, in Command as everywhere else. Every
 /// title still starts with its own letter, for the Alt+letter shortcuts.
 pub const EDITOR_MENU_BAR: &[MenuCategory] = &[
-    MenuCategory {
-        title: "File",
-        items: &[Action::Save, Action::SaveAs, Action::Rename, Action::Close],
-    },
+    EDITOR_FILE,
     EDIT,
     OPTIONS,
     MenuCategory {
@@ -204,6 +201,12 @@ pub const EDITOR_MENU_BAR: &[MenuCategory] = &[
         ],
     },
 ];
+
+/// File in the editor's menu bars (with the panes, and `pce`).
+const EDITOR_FILE: MenuCategory = MenuCategory {
+    title: "File",
+    items: &[Action::Save, Action::SaveAs, Action::Rename, Action::Close],
+};
 
 const EDIT: MenuCategory = MenuCategory {
     title: "Edit",
@@ -218,10 +221,7 @@ const EDIT: MenuCategory = MenuCategory {
 /// `pce`'s menu bar: the editor's, without what belongs to the file
 /// manager around it (its logs).
 pub const PCE_MENU_BAR: &[MenuCategory] = &[
-    MenuCategory {
-        title: "File",
-        items: &[Action::Save, Action::SaveAs, Action::Rename, Action::Close],
-    },
+    EDITOR_FILE,
     EDIT,
     OPTIONS,
     MenuCategory {

@@ -689,9 +689,6 @@ pub struct Editor {
     pub untitled: bool,
     /// Named, but not on disk yet (`pce new.txt`): the first save makes it.
     pub new_file: bool,
-    /// The editor alone, with no panes to go back to (`pce`): always full
-    /// screen, and closing it ends the program.
-    pub standalone: bool,
     /// Which file on disk this is (device and inode), as opened or last
     /// saved — to notice it renamed, deleted or replaced under the editor,
     /// so a save can't silently land somewhere other than the user thinks.
@@ -830,7 +827,6 @@ impl Editor {
             folded: RefCell::default(),
             untitled: false,
             new_file: false,
-            standalone: false,
             disk_id: None,
             mode: None,
         })

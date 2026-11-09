@@ -514,8 +514,13 @@ pub struct App {
     last_refresh_check: Option<Instant>,
     /// A note from that check, waiting for whatever's open to close.
     pending_notice: Option<String>,
-    /// `pce`: the editor is all there is (see `App::editor_only`).
+    /// `pce`: the editor is all there is (see `App::editor_only`). The
+    /// one mark of that mode; what differs in it asks this.
     pub editor_only: bool,
+    /// `pce`: a save over the file in place failed part-way, so the file
+    /// may be damaged — and unless a later save worked, `pce` says so and
+    /// ends with a failure, for git, crontab or sudoedit not to take it.
+    pub damaged_file: Option<PathBuf>,
 }
 
 /// Directories named on the command line (`pc LEFT [RIGHT]`), already
@@ -547,7 +552,6 @@ impl App {
     /// As of an untitled text to start from). Closing it ends the program.
     pub fn editor_only(mut editor: Editor) -> Result<Self> {
         let mut app = Self::build(StartDirs::default(), true)?;
-        editor.standalone = true;
         editor.full_screen = true;
         app.install_editor(editor);
         app.view_before_editor = None;
@@ -555,7 +559,13 @@ impl App {
     }
 
     fn build(start_dirs: StartDirs, editor_only: bool) -> Result<Self> {
-        let cwd = env::current_dir()?;
+        // `pce` doesn't need the directory it's run in to be readable, or
+        // still there: its panes are never listed.
+        let cwd = if editor_only {
+            env::current_dir().unwrap_or_default()
+        } else {
+            env::current_dir()?
+        };
         let saved_settings = state::load_settings();
         let start_left_in_cwd = saved_settings
             .get(SettingItem::StartLeftInCwd.key())
@@ -613,8 +623,16 @@ impl App {
             .copied()
             .unwrap_or(true);
         let mut app = App {
-            left: Pane::new(left_dir, hide_hidden_files)?,
-            right: Pane::new(right_dir, hide_hidden_files)?,
+            left: if editor_only {
+                Pane::unlisted(left_dir)
+            } else {
+                Pane::new(left_dir, hide_hidden_files)?
+            },
+            right: if editor_only {
+                Pane::unlisted(right_dir)
+            } else {
+                Pane::new(right_dir, hide_hidden_files)?
+            },
             active: Side::Left,
             should_quit: false,
             menu_open: false,
@@ -679,6 +697,7 @@ impl App {
             last_refresh_check: None,
             pending_notice: None,
             editor_only,
+            damaged_file: None,
         };
         if !editor_only {
             app.restore_sorts();
@@ -2515,7 +2534,7 @@ impl App {
             EditorCommand::Close if editor.selection().is_some() => editor.deselect(),
             EditorCommand::Close => self.close_editor(),
             // `pce` has no pane to go back to.
-            EditorCommand::ToggleFullScreen if editor.standalone => {}
+            EditorCommand::ToggleFullScreen if self.editor_only => {}
             EditorCommand::ToggleFullScreen => {
                 editor.full_screen = !editor.full_screen;
                 self.list_focus = false;
@@ -2632,10 +2651,14 @@ impl App {
         let editor = self.editor.as_ref()?;
         let typed = crate::transfer::expand_home(typed.trim())?;
         let base = if editor.untitled {
-            Some(self.active_pane_ref().cwd.as_path())
+            // `pce` run in a directory that's gone: only a full path will do.
+            Some(self.active_pane_ref().cwd.as_path()).filter(|dir| dir.is_dir())
         } else {
             editor.path.parent()
         };
+        if base.is_none() && !typed.is_absolute() {
+            return None;
+        }
         let target = if typed.is_absolute() {
             typed
         } else {
@@ -2668,13 +2691,17 @@ impl App {
         // isn't (else Replace is asked), and with the permissions of the
         // file the text came from, so a private one's copy stays private.
         let new = std::fs::symlink_metadata(path).is_err();
+        let mut damaged = false;
         let written = if new {
             let mode = if editor.untitled { None } else { editor.mode };
             fs_ops::write_new_file(path, &editor.to_bytes(), mode)
-        } else if editor.standalone && editor.path == path {
+        } else if self.editor_only && editor.path == path {
             // `pce` as `$EDITOR`: whoever handed over the file may read it
             // back through the descriptor it holds (crontab -e insists).
-            fs_ops::overwrite_in_place(path, &editor.to_bytes())
+            fs_ops::overwrite_in_place(path, &editor.to_bytes()).map_err(|failed| {
+                damaged = failed.touched;
+                failed.error
+            })
         } else {
             fs_ops::write_file_safely(path, &editor.to_bytes())
         };
@@ -2697,10 +2724,16 @@ impl App {
                 editor.mark_saved();
                 editor.message = Some("Saved".to_string());
                 self.watch = EditedFileWatch::default();
+                self.damaged_file = None;
                 self.set_status(format!("Saved {}", path.display()));
                 // The new size and date, in whichever pane shows the file —
                 // on the same entry, even if sorting by size or date moved it.
-                for side in [Side::Left, Side::Right] {
+                let sides: &[Side] = if self.editor_only {
+                    &[]
+                } else {
+                    &[Side::Left, Side::Right]
+                };
+                for &side in sides {
                     let pane = self.pane_mut(side);
                     let result = pane.reload_keeping_selection();
                     if show
@@ -2714,6 +2747,16 @@ impl App {
                     }
                 }
                 true
+            }
+            Err(err) if damaged => {
+                editor.message = Some("Not saved".to_string());
+                self.damaged_file = Some(path.to_path_buf());
+                self.set_error(format!(
+                    "Cannot save {}: {err}. The file on disk may be damaged now: \
+                     save again, or use Save As",
+                    path.display()
+                ));
+                false
             }
             Err(err) => {
                 editor.message = Some("Not saved".to_string());
@@ -2951,6 +2994,12 @@ impl App {
                     return Ok(());
                 }
                 let Some(target) = self.save_as_target(&typed) else {
+                    self.after_prompt = None;
+                    self.set_error(format!(
+                        "Cannot save as \"{}\": no current directory to put it in; \
+                         give the full path",
+                        typed.trim()
+                    ));
                     return Ok(());
                 };
                 // Its own file, still the same one: just a save. (Without
@@ -4784,6 +4833,40 @@ mod tests {
         save_as(&mut app, "link");
         assert!(matches!(app.dialog, Dialog::ConfirmSaveAs { .. }));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_app_editor_saves_through_a_temp_file_and_pce_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        let (mut app, dir) = app_with_files("save_kinds", &[("a.txt", b"x")]);
+        let inode = || std::fs::metadata(dir.join("a.txt")).unwrap().ino();
+        let before = inode();
+        app.run_action(Action::Edit).unwrap();
+        keys(&mut app, "y");
+        app.editor_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert_ne!(inode(), before, "the safe save: a new file renamed over");
+        let mut pce = App::editor_only(Editor::open(&dir.join("a.txt")).unwrap()).unwrap();
+        let before = inode();
+        pce.editor_key(KeyCode::Char('z'), KeyModifiers::NONE)
+            .unwrap();
+        pce.editor_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            .unwrap();
+        assert_eq!(inode(), before, "pce: the same file, written over");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"zyx");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_without_a_current_directory_needs_a_full_path() {
+        let mut app = App::editor_only(Editor::untitled()).unwrap();
+        let gone = std::env::temp_dir().join("pc_test_no_such_dir_at_all");
+        app.left = Pane::unlisted(gone.clone());
+        app.right = Pane::unlisted(gone);
+        assert_eq!(app.save_as_target("notes.txt"), None);
+        let full = std::env::temp_dir().join("notes.txt");
+        assert_eq!(app.save_as_target(&full.display().to_string()), Some(full));
     }
 
     #[test]

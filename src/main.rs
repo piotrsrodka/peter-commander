@@ -19,6 +19,7 @@ mod tty_image;
 mod ui;
 
 use std::env;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,7 +44,7 @@ use ratatui::layout::Position;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::flag;
 
-use app::{App, Dialog, ExternalRequest, SettingItem, StartDirs};
+use app::{App, Dialog, ExternalRequest, StartDirs};
 use editor::Editor;
 use menu::{Action, FN_KEYS};
 
@@ -62,14 +63,14 @@ enum CliRequest {
     /// Start the UI, optionally in the given left/right pane directories
     /// (as typed; checked by `resolve_dir` once parsing is done).
     Run {
-        left: Option<String>,
-        right: Option<String>,
+        left: Option<OsString>,
+        right: Option<OsString>,
     },
     /// `--edit` (or run as `pce`): the built-in editor alone, on `file` (or
     /// an untitled text), at `line` (`+N`, counted from 1).
     Edit {
         line: Option<usize>,
-        file: Option<String>,
+        file: Option<OsString>,
     },
     Version,
     Help,
@@ -79,15 +80,16 @@ enum CliRequest {
 
 /// The command line as given — the program's name first, since run as
 /// `pce` (a link to this binary, or the launcher) it's the editor alone,
-/// as with `--edit`.
-fn parse_cli<I: IntoIterator<Item = String>>(argv: I) -> CliRequest {
+/// as with `--edit`. Taken as the system gives it, not as UTF-8: a name
+/// in another encoding is still a name.
+fn parse_cli<I: IntoIterator<Item = OsString>>(argv: I) -> CliRequest {
     let mut argv = argv.into_iter();
     let program = argv.next().unwrap_or_default();
     let as_pce = Path::new(&program)
         .file_stem()
         .is_some_and(|stem| stem == "pce");
     if as_pce {
-        parse_args(std::iter::once("--edit".to_string()).chain(argv))
+        parse_args(std::iter::once(OsString::from("--edit")).chain(argv))
     } else {
         parse_args(argv)
     }
@@ -96,35 +98,44 @@ fn parse_cli<I: IntoIterator<Item = String>>(argv: I) -> CliRequest {
 /// `-V`/`-v`/`--version`/`-version` and `-h`/`--help` win wherever they
 /// appear; otherwise up to two directories, for the left and right pane.
 /// A bare `version` is a directory name like any other, so `pc version`
-/// opens it.
-fn parse_args<I: IntoIterator<Item = String>>(args: I) -> CliRequest {
-    let mut dirs = Vec::new();
+/// opens it. After `--` nothing is an option any more — sudoedit and
+/// visudo call `$EDITOR -- FILE` (or `+N -- FILE`), and a name may start
+/// with `-`.
+fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> CliRequest {
+    // Each name, and whether it came after `--`.
+    let mut names: Vec<(OsString, bool)> = Vec::new();
     let mut invalid = None;
     let mut edit = false;
+    let mut options_done = false;
     for arg in args {
-        match arg.as_str() {
-            "-V" | "-v" | "--version" | "-version" => return CliRequest::Version,
-            "-h" | "--help" => return CliRequest::Help,
-            "--edit" => edit = true,
-            option if option.len() > 1 && option.starts_with('-') => {
+        if options_done {
+            names.push((arg, true));
+            continue;
+        }
+        match arg.to_str() {
+            Some("--") => options_done = true,
+            Some("-V" | "-v" | "--version" | "-version") => return CliRequest::Version,
+            Some("-h" | "--help") => return CliRequest::Help,
+            Some("--edit") => edit = true,
+            Some(option) if option.len() > 1 && option.starts_with('-') => {
                 invalid.get_or_insert(format!("unknown option '{option}'"));
             }
-            _ => dirs.push(arg),
+            _ => names.push((arg, false)),
         }
     }
     if let Some(message) = invalid {
         return CliRequest::Invalid(message);
     }
     if edit {
-        return parse_edit_args(dirs);
+        return parse_edit_args(names);
     }
-    if dirs.len() > 2 {
+    if names.len() > 2 {
         return CliRequest::Invalid(format!(
             "too many directories: expected at most 2 (left and right pane), got {}",
-            dirs.len()
+            names.len()
         ));
     }
-    let mut dirs = dirs.into_iter();
+    let mut dirs = names.into_iter().map(|(name, _)| name);
     CliRequest::Run {
         left: dirs.next(),
         right: dirs.next(),
@@ -132,17 +143,26 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> CliRequest {
 }
 
 /// `--edit [+N] [FILE]`: a line to start on, as vim and nano take it, and
-/// one file at most. A `+` not followed by digits is a file name.
-fn parse_edit_args(args: Vec<String>) -> CliRequest {
-    let mut args = args.into_iter().peekable();
-    let line = args
-        .next_if(|arg| {
-            arg.len() > 1 && arg.starts_with('+') && arg[1..].bytes().all(|b| b.is_ascii_digit())
+/// one file at most. A `+` not followed by digits is a file name, and so
+/// is anything after `--`.
+fn parse_edit_args(names: Vec<(OsString, bool)>) -> CliRequest {
+    let mut names = names.into_iter().peekable();
+    let line = names
+        .next_if(|(name, after_dashes)| {
+            !after_dashes
+                && name.to_str().is_some_and(|name| {
+                    name.len() > 1
+                        && name.starts_with('+')
+                        && name[1..].bytes().all(|b| b.is_ascii_digit())
+                })
         })
-        .and_then(|arg| arg[1..].parse().ok());
-    let file = args.next();
-    if let Some(extra) = args.next() {
-        return CliRequest::Invalid(format!("--edit takes one file, not also '{extra}'"));
+        .and_then(|(name, _)| name.to_str()?[1..].parse().ok());
+    let file = names.next().map(|(name, _)| name);
+    if let Some((extra, _)) = names.next() {
+        return CliRequest::Invalid(format!(
+            "--edit takes one file, not also '{}'",
+            extra.to_string_lossy()
+        ));
     }
     CliRequest::Edit { line, file }
 }
@@ -151,9 +171,9 @@ fn parse_edit_args(args: Vec<String>) -> CliRequest {
 /// tmux layouts and the like run it, expecting nvim's file browser — the
 /// file manager, its left pane there, just as `peter-commander DIR` (`+N`
 /// then means nothing); on anything else, the editor alone.
-fn start_for_edit(file: Option<&str>, line: Option<usize>) -> std::result::Result<Start, String> {
+fn start_for_edit(file: Option<&Path>, line: Option<usize>) -> std::result::Result<Start, String> {
     if let Some(arg) = file
-        && Path::new(arg).is_dir()
+        && arg.is_dir()
     {
         return Ok(Start::Panes(StartDirs {
             left: Some(resolve_dir(arg)?),
@@ -167,12 +187,13 @@ fn start_for_edit(file: Option<&str>, line: Option<usize>) -> std::result::Resul
 /// terminal switches to the UI, so it lands in the shell (or in git's
 /// output, as `core.editor`). A name that isn't there yet is a new file,
 /// made on the first save.
-fn editor_for(file: Option<&str>, line: Option<usize>) -> std::result::Result<Editor, String> {
+fn editor_for(file: Option<&Path>, line: Option<usize>) -> std::result::Result<Editor, String> {
     let mut editor = match file {
         None => Editor::untitled(),
-        Some(arg) => {
+        Some(given) => {
+            let arg = given.display();
             let path =
-                std::path::absolute(arg).map_err(|err| format!("cannot edit '{arg}': {err}"))?;
+                std::path::absolute(given).map_err(|err| format!("cannot edit '{arg}': {err}"))?;
             match std::fs::metadata(&path) {
                 Ok(meta) if meta.is_dir() => {
                     return Err(format!("cannot edit '{arg}': it's a directory"));
@@ -181,12 +202,19 @@ fn editor_for(file: Option<&str>, line: Option<usize>) -> std::result::Result<Ed
                     Editor::read(&path).map_err(|why| format!("cannot edit '{arg}': {why}"))?
                 }
                 // New, in a directory that's there: made on the first save.
+                // A link whose target isn't there yet is the same, the
+                // target being the new file (the link stays a link).
                 Err(err)
                     if err.kind() == io::ErrorKind::NotFound
-                        && path.parent().is_some_and(Path::is_dir)
-                        && !arg.ends_with(['/', std::path::MAIN_SEPARATOR]) =>
+                        && !given
+                            .to_string_lossy()
+                            .ends_with(['/', std::path::MAIN_SEPARATOR]) =>
                 {
-                    Editor::new_file(path)
+                    let target = fs_ops::link_target(&path);
+                    if !target.parent().is_some_and(Path::is_dir) {
+                        return Err(format!("cannot edit '{arg}': {err}"));
+                    }
+                    Editor::new_file(target)
                 }
                 Err(err) => return Err(format!("cannot edit '{arg}': {err}")),
             }
@@ -201,8 +229,9 @@ fn editor_for(file: Option<&str>, line: Option<usize>) -> std::result::Result<Ed
 /// Turns a directory argument into an absolute path, or says why it can't
 /// be opened — checked before the terminal switches to the UI, so the
 /// message lands in the shell the user typed the command in.
-fn resolve_dir(arg: &str) -> std::result::Result<PathBuf, String> {
-    let path = Path::new(arg);
+fn resolve_dir(arg: &Path) -> std::result::Result<PathBuf, String> {
+    let path = arg;
+    let arg = arg.display();
     let resolved = path
         .canonicalize()
         .map_err(|err| format!("cannot open '{arg}': {err}"))?;
@@ -243,16 +272,22 @@ fn usage_text() -> String {
 }
 
 fn main() -> Result<()> {
-    let start = match parse_cli(env::args()) {
-        CliRequest::Edit { line, file } => match start_for_edit(file.as_deref(), line) {
-            Ok(start) => start,
-            Err(message) => {
-                eprintln!("pce: {message}");
-                std::process::exit(1);
+    let start = match parse_cli(env::args_os()) {
+        CliRequest::Edit { line, file } => {
+            match start_for_edit(file.as_deref().map(Path::new), line) {
+                Ok(start) => start,
+                Err(message) => {
+                    eprintln!("pce: {message}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         CliRequest::Run { left, right } => {
-            let resolve = |arg: Option<String>| arg.as_deref().map(resolve_dir).transpose();
+            let resolve = |arg: Option<OsString>| {
+                arg.as_deref()
+                    .map(|arg| resolve_dir(Path::new(arg)))
+                    .transpose()
+            };
             match resolve(left).and_then(|left| {
                 Ok(StartDirs {
                     left,
@@ -294,13 +329,20 @@ fn main() -> Result<()> {
         flag::register(signal, Arc::clone(&should_exit))?;
     }
 
-    // Read directly rather than via App::new() (which happens later, inside
-    // run()) so the very first frame already has mouse capture in the
-    // state the user last left it in, instead of always starting enabled.
-    let mouse_capture_enabled = state::load_settings()
-        .get(SettingItem::MouseCapture.key())
-        .copied()
-        .unwrap_or(true);
+    // Before the terminal is the UI's, so what goes wrong (a directory
+    // that can't be listed) is said plainly in the shell.
+    let app = match start {
+        Start::Panes(start_dirs) => App::with_start_dirs(start_dirs),
+        Start::Editor(editor) => App::editor_only(*editor),
+    };
+    let app = match app {
+        Ok(app) => app,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+    };
+    let mouse_capture_enabled = app.mouse_capture;
 
     enable_raw_mode().context("enable_raw_mode")?;
     let mut stdout = io::stdout();
@@ -316,15 +358,27 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Terminal::new")?;
 
-    let result = run(&mut terminal, &should_exit, mouse_capture_enabled, start);
+    let result = run(&mut terminal, &should_exit, mouse_capture_enabled, app);
 
     restore_terminal();
 
-    if let Err(err) = &result {
-        logging::log_error(&format!("fatal: {err:?}"));
+    match result {
+        Err(err) => {
+            logging::log_error(&format!("fatal: {err:?}"));
+            Err(err)
+        }
+        // `pce` ending after an in-place save failed part-way: whoever is
+        // waiting for the editor (git, crontab, sudoedit) is told it
+        // failed, so it doesn't take a damaged file.
+        Ok(Some(damaged)) => {
+            eprintln!(
+                "pce: saving {} failed part-way; the file may be damaged",
+                damaged.display()
+            );
+            std::process::exit(1);
+        }
+        Ok(None) => Ok(()),
     }
-
-    result
 }
 
 /// What `main` starts: the file manager, or (`pce`) the editor alone.
@@ -337,12 +391,8 @@ fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     should_exit: &AtomicBool,
     mouse_capture_enabled: bool,
-    start: Start,
-) -> Result<()> {
-    let mut app = match start {
-        Start::Panes(start_dirs) => App::with_start_dirs(start_dirs)?,
-        Start::Editor(editor) => App::editor_only(*editor)?,
-    };
+    mut app: App,
+) -> Result<Option<PathBuf>> {
     // Tracks what's actually been sent to the terminal, so a change to the
     // live "Capture mouse" setting (toggled in the Settings dialog) can be
     // applied the moment it happens, not just at the next TUI suspend.
@@ -405,7 +455,7 @@ fn run(
 
     app.cancel_job_and_wait();
     app.save_state();
-    Ok(())
+    Ok(app.damaged_file.take())
 }
 
 /// A paste then arrives as one `Event::Paste` instead of a stream of key
@@ -1343,14 +1393,14 @@ mod tests {
         assert_eq!(next_image(&entries, 1, false), None);
     }
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
     }
 
     fn run(left: Option<&str>, right: Option<&str>) -> CliRequest {
         CliRequest::Run {
-            left: left.map(String::from),
-            right: right.map(String::from),
+            left: left.map(OsString::from),
+            right: right.map(OsString::from),
         }
     }
 
@@ -1406,17 +1456,14 @@ mod tests {
         let file = tmp.join("file.txt");
         std::fs::write(&file, "x").unwrap();
 
-        assert_eq!(
-            resolve_dir(tmp.to_str().unwrap()),
-            Ok(tmp.canonicalize().unwrap())
-        );
+        assert_eq!(resolve_dir(&tmp), Ok(tmp.canonicalize().unwrap()));
         assert!(
-            resolve_dir(file.to_str().unwrap())
+            resolve_dir(&file)
                 .unwrap_err()
                 .contains("is not a directory")
         );
         assert!(
-            resolve_dir(tmp.join("missing").to_str().unwrap())
+            resolve_dir(&tmp.join("missing"))
                 .unwrap_err()
                 .starts_with("cannot open")
         );
@@ -2338,7 +2385,7 @@ mod tests {
     fn edit(line: Option<usize>, file: Option<&str>) -> CliRequest {
         CliRequest::Edit {
             line,
-            file: file.map(String::from),
+            file: file.map(OsString::from),
         }
     }
 
@@ -2378,13 +2425,64 @@ mod tests {
     }
 
     #[test]
+    fn double_dash_ends_the_options_as_sudoedit_and_visudo_expect() {
+        assert_eq!(
+            parse_args(args(&["--edit", "--", "f"])),
+            edit(None, Some("f"))
+        );
+        assert_eq!(
+            parse_args(args(&["--edit", "+3", "--", "f"])),
+            edit(Some(3), Some("f"))
+        );
+        // After `--`, a leading `-` (or `+`) is part of a name.
+        assert_eq!(
+            parse_args(args(&["--edit", "--", "-file"])),
+            edit(None, Some("-file"))
+        );
+        assert_eq!(
+            parse_args(args(&["--edit", "--", "+3"])),
+            edit(None, Some("+3"))
+        );
+        assert_eq!(
+            parse_args(args(&["--edit", "--", "-h"])),
+            edit(None, Some("-h"))
+        );
+        assert_eq!(
+            parse_cli(args(&["pce", "--", "/var/tmp/sudoers.XXXX"])),
+            edit(None, Some("/var/tmp/sudoers.XXXX"))
+        );
+        assert_eq!(parse_args(args(&["--", "-dir"])), run(Some("-dir"), None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_isnt_utf8_is_a_name_not_a_crash() {
+        use std::os::unix::ffi::OsStringExt;
+        let latin2 = OsString::from_vec(b"zaba-\xbf.txt".to_vec());
+        let parsed = parse_cli([OsString::from("pce"), latin2.clone()]);
+        assert_eq!(
+            parsed,
+            CliRequest::Edit {
+                line: None,
+                file: Some(latin2.clone())
+            }
+        );
+        let dir = std::env::temp_dir().join(format!("pc_test_pce_latin2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let editor = editor_for(Some(&dir.join(&latin2)), None).unwrap();
+        assert!(editor.new_file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn pce_refuses_what_it_cant_edit_before_any_ui() {
         let dir = std::env::temp_dir().join(format!("pc_test_pce_refuse_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bin.dat"), b"\x00\x01").unwrap();
         std::fs::write(dir.join("latin2.txt"), b"\xb1").unwrap();
-        let refused = |name: &str| editor_for(Some(&dir.join(name).display().to_string()), None);
+        let refused = |name: &str| editor_for(Some(&dir.join(name)), None);
         let why = |name: &str| refused(name).err().unwrap();
         assert!(why("bin.dat").contains("binary"));
         assert!(why("latin2.txt").contains("UTF-8"));
@@ -2394,7 +2492,7 @@ mod tests {
         assert!(editor.new_file && !dir.join("new.txt").exists());
         // +N: that line, or the last.
         std::fs::write(dir.join("lines.txt"), "a\nb\nc\n").unwrap();
-        let path = dir.join("lines.txt").display().to_string();
+        let path = dir.join("lines.txt");
         assert_eq!(
             editor_for(Some(&path), Some(2)).unwrap().cursor(),
             editor::Pos::new(1, 0)
@@ -2416,7 +2514,7 @@ mod tests {
         if let Some(text) = text {
             std::fs::write(dir.join(name), text).unwrap();
         }
-        let editor = editor_for(Some(&dir.join(name).display().to_string()), None).unwrap();
+        let editor = editor_for(Some(&dir.join(name)), None).unwrap();
         let mut app = App::editor_only(editor).unwrap();
         app.clipboard = clipboard::Clipboard::internal();
         (app, dir)
@@ -2431,7 +2529,7 @@ mod tests {
             std::fs::metadata(dir.join("COMMIT_EDITMSG")).unwrap().ino()
         };
         let editor = app.editor.as_ref().unwrap();
-        assert!(editor.full_screen && editor.standalone);
+        assert!(editor.full_screen && app.editor_only);
         let titles: Vec<&str> = app.menu_bar().iter().map(|c| c.title).collect();
         assert_eq!(titles, ["File", "Edit", "Options", "Command"]);
         let items: Vec<Action> = app
@@ -2530,7 +2628,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
-        let start = |arg: &Path, line| start_for_edit(Some(&arg.display().to_string()), line);
+        let start = |arg: &Path, line| start_for_edit(Some(arg), line);
         let left_pane = |start| match start {
             Ok(Start::Panes(dirs)) => dirs.left.expect("the left pane's directory"),
             Ok(Start::Editor(_)) => panic!("the editor, not the panes"),
@@ -2551,7 +2649,7 @@ mod tests {
         }
         // `.`: where it's run.
         assert_eq!(
-            left_pane(start_for_edit(Some("."), None)),
+            left_pane(start_for_edit(Some(Path::new(".")), None)),
             env::current_dir().unwrap().canonicalize().unwrap()
         );
         // A file, or a name not there yet, is still the editor.
@@ -2565,5 +2663,101 @@ mod tests {
         }
         assert!(matches!(start_for_edit(None, None), Ok(Start::Editor(_))));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_asks_before_saving_over_a_new_file_someone_else_made() {
+        let (mut app, dir) = pce_on("new_taken", "new.txt", None);
+        typed(&mut app, "mine");
+        std::fs::write(dir.join("new.txt"), "theirs").unwrap();
+        ctrl(&mut app, 's');
+        assert!(matches!(app.dialog, Dialog::ConfirmSaveAs { .. }));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(std::fs::read(dir.join("new.txt")).unwrap(), b"theirs");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_on_a_new_name_isnt_taken_for_a_vanished_file() {
+        let (mut app, dir) = pce_on("new_quiet", "new.txt", None);
+        app.refresh_from_disk();
+        app.refresh_from_disk();
+        assert!(app.error_dialog.is_none());
+        assert!(!app.editor.as_ref().unwrap().is_modified());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pce_on_a_dangling_link_makes_its_target_and_keeps_the_link() {
+        let dir = std::env::temp_dir().join(format!("pc_test_pce_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.join("link.txt")).unwrap();
+        let editor = editor_for(Some(&dir.join("link.txt")), None).unwrap();
+        assert!(editor.new_file);
+        let mut app = App::editor_only(editor).unwrap();
+        typed(&mut app, "via link");
+        ctrl(&mut app, 's');
+        assert!(
+            matches!(app.dialog, Dialog::None),
+            "no Replace for its own file"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("target.txt")).unwrap(),
+            b"via link\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pce_refuses_big_unreadable_and_slashed_names() {
+        let dir = std::env::temp_dir().join(format!("pc_test_pce_refuse2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = std::fs::File::create(dir.join("big.txt")).unwrap();
+        big.set_len(editor::MAX_FILE_BYTES + 1).unwrap();
+        let why = |path: &Path| editor_for(Some(path), None).err().unwrap();
+        assert!(why(&dir.join("big.txt")).contains("10 MB"));
+        assert!(why(Path::new(&format!("{}/new.txt/", dir.display()))).contains("cannot edit"));
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(dir.join("secret.txt"), "x").unwrap();
+            std::fs::set_permissions(
+                dir.join("secret.txt"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            assert!(why(&dir.join("secret.txt")).contains("ermission"));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pce_ends_in_failure_after_a_save_that_failed_part_way() {
+        // /dev/full takes the open but no byte: a save that got going.
+        let editor = Editor::from_bytes(PathBuf::from("/dev/full"), b"x")
+            .ok()
+            .unwrap();
+        let mut app = App::editor_only(editor).unwrap();
+        typed(&mut app, "y");
+        ctrl(&mut app, 's');
+        let error = app.error_dialog.take().unwrap();
+        assert!(error.contains("may be damaged"), "{error}");
+        assert_eq!(app.damaged_file.as_deref(), Some(Path::new("/dev/full")));
+        // Quitting without a save that works: still failed, for main to say.
+        ctrl(&mut app, 'q');
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.should_quit);
+        assert!(app.damaged_file.is_some());
     }
 }

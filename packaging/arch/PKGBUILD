@@ -31,9 +31,6 @@ check() {
 package() {
     cd "$pkgname-$pkgver"
     install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
-    # pce, the editor alone: the same binary under another name (it checks
-    # what it was called), not the small launcher cargo install uses.
-    ln -s "$pkgname" "$pkgdir/usr/bin/pce"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
