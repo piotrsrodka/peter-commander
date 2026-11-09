@@ -1788,17 +1788,41 @@ fn format_size(bytes: u64) -> String {
 /// instead of producing a useless sliver of a name column.
 const MIN_NAME_COLUMN_WIDTH: usize = 8;
 
+/// A pane is wide enough for the Size, Date and Time columns to get a cell
+/// of margin on each side when the name column keeps at least this much.
+const WIDE_PANE_NAME_WIDTH: usize = 20;
+
+/// The margin, in cells, before the Size, Date and Time values (none
+/// after them): one where the pane is wide enough, so the values don't
+/// touch the column line on their left, and none where every cell is
+/// needed for the name.
+fn column_pad(inner_width: u16) -> usize {
+    let padded = SIZE_COLUMN_WIDTH + DATE_COLUMN_WIDTH + 2 + 3;
+    usize::from(inner_width as usize >= padded + WIDE_PANE_NAME_WIDTH)
+}
+
 /// How wide the name column should be so the full row (name + size + date)
 /// exactly fills `inner_width` (the pane's content width, borders already
 /// excluded) — rather than a fixed width that wastes space on a wide pane
-/// or overflows on a narrow one.
-fn name_column_width(inner_width: u16) -> usize {
-    // 3 spaces: one before the size column, one before the date, and one
-    // trailing margin after it.
-    let fixed_width = SIZE_COLUMN_WIDTH + DATE_COLUMN_WIDTH + 3;
+/// or overflows on a narrow one. `pad` is from `column_pad`.
+fn name_column_width(inner_width: u16, pad: usize) -> usize {
+    // 2 spaces, before the size column and before the date, plus the
+    // margins before the size, date and time.
+    let fixed_width = SIZE_COLUMN_WIDTH + DATE_COLUMN_WIDTH + 2 + 3 * pad;
     (inner_width as usize)
         .saturating_sub(fixed_width)
         .max(MIN_NAME_COLUMN_WIDTH)
+}
+
+/// One listing row's columns: the fitted name, then the size right-aligned
+/// and the date and time (from `format_modified`, or empty), each with
+/// `pad` cells of margin before it.
+fn listing_cells(name: &str, size: &str, modified: &str, pad: usize) -> String {
+    let p = " ".repeat(pad);
+    let (date, time) = modified.split_once(' ').unwrap_or(("", ""));
+    format!(
+        "{name} {p}{size:>SIZE_COLUMN_WIDTH$} {p}{date:<DATE_PART_WIDTH$} {p}{time:<TIME_PART_WIDTH$}"
+    )
 }
 
 /// Truncates a name to fit the name column, appending an ellipsis, instead
@@ -2020,7 +2044,8 @@ fn draw_pane(
     let title = pane.cwd.to_string_lossy().to_string();
 
     // -2 for the pane's own left/right border.
-    let name_width = name_column_width(area.width.saturating_sub(2));
+    let pad = column_pad(area.width.saturating_sub(2));
+    let name_width = name_column_width(area.width.saturating_sub(2), pad);
 
     let items: Vec<ListItem> = pane
         .entries
@@ -2098,8 +2123,7 @@ fn draw_pane(
             let name = fit_name(&entry.name, name_width);
             // Padded even when empty (".." has no date), so every row — and
             // the cursor bar on it — spans the full width.
-            let label =
-                format!("{name} {size_label:>SIZE_COLUMN_WIDTH$} {date:<DATE_COLUMN_WIDTH$} ");
+            let label = listing_cells(&name, &size_label, &date, pad);
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
@@ -2151,7 +2175,7 @@ fn draw_pane(
                 };
                 let date = format_modified(entry.modified);
                 let name = fit_name(&entry.name, name_width);
-                format!("{name} {size:>SIZE_COLUMN_WIDTH$} {date}")
+                listing_cells(&name, &size, &date, pad)
             }
             _ => {
                 let (files, dirs) = pane.totals();
@@ -2187,7 +2211,7 @@ fn draw_pane(
     frame.render_widget(block, area);
     if let Some(header_area) = header_area {
         frame.render_widget(
-            Paragraph::new(column_header_line(pane, name_width)),
+            Paragraph::new(column_header_line(pane, name_width, pad)),
             header_area,
         );
     }
@@ -2266,6 +2290,7 @@ fn draw_pane(
             list_area,
             header_area,
             name_width,
+            pad,
             border_style,
         );
     }
@@ -2282,6 +2307,7 @@ fn draw_column_separators(
     list_area: Rect,
     header_area: Option<Rect>,
     name_width: usize,
+    pad: usize,
     border_style: Style,
 ) {
     let top = header_area.map_or(list_area.y, |header| header.y);
@@ -2290,10 +2316,11 @@ fn draw_column_separators(
     let bottom = list_area.y + list_area.height;
     let border_fg = border_style.fg.unwrap_or(Color::Reset);
     let right_edge = area.x + area.width.saturating_sub(1);
+    let size_end = name_width + 1 + pad + SIZE_COLUMN_WIDTH;
     let columns = [
         list_area.x + name_width as u16,
-        list_area.x + (name_width + 1 + SIZE_COLUMN_WIDTH) as u16,
-        list_area.x + (name_width + 1 + SIZE_COLUMN_WIDTH + 1 + DATE_PART_WIDTH) as u16,
+        list_area.x + size_end as u16,
+        list_area.x + (size_end + 1 + pad + DATE_PART_WIDTH) as u16,
     ];
 
     let buf = frame.buffer_mut();
@@ -2323,7 +2350,7 @@ fn draw_column_separators(
 /// sorted column followed by the sort arrow — sorting by type marks the Name
 /// column, since the extension is part of the name, and sorting by date
 /// (date and time together) marks Date.
-fn column_header_line(pane: &Pane, name_width: usize) -> Line<'static> {
+fn column_header_line(pane: &Pane, name_width: usize, pad: usize) -> Line<'static> {
     let sorted_column = match pane.sort_key {
         SortKey::Name | SortKey::Extension => 0,
         SortKey::Size => 1,
@@ -2338,7 +2365,8 @@ fn column_header_line(pane: &Pane, name_width: usize) -> Line<'static> {
     let mut spans = Vec::new();
     for (idx, (label, width)) in columns.into_iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::raw(" "));
+            // The column line, then the margin the values below have.
+            spans.push(Span::raw(" ".repeat(1 + pad)));
         }
         let text = if idx == sorted_column {
             let arrow = if pane.sort_descending() {
@@ -3362,6 +3390,37 @@ mod tests {
         // Non-classic mode: the cell underneath is a named/Reset color, so
         // the shadow falls back to a flat dark gray fill.
         assert_eq!(cell.bg, Color::Rgb(30, 30, 30));
+    }
+
+    #[test]
+    fn wide_panes_give_size_date_and_time_a_left_margin() {
+        // Just narrow enough for none, and wide enough for one.
+        let narrow = SIZE_COLUMN_WIDTH + DATE_COLUMN_WIDTH + 2 + 3 + WIDE_PANE_NAME_WIDTH - 1;
+        assert_eq!(column_pad(narrow as u16), 0);
+        assert_eq!(column_pad(narrow as u16 + 1), 1);
+
+        let date = "20-09-26 15:57";
+        assert_eq!(
+            listing_cells("a", "1,234", date, 0),
+            "a      1,234 20-09-26 15:57"
+        );
+        assert_eq!(
+            listing_cells("a", "1,234", date, 1),
+            "a       1,234  20-09-26  15:57"
+        );
+        // ".." has no date, and its row is as wide as the others.
+        assert_eq!(
+            listing_cells("a", "", "", 1).chars().count(),
+            listing_cells("a", "1,234", date, 1).chars().count()
+        );
+
+        // Every row still fills the pane exactly, margins or not.
+        for inner in [38u16, 52, 53, 120] {
+            let pad = column_pad(inner);
+            let name = fit_name("x", name_column_width(inner, pad));
+            let row = listing_cells(&name, "1", date, pad);
+            assert_eq!(row.chars().count(), inner as usize, "inner {inner}");
+        }
     }
 
     fn buffer_text(buf: &Buffer) -> String {
